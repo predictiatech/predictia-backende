@@ -42,9 +42,31 @@ Dados: ${JSON.stringify(gameInfo)}`;
 }
 
 // =====================
+// UTILS
+// =====================
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function pick(obj, keys) {
+  const out = {};
+  keys.forEach((k) => {
+    if (obj?.[k] !== undefined) out[k] = obj[k];
+  });
+  return out;
+}
+
+// =====================
 // API-SPORTS CORE
 // =====================
-// FIX: NÃO IGNORAR 0/FALSE
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
 
@@ -79,6 +101,23 @@ async function apiSports(base, path, params = {}) {
   }
 }
 
+// ✅ RETRY: útil quando stats/eventos ainda não chegaram no começo do jogo
+async function apiSportsRetry(base, path, params, { tries = 3, delayMs = 600 } = {}) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    const r = await apiSports(base, path, params);
+    last = r;
+
+    const ok = Array.isArray(r?.response) && r.response.length > 0;
+    const noHardError = !r?.errors || Object.keys(r.errors).length === 0;
+
+    if (ok && noHardError) return r;
+
+    if (i < tries - 1) await sleep(delayMs);
+  }
+  return last || { response: [], errors: { internal: "retry_failed" } };
+}
+
 // =====================
 // ADAPTERS
 // =====================
@@ -89,26 +128,6 @@ const ADAPTERS = {
     getGames: ({ date, live }) => ({
       path: "/fixtures",
       params: live ? { live: "all" } : { date },
-    }),
-
-    stats: (fixtureId) => ({
-      path: "/fixtures/statistics",
-      params: { fixture: fixtureId },
-    }),
-
-    events: (fixtureId) => ({
-      path: "/fixtures/events",
-      params: { fixture: fixtureId },
-    }),
-
-    odds: (fixtureId) => ({
-      path: "/odds/live",
-      params: { fixture: fixtureId },
-    }),
-
-    standings: ({ league, season }) => ({
-      path: "/standings",
-      params: { league, season },
     }),
 
     extractId: (item) => item?.fixture?.id,
@@ -166,6 +185,8 @@ const ADAPTERS = {
       params: { date, season },
     }),
 
+    extractId: (item) => item?.id,
+
     extractLiveScore: (item) => ({
       gameId: item?.id,
       league: item?.league,
@@ -175,44 +196,8 @@ const ADAPTERS = {
       periods: item?.periods,
       date: item?.date,
     }),
-
-    stats: (gameId) => ({
-      path: "/games/statistics",
-      params: { id: gameId },
-    }),
-
-    odds: (gameId, season) => ({
-      path: "/odds",
-      params: { game: gameId, league: "standard", season },
-    }),
-
-    standings: ({ league, season }) => ({
-      path: "/standings",
-      params: { league: league || "standard", season },
-    }),
-
-    extractId: (item) => item?.id,
   },
 };
-
-// =====================
-// HELPERS
-// =====================
-function todayISO() {
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function pick(obj, keys) {
-  const out = {};
-  keys.forEach((k) => {
-    if (obj?.[k] !== undefined) out[k] = obj[k];
-  });
-  return out;
-}
 
 // =====================
 // ROUTES
@@ -220,7 +205,7 @@ function pick(obj, keys) {
 app.get("/", (req, res) => res.send("PredictIA Engine Online"));
 
 // =====================
-// FOOTBALL ENDPOINTS
+// FOOTBALL
 // =====================
 app.get("/football/games", async (req, res) => {
   const date = req.query.date || todayISO();
@@ -228,7 +213,7 @@ app.get("/football/games", async (req, res) => {
   const max = Number(req.query.max || 20);
 
   const cfg = ADAPTERS.football.getGames({ date, live });
-  const data = await apiSports(ADAPTERS.football.base, cfg.path, cfg.params);
+  const data = await apiSports(FOOTBALL_BASE, cfg.path, cfg.params);
   const games = (data.response || []).slice(0, max);
 
   res.json({
@@ -241,7 +226,7 @@ app.get("/football/games", async (req, res) => {
 
 app.get("/football/live", async (req, res) => {
   const cfg = ADAPTERS.football.getGames({ live: true });
-  const data = await apiSports(ADAPTERS.football.base, cfg.path, cfg.params);
+  const data = await apiSports(FOOTBALL_BASE, cfg.path, cfg.params);
 
   const games = data.response || [];
   res.json({
@@ -252,7 +237,7 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// ✅ PATCH AQUI: SEMPRE BUSCAR O JOGO BASE + FIX include parsing + fixtureId numérico
+// ✅ MATCH COMPLETO (com retry/fallback)
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
 
@@ -263,34 +248,40 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       : ["score", "stats", "events", "goals", "corners", "cards", "odds"];
 
   const want = new Set(include.map((x) => x.trim()).filter(Boolean));
+  const analysis = String(req.query.analysis || "").toLowerCase() === "true";
+  const retry = String(req.query.retry || "true").toLowerCase() === "true"; // default true
 
   const out = { fixtureId };
 
-  // SEMPRE: buscar fixture base (placar/time/status)
+  // base fixture (sempre)
   const fixture = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
   const item = (fixture.response || [])[0];
 
   if (!item) {
-    return res.status(404).json({ error: "Fixture não encontrado", fixtureId });
+    return res.status(404).json({ error: "Fixture não encontrado", fixtureId, raw: fixture.raw || fixture.errors });
   }
 
   out.game = item;
   out.live_score = ADAPTERS.football.extractLiveScore(item);
 
-  // stats
+  // stats (e corners derivados)
   if (want.has("stats") || want.has("corners")) {
-    const s = await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
-    if (want.has("stats")) out.live_stats = s.response || [];
+    const s = retry
+      ? await apiSportsRetry(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId }, { tries: 3, delayMs: 700 })
+      : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
+
     out._stats_errors = s.errors || undefined;
 
-    if (want.has("corners")) {
-      out.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
-    }
+    if (want.has("stats")) out.live_stats = s.response || [];
+    if (want.has("corners")) out.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
   }
 
-  // events => goals/cards/events
+  // events (e goals/cards derivados)
   if (want.has("events") || want.has("goals") || want.has("cards")) {
-    const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
+    const e = retry
+      ? await apiSportsRetry(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId }, { tries: 3, delayMs: 700 })
+      : await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
+
     const events = e.response || [];
     out._events_errors = e.errors || undefined;
 
@@ -301,13 +292,16 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 
   // odds
   if (want.has("odds")) {
-    const o = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
+    const o = retry
+      ? await apiSportsRetry(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId }, { tries: 3, delayMs: 700 })
+      : await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
+
     out.live_odds = o.response || [];
     out._odds_errors = o.errors || undefined;
   }
 
   // IA
-  if (String(req.query.analysis || "").toLowerCase() === "true") {
+  if (analysis) {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
     );
@@ -329,7 +323,7 @@ app.get("/football/standings", async (req, res) => {
 });
 
 // =====================
-// NBA ENDPOINTS
+// NBA
 // =====================
 app.get("/nba/games", async (req, res) => {
   const date = req.query.date || todayISO();
@@ -352,11 +346,19 @@ app.get("/nba/match/:gameId", async (req, res) => {
   const gameId = req.params.gameId;
   const season = req.query.season || "2025";
 
-  const include = String(req.query.include || "score,stats,odds").split(",");
+  const includeRaw = req.query.include;
+  const include =
+    typeof includeRaw === "string" && includeRaw.trim().length > 0
+      ? includeRaw.split(",")
+      : ["score", "stats", "odds"];
+
   const want = new Set(include.map((x) => x.trim()).filter(Boolean));
+  const analysis = String(req.query.analysis || "").toLowerCase() === "true";
+  const retry = String(req.query.retry || "true").toLowerCase() === "true";
 
   const out = { gameId, season };
 
+  // score
   if (want.has("score")) {
     const g = await apiSports(NBA_BASE, "/games", { id: gameId, season });
     const item = (g.response || [])[0];
@@ -365,14 +367,22 @@ app.get("/nba/match/:gameId", async (req, res) => {
     out._game_errors = g.errors || undefined;
   }
 
+  // stats
   if (want.has("stats")) {
-    const s = await apiSports(NBA_BASE, "/games/statistics", { id: gameId });
+    const s = retry
+      ? await apiSportsRetry(NBA_BASE, "/games/statistics", { id: gameId }, { tries: 3, delayMs: 700 })
+      : await apiSports(NBA_BASE, "/games/statistics", { id: gameId });
+
     out.live_stats = s.response || [];
     out._stats_errors = s.errors || undefined;
   }
 
+  // odds
   if (want.has("odds")) {
-    const o = await apiSports(NBA_BASE, "/odds", { game: gameId, league: "standard", season });
+    const o = retry
+      ? await apiSportsRetry(NBA_BASE, "/odds", { game: gameId, league: "standard", season }, { tries: 3, delayMs: 700 })
+      : await apiSports(NBA_BASE, "/odds", { game: gameId, league: "standard", season });
+
     out.live_odds = o.response || [];
     out._odds_errors = o.errors || undefined;
   }
@@ -381,7 +391,7 @@ app.get("/nba/match/:gameId", async (req, res) => {
   out.corners = { total: 0, perTeam: [] };
   out.cards = [];
 
-  if (String(req.query.analysis || "").toLowerCase() === "true") {
+  if (analysis) {
     out.ai_prediction = await getAIAnalysis(pick(out, ["live_score", "live_stats", "live_odds"]));
   }
 
@@ -419,6 +429,7 @@ app.post("/alerts/search", async (req, res) => {
       season,
       nbaSeason,
       live = true,
+      retry = true,
     } = req.body;
 
     const adapter = ADAPTERS[sport];
@@ -462,28 +473,51 @@ app.post("/alerts/search", async (req, res) => {
         }
 
         if (include.stats) {
-          const sCfg = adapter.stats(id);
-          const s = await apiSports(adapter.base, sCfg.path, sCfg.params);
-          details.live_stats = s.response || [];
+          if (sport === "football") {
+            const s = retry
+              ? await apiSportsRetry(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id }, { tries: 3, delayMs: 700 })
+              : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id });
+            details.live_stats = s.response || [];
+          } else {
+            const s = retry
+              ? await apiSportsRetry(NBA_BASE, "/games/statistics", { id }, { tries: 3, delayMs: 700 })
+              : await apiSports(NBA_BASE, "/games/statistics", { id });
+            details.live_stats = s.response || [];
+          }
         }
 
         if (include.odds) {
-          const oCfg = sport === "nba" ? adapter.odds(id, nbaSeason || season || "2025") : adapter.odds(id);
-          const o = await apiSports(adapter.base, oCfg.path, oCfg.params);
-          details.live_odds = o.response || [];
+          if (sport === "football") {
+            const o = retry
+              ? await apiSportsRetry(FOOTBALL_BASE, "/odds/live", { fixture: id }, { tries: 3, delayMs: 700 })
+              : await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: id });
+            details.live_odds = o.response || [];
+          } else {
+            const o = retry
+              ? await apiSportsRetry(NBA_BASE, "/odds", { game: id, league: "standard", season: nbaSeason || season || "2025" }, { tries: 3, delayMs: 700 })
+              : await apiSports(NBA_BASE, "/odds", { game: id, league: "standard", season: nbaSeason || season || "2025" });
+            details.live_odds = o.response || [];
+          }
         }
 
         if (sport === "football") {
           if (include.goals || include.cards) {
-            const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: id });
+            const e = retry
+              ? await apiSportsRetry(FOOTBALL_BASE, "/fixtures/events", { fixture: id }, { tries: 3, delayMs: 700 })
+              : await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: id });
+
             const events = e.response || [];
             if (include.goals) details.goals = ADAPTERS.football.extractGoalsFromEvents(events);
             if (include.cards) details.cards = ADAPTERS.football.extractCardsFromEvents(events);
           }
+
           if (include.corners) {
             const s = details.live_stats
               ? { response: details.live_stats }
-              : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id });
+              : retry
+                ? await apiSportsRetry(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id }, { tries: 3, delayMs: 700 })
+                : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id });
+
             details.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
           }
         } else {
