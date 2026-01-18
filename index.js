@@ -13,7 +13,7 @@ app.use(express.json());
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
-app.get("/", (_, res) => res.send("PredictIA backend rodando"));
+app.get("/", (_, res) => res.send("PredictIA backend v2 (debug-enabled)"));
 
 function extractJson(text) {
   const s = text.indexOf("{");
