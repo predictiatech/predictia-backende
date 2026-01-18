@@ -1,4 +1,4 @@
-// index.js (COMPLETO) — Football v3 + NBA v2 + Debug extra (stats/odds/events/lineups/standings/predictions) + DEBUG FOOTBALL ODDS
+// index.js (COMPLETO) — Football v3 + NBA v2 + Debug extra (stats/odds/events/lineups/standings/predictions) + DEBUG FOOTBALL ODDS (bets com id/search)
 
 import express from "express";
 import fetch from "node-fetch";
@@ -171,13 +171,21 @@ app.get("/debug/nba/ping", async (req, res) => {
 // DEBUG FOOTBALL ODDS
 // =========================
 
-// 1) Lista mercados (bets)
+// 1) Lista mercados (bets) + filtros (id/search) conforme documentação
 app.get("/debug/football/odds/bets", async (req, res) => {
   try {
-    const data = await apiSports(football.base, "/odds/bets", {});
+    const id = req.query.id;
+    const search = req.query.search;
+
+    const params = {};
+    if (id) params.id = id;
+    if (search) params.search = search;
+
+    const data = await apiSports(football.base, "/odds/bets", params);
+
     return res.json({
       ok: true,
-      endpoint: { path: "/odds/bets", params: {} },
+      endpoint: { path: "/odds/bets", params },
       results: data?.results ?? null,
       errors: data?.errors ?? null,
       sample: takeFirstResponse(data),
