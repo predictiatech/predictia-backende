@@ -1,4 +1,4 @@
-// index.js (COMPLETO) — Football v3 + NBA v2 + Debug extra (stats/odds/events/lineups/standings/predictions)
+// index.js (COMPLETO) — Football v3 + NBA v2 + Debug extra (stats/odds/events/lineups/standings/predictions) + DEBUG FOOTBALL ODDS
 
 import express from "express";
 import fetch from "node-fetch";
@@ -164,6 +164,71 @@ app.get("/debug/nba/ping", async (req, res) => {
     res.json({ ok: true, base: nba.base, keys: Object.keys(data), sample: takeFirstResponse(data) });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// =========================
+// DEBUG FOOTBALL ODDS
+// =========================
+
+// 1) Lista mercados (bets)
+app.get("/debug/football/odds/bets", async (req, res) => {
+  try {
+    const data = await apiSports(football.base, "/odds/bets", {});
+    return res.json({
+      ok: true,
+      endpoint: { path: "/odds/bets", params: {} },
+      results: data?.results ?? null,
+      errors: data?.errors ?? null,
+      sample: takeFirstResponse(data),
+      rawKeys: Object.keys(data || {}),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// 2) Odds ao vivo (por fixture + bet)
+app.get("/debug/football/odds/live", async (req, res) => {
+  try {
+    const fixture = req.query.fixture;
+    const bet = req.query.bet;
+
+    if (!fixture) return res.status(400).json({ error: "missing_query", missing: "fixture" });
+    if (!bet) return res.status(400).json({ error: "missing_query", missing: "bet" });
+
+    const data = await apiSports(football.base, "/odds/live", { fixture, bet });
+    return res.json({
+      ok: true,
+      endpoint: { path: "/odds/live", params: { fixture, bet } },
+      results: data?.results ?? null,
+      errors: data?.errors ?? null,
+      sample: takeFirstResponse(data),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// 3) Odds pré-jogo (por fixture + bet)
+app.get("/debug/football/odds", async (req, res) => {
+  try {
+    const fixture = req.query.fixture;
+    const bet = req.query.bet;
+
+    if (!fixture) return res.status(400).json({ error: "missing_query", missing: "fixture" });
+    if (!bet) return res.status(400).json({ error: "missing_query", missing: "bet" });
+
+    const data = await apiSports(football.base, "/odds", { fixture, bet });
+    return res.json({
+      ok: true,
+      endpoint: { path: "/odds", params: { fixture, bet } },
+      results: data?.results ?? null,
+      errors: data?.errors ?? null,
+      sample: takeFirstResponse(data),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
