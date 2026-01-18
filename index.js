@@ -1,3 +1,8 @@
+// PATCH COMPLETO (cole no seu index.js): retry + fallback p/ corners via odds + debug opcional
+// - Se /fixtures/statistics vier vazio, tenta 3x com delay
+// - Se ainda vier vazio, corners tenta ler do mercado "Total Corners / Match Corners" nas odds
+// - Mantém tudo compatível com Render
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -42,11 +47,31 @@ Dados: ${JSON.stringify(gameInfo)}`;
 }
 
 // =====================
+// UTILS
+// =====================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function pick(obj, keys) {
+  const out = {};
+  keys.forEach((k) => {
+    if (obj?.[k] !== undefined) out[k] = obj[k];
+  });
+  return out;
+}
+
+// =====================
 // API-SPORTS CORE
 // =====================
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
-
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== "") {
       url.searchParams.set(k, String(v));
@@ -78,31 +103,16 @@ async function apiSports(base, path, params = {}) {
   }
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function isLiveFootballStatus(short) {
-  // statuses comuns (API-Football): 1H, HT, 2H, ET, BT, P, LIVE
-  const s = String(short || "").toUpperCase();
-  return ["1H", "HT", "2H", "ET", "BT", "P", "LIVE"].includes(s);
-}
-
-async function apiSportsRetry({
-  base,
-  path,
-  params,
-  maxAttempts = 3,
-  delayMs = 650,
-  shouldRetry = (json) => Array.isArray(json?.response) && json.response.length === 0,
-}) {
+// retry helper: tenta buscar endpoint até "response" vir não vazio
+async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1200) {
   let last = null;
-  for (let i = 0; i < maxAttempts; i++) {
+  for (let i = 0; i < tries; i++) {
     last = await apiSports(base, path, params);
-    if (!shouldRetry(last)) return last;
-    if (i < maxAttempts - 1) await sleep(delayMs);
+    const okNonEmpty = Array.isArray(last?.response) && last.response.length > 0;
+    if (okNonEmpty) return { ...last, _retry: { tries: i + 1, ok: true } };
+    if (i < tries - 1) await sleep(delayMs);
   }
-  return last;
+  return { ...(last || { response: [] }), _retry: { tries, ok: false } };
 }
 
 // =====================
@@ -182,6 +192,28 @@ const ADAPTERS = {
       const total = perTeam.reduce((acc, x) => acc + (Number(x.corners) || 0), 0);
       return { total, perTeam };
     },
+
+    // fallback: se não há stats, tenta inferir "linha de cantos" via odds
+    // (isso NÃO é a quantidade real de cantos; é só o handicap/linha do mercado)
+    extractCornerLineFromOdds: (liveOdds = []) => {
+      const markets = (liveOdds?.[0]?.odds || []);
+      const m =
+        markets.find((x) => /match corners/i.test(x?.name || "")) ||
+        markets.find((x) => /total corners/i.test(x?.name || "")) ||
+        markets.find((x) => /asian corners/i.test(x?.name || ""));
+      if (!m) return null;
+
+      // pega o primeiro handicap numérico que aparecer
+      const vals = m.values || [];
+      const pickVal = vals.find((v) => v?.handicap !== null && v?.handicap !== undefined) || vals[0];
+      const handicap = pickVal?.handicap ?? null;
+
+      return {
+        market: m.name,
+        handicap,
+        sample: pickVal ? { value: pickVal.value, odd: pickVal.odd, handicap: pickVal.handicap } : null,
+      };
+    },
   },
 
   nba: {
@@ -222,38 +254,12 @@ const ADAPTERS = {
 };
 
 // =====================
-// HELPERS
-// =====================
-function todayISO() {
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function pick(obj, keys) {
-  const out = {};
-  keys.forEach((k) => {
-    if (obj?.[k] !== undefined) out[k] = obj[k];
-  });
-  return out;
-}
-
-function normalizeErrors(e) {
-  if (!e) return undefined;
-  if (Array.isArray(e) && e.length === 0) return undefined;
-  if (typeof e === "object" && Object.keys(e).length === 0) return undefined;
-  return e;
-}
-
-// =====================
 // ROUTES
 // =====================
 app.get("/", (req, res) => res.send("PredictIA Engine Online"));
 
 // =====================
-// FOOTBALL ENDPOINTS
+// FOOTBALL
 // =====================
 app.get("/football/games", async (req, res) => {
   const date = req.query.date || todayISO();
@@ -285,86 +291,75 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// FIX PRINCIPAL: sempre busca o fixture base; retries para stats/events quando jogo está ao vivo
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
-  if (!Number.isFinite(fixtureId)) return res.status(400).json({ error: "fixtureId inválido." });
 
   const includeRaw = req.query.include;
   const include =
     typeof includeRaw === "string" && includeRaw.trim().length > 0
       ? includeRaw.split(",")
-      : ["score", "stats", "goals", "corners", "cards", "odds"];
+      : ["score", "stats", "events", "goals", "corners", "cards", "odds"];
 
   const want = new Set(include.map((x) => x.trim()).filter(Boolean));
+  const debug = String(req.query.debug || "").toLowerCase() === "true";
+
   const out = { fixtureId };
 
-  // 1) SEMPRE pegar base do jogo (para status/live e para não retornar só fixtureId)
+  // base fixture sempre
   const fixture = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
   const item = (fixture.response || [])[0];
-
-  if (!item) return res.status(404).json({ error: "Fixture não encontrado." });
+  if (!item) return res.status(404).json({ error: "Fixture não encontrado", fixtureId });
 
   out.game = item;
   out.live_score = ADAPTERS.football.extractLiveScore(item);
 
-  const liveShort = out.live_score?.status?.short;
-  const isLive = isLiveFootballStatus(liveShort);
-
-  // 2) STATS (com retry se live e veio vazio)
-  if (want.has("stats") || want.has("corners")) {
-    const sCfg = ADAPTERS.football.stats(fixtureId);
-
-    const s = await apiSportsRetry({
-      base: FOOTBALL_BASE,
-      path: sCfg.path,
-      params: sCfg.params,
-      maxAttempts: isLive ? 3 : 1,
-      delayMs: 700,
-      shouldRetry: (json) => isLive && Array.isArray(json?.response) && json.response.length === 0 && !json?.errors,
-    });
-
-    out.live_stats = s.response || [];
-    out._stats_errors = normalizeErrors(s.errors) || undefined;
-
-    if (want.has("corners")) {
-      out.corners = ADAPTERS.football.extractCornersFromStats(out.live_stats || []);
+  // odds (pode ser usado como fallback de cantos)
+  let oddsResp = null;
+  if (want.has("odds") || want.has("corners")) {
+    oddsResp = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
+    if (want.has("odds")) {
+      out.live_odds = oddsResp.response || [];
+      out._odds_errors = oddsResp.errors || undefined;
     }
   }
 
-  // 3) EVENTS (com retry se live e veio vazio)
-  if (want.has("goals") || want.has("cards") || want.has("events")) {
-    const eCfg = ADAPTERS.football.events(fixtureId);
+  // stats com retry
+  if (want.has("stats") || want.has("corners")) {
+    const sTry = await apiSportsRetryNonEmpty(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId }, 3, 1200);
 
-    const e = await apiSportsRetry({
-      base: FOOTBALL_BASE,
-      path: eCfg.path,
-      params: eCfg.params,
-      maxAttempts: isLive ? 3 : 1,
-      delayMs: 700,
-      shouldRetry: (json) => isLive && Array.isArray(json?.response) && json.response.length === 0 && !json?.errors,
-    });
+    if (want.has("stats")) out.live_stats = sTry.response || [];
+    out._stats_errors = sTry.errors || undefined;
+    if (debug) out._stats_retry = sTry._retry;
 
+    if (want.has("corners")) {
+      const cornersFromStats = ADAPTERS.football.extractCornersFromStats(sTry.response || []);
+      const hasCorners = (cornersFromStats?.perTeam || []).length > 0;
+
+      out.corners = cornersFromStats;
+
+      // fallback: se stats ainda vazio, pelo menos retorna "linha" de cantos da odd
+      if (!hasCorners) {
+        const cornerLine = ADAPTERS.football.extractCornerLineFromOdds(oddsResp?.response || []);
+        if (cornerLine) out.corners_fallback = cornerLine;
+      }
+    }
+  }
+
+  // events/goals/cards
+  if (want.has("events") || want.has("goals") || want.has("cards")) {
+    const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
     const events = e.response || [];
-    out._events_errors = normalizeErrors(e.errors) || undefined;
+    out._events_errors = e.errors || undefined;
 
     if (want.has("events")) out.events = events;
     if (want.has("goals")) out.goals = ADAPTERS.football.extractGoalsFromEvents(events);
     if (want.has("cards")) out.cards = ADAPTERS.football.extractCardsFromEvents(events);
   }
 
-  // 4) ODDS
-  if (want.has("odds")) {
-    const oCfg = ADAPTERS.football.odds(fixtureId);
-    const o = await apiSports(FOOTBALL_BASE, oCfg.path, oCfg.params);
-    out.live_odds = o.response || [];
-    out._odds_errors = normalizeErrors(o.errors) || undefined;
-  }
-
-  // 5) IA
+  // IA
   if (String(req.query.analysis || "").toLowerCase() === "true") {
     out.ai_prediction = await getAIAnalysis(
-      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
+      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "corners_fallback", "live_odds"])
     );
   }
 
@@ -384,7 +379,7 @@ app.get("/football/standings", async (req, res) => {
 });
 
 // =====================
-// NBA ENDPOINTS
+// NBA
 // =====================
 app.get("/nba/games", async (req, res) => {
   const date = req.query.date || todayISO();
@@ -404,10 +399,9 @@ app.get("/nba/games", async (req, res) => {
 });
 
 app.get("/nba/match/:gameId", async (req, res) => {
-  const gameId = Number(req.params.gameId);
-  if (!Number.isFinite(gameId)) return res.status(400).json({ error: "gameId inválido." });
-
+  const gameId = req.params.gameId;
   const season = req.query.season || "2025";
+
   const include = String(req.query.include || "score,stats,odds").split(",");
   const want = new Set(include.map((x) => x.trim()).filter(Boolean));
 
@@ -418,19 +412,19 @@ app.get("/nba/match/:gameId", async (req, res) => {
     const item = (g.response || [])[0];
     out.game = item || null;
     out.live_score = item ? ADAPTERS.nba.extractLiveScore(item) : null;
-    out._game_errors = normalizeErrors(g.errors) || undefined;
+    out._game_errors = g.errors || undefined;
   }
 
   if (want.has("stats")) {
     const s = await apiSports(NBA_BASE, "/games/statistics", { id: gameId });
     out.live_stats = s.response || [];
-    out._stats_errors = normalizeErrors(s.errors) || undefined;
+    out._stats_errors = s.errors || undefined;
   }
 
   if (want.has("odds")) {
     const o = await apiSports(NBA_BASE, "/odds", { game: gameId, league: "standard", season });
     out.live_odds = o.response || [];
-    out._odds_errors = normalizeErrors(o.errors) || undefined;
+    out._odds_errors = o.errors || undefined;
   }
 
   out.goals = [];
@@ -512,46 +506,48 @@ app.post("/alerts/search", async (req, res) => {
 
         if (include.score) {
           details.live_score =
-            sport === "football" ? ADAPTERS.football.extractLiveScore(game) : ADAPTERS.nba.extractLiveScore(game);
+            sport === "football"
+              ? ADAPTERS.football.extractLiveScore(game)
+              : ADAPTERS.nba.extractLiveScore(game);
         }
 
-        const isLive = sport === "football" ? isLiveFootballStatus(details.live_score?.status?.short) : false;
-
-        if (include.stats || (sport === "football" && include.corners)) {
-          const sCfg = adapter.stats(id);
-          const s = await apiSportsRetry({
-            base: adapter.base,
-            path: sCfg.path,
-            params: sCfg.params,
-            maxAttempts: isLive ? 3 : 1,
-            delayMs: 700,
-            shouldRetry: (json) => isLive && Array.isArray(json?.response) && json.response.length === 0 && !json?.errors,
-          });
-          details.live_stats = s.response || [];
+        // stats (futebol com retry)
+        if (include.stats) {
+          if (sport === "football") {
+            const sTry = await apiSportsRetryNonEmpty(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id }, 3, 1200);
+            details.live_stats = sTry.response || [];
+          } else {
+            const sCfg = adapter.stats(id);
+            const s = await apiSports(adapter.base, sCfg.path, sCfg.params);
+            details.live_stats = s.response || [];
+          }
         }
 
-        if (include.odds) {
+        // odds
+        let oddsResp = null;
+        if (include.odds || (sport === "football" && include.corners)) {
           const oCfg = sport === "nba" ? adapter.odds(id, nbaSeason || season || "2025") : adapter.odds(id);
-          const o = await apiSports(adapter.base, oCfg.path, oCfg.params);
-          details.live_odds = o.response || [];
+          oddsResp = await apiSports(adapter.base, oCfg.path, oCfg.params);
+          if (include.odds) details.live_odds = oddsResp.response || [];
         }
 
         if (sport === "football") {
           if (include.goals || include.cards) {
-            const e = await apiSportsRetry({
-              base: FOOTBALL_BASE,
-              path: "/fixtures/events",
-              params: { fixture: id },
-              maxAttempts: isLive ? 3 : 1,
-              delayMs: 700,
-              shouldRetry: (json) => isLive && Array.isArray(json?.response) && json.response.length === 0 && !json?.errors,
-            });
+            const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: id });
             const events = e.response || [];
             if (include.goals) details.goals = ADAPTERS.football.extractGoalsFromEvents(events);
             if (include.cards) details.cards = ADAPTERS.football.extractCardsFromEvents(events);
           }
+
           if (include.corners) {
-            details.corners = ADAPTERS.football.extractCornersFromStats(details.live_stats || []);
+            const cornersFromStats = ADAPTERS.football.extractCornersFromStats(details.live_stats || []);
+            details.corners = cornersFromStats;
+
+            const hasCorners = (cornersFromStats?.perTeam || []).length > 0;
+            if (!hasCorners) {
+              const cornerLine = ADAPTERS.football.extractCornerLineFromOdds(oddsResp?.response || []);
+              if (cornerLine) details.corners_fallback = cornerLine;
+            }
           }
         } else {
           if (include.goals) details.goals = [];
@@ -568,6 +564,7 @@ app.post("/alerts/search", async (req, res) => {
             goals: details.goals,
             cards: details.cards,
             corners: details.corners,
+            corners_fallback: details.corners_fallback,
           });
         }
 
