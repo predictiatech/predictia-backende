@@ -1,27 +1,53 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Configurações de Ambiente
+// =====================
+// ENV
+// =====================
 const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 const GENAI_MODEL = process.env.GEMINI_MODEL || "gemini-pro";
 
+if (!API_KEY) {
+  console.error("FALTA API_KEY: defina API_SPORTS_KEY ou FOOTBALL_API_KEY no Render.");
+}
+
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const NBA_BASE = "https://v2.nba.api-sports.io";
 
-// Inicialização da IA
+// =====================
+// GEMINI
+// =====================
 const genAI = GENAI_KEY ? new GoogleGenerativeAI(GENAI_KEY) : null;
 
+async function getAIAnalysis(gameInfo) {
+  if (!genAI) return "IA não configurada.";
+  try {
+    const model = genAI.getGenerativeModel({ model: GENAI_MODEL });
+    const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
+Responda em PT-BR.
+Dê uma recomendação curta (máx 4 linhas), com risco (baixo/médio/alto) e 1 justificativa.
+Dados: ${JSON.stringify(gameInfo)}`;
+    const result = await model.generateContent(prompt);
+    return result.response.text();
+  } catch {
+    return "Erro na análise da IA.";
+  }
+}
+
+// =====================
+// API-SPORTS CORE
+// =====================
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
   Object.entries(params).forEach(([k, v]) => {
-    if (v) url.searchParams.set(k, String(v));
+    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   });
 
   try {
@@ -29,95 +55,524 @@ async function apiSports(base, path, params = {}) {
       method: "GET",
       headers: {
         "x-apisports-key": API_KEY,
-        "Accept": "application/json",
-      }
+        Accept: "application/json",
+      },
     });
-    return await response.json();
+
+    const json = await response.json();
+    if (!response.ok) {
+      return {
+        response: [],
+        errors: { http: response.status, message: json?.message || "HTTP error" },
+        raw: json,
+      };
+    }
+    return json;
   } catch (error) {
     return { response: [], errors: { internal: error.message } };
   }
 }
 
-// Função de Análise com Gemini
-async function getAIAnalysis(gameInfo) {
-  if (!genAI) return "IA não configurada.";
-  try {
-    const model = genAI.getGenerativeModel({ model: GENAI_MODEL });
-    const prompt = `Aja como um analista esportivo profissional para o app PredictIA. 
-    Analise estes dados e dê uma recomendação curta de aposta: ${JSON.stringify(gameInfo)}`;
-    
-    const result = await model.generateContent(prompt);
-    return result.response.text();
-  } catch (error) {
-    return "Erro na análise da IA.";
-  }
-}
-
+// =====================
+// ADAPTERS
+// =====================
 const ADAPTERS = {
   football: {
     base: FOOTBALL_BASE,
-    getGames: (date) => ({ path: "/fixtures", params: date ? { date } : { live: "all" } }),
-    stats: (id) => ({ path: "/fixtures/statistics", params: { fixture: id } }),
-    odds: (id) => ({ path: "/odds/live", params: { fixture: id } }),
-    extractId: (item) => item.fixture?.id
+
+    // jogos (live ou por data)
+    getGames: ({ date, live }) => ({
+      path: "/fixtures",
+      params: live ? { live: "all" } : { date },
+    }),
+
+    // placar do jogo (vem no /fixtures)
+    score: (fixture) => fixture?.goals ?? fixture?.score ?? {},
+
+    // estatísticas ao vivo (posse, chutes, etc)
+    stats: (fixtureId) => ({
+      path: "/fixtures/statistics",
+      params: { fixture: fixtureId },
+    }),
+
+    // eventos ao vivo (gols, cartões, substituições)
+    events: (fixtureId) => ({
+      path: "/fixtures/events",
+      params: { fixture: fixtureId },
+    }),
+
+    // escanteios e cartões (também dá para derivar de stats/events)
+    // mantemos separado e normalizamos no extractor
+    // (não existe endpoint "corners" dedicado no v3; vem em statistics)
+    // cartões vêm em events
+    corners: (fixtureId) => ({
+      path: "/fixtures/statistics",
+      params: { fixture: fixtureId },
+    }),
+    cards: (fixtureId) => ({
+      path: "/fixtures/events",
+      params: { fixture: fixtureId },
+    }),
+
+    // odds (ao vivo)
+    odds: (fixtureId) => ({
+      path: "/odds/live",
+      params: { fixture: fixtureId },
+    }),
+
+    // classificação
+    standings: ({ league, season }) => ({
+      path: "/standings",
+      params: { league, season },
+    }),
+
+    // ids
+    extractId: (item) => item?.fixture?.id,
+
+    // normalizações
+    extractLiveScore: (item) => ({
+      fixtureId: item?.fixture?.id,
+      league: item?.league,
+      teams: item?.teams,
+      goals: item?.goals,
+      score: item?.score,
+      status: item?.fixture?.status,
+      time: item?.fixture?.status?.elapsed,
+    }),
+
+    extractGoalsFromEvents: (events = []) =>
+      events
+        .filter((e) => e?.type === "Goal")
+        .map((e) => ({
+          time: e?.time,
+          team: e?.team,
+          player: e?.player,
+          assist: e?.assist,
+          detail: e?.detail,
+          comments: e?.comments,
+        })),
+
+    extractCardsFromEvents: (events = []) =>
+      events
+        .filter((e) => e?.type === "Card")
+        .map((e) => ({
+          time: e?.time,
+          team: e?.team,
+          player: e?.player,
+          detail: e?.detail, // Yellow Card / Red Card etc.
+          comments: e?.comments,
+        })),
+
+    extractCornersFromStats: (statsResponse = []) => {
+      // statsResponse: [{team, statistics:[{type,value},...]}]
+      const perTeam = (statsResponse || []).map((row) => {
+        const s = row?.statistics || [];
+        const corners = s.find((x) => x?.type === "Corner Kicks")?.value ?? 0;
+        return { team: row?.team, corners: corners ?? 0 };
+      });
+
+      const total = perTeam.reduce((acc, x) => acc + (Number(x.corners) || 0), 0);
+      return { total, perTeam };
+    },
   },
+
   nba: {
     base: NBA_BASE,
-    getGames: (date) => ({ path: "/games", params: { date: date || "2026-01-18", season: "2025" } }),
-    stats: (id) => ({ path: "/games/statistics", params: { id: id } }),
-    // Ajuste aqui: NBA exige liga e temporada para odds consistentes
-    odds: (id) => ({ path: "/odds", params: { game: id, league: "standard", season: "2025" } }),
-    extractId: (item) => item.id
-  }
+
+    // jogos (a API v2 NBA não tem "live=all" igual futebol; usa date + status se quiser)
+    getGames: ({ date, season }) => ({
+      path: "/games",
+      params: { date, season },
+    }),
+
+    // placar do jogo (vem em /games)
+    extractLiveScore: (item) => ({
+      gameId: item?.id,
+      league: item?.league,
+      teams: item?.teams,
+      scores: item?.scores,
+      status: item?.status,
+      periods: item?.periods,
+      date: item?.date,
+    }),
+
+    // estatísticas (team/player)
+    stats: (gameId) => ({
+      path: "/games/statistics",
+      params: { id: gameId },
+    }),
+
+    // "gols" no NBA = pontos (derivado do placar)
+    // "cartões" não aplica; retorna vazio
+    // "escanteios" não aplica; retorna vazio
+
+    // odds (ajuste: sua assinatura pode exigir endpoint /odds e params específicos)
+    // mantemos como estava, com liga + season
+    odds: (gameId, season) => ({
+      path: "/odds",
+      params: { game: gameId, league: "standard", season },
+    }),
+
+    // classificação NBA (standings)
+    standings: ({ league, season }) => ({
+      path: "/standings",
+      params: { league: league || "standard", season },
+    }),
+
+    extractId: (item) => item?.id,
+  },
 };
 
+// =====================
+// HELPERS
+// =====================
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function pick(obj, keys) {
+  const out = {};
+  keys.forEach((k) => {
+    if (obj?.[k] !== undefined) out[k] = obj[k];
+  });
+  return out;
+}
+
+// =====================
+// ROUTES
+// =====================
+
+// Health
+app.get("/", (req, res) => res.send("PredictIA Engine Online"));
+
+// =====================
+// FOOTBALL ENDPOINTS
+// =====================
+
+// Jogos futebol (live ou por data)
+app.get("/football/games", async (req, res) => {
+  const date = req.query.date || todayISO();
+  const live = String(req.query.live || "").toLowerCase() === "true";
+  const max = Number(req.query.max || 20);
+
+  const cfg = ADAPTERS.football.getGames({ date, live });
+  const data = await apiSports(ADAPTERS.football.base, cfg.path, cfg.params);
+  const games = (data.response || []).slice(0, max);
+
+  res.json({
+    status: "ok",
+    count: games.length,
+    data: games.map((g) => ADAPTERS.football.extractLiveScore(g)),
+    raw: data.errors ? { errors: data.errors } : undefined,
+  });
+});
+
+// Placar ao vivo (mesmo /games mas filtrado)
+app.get("/football/live", async (req, res) => {
+  const cfg = ADAPTERS.football.getGames({ live: true });
+  const data = await apiSports(ADAPTERS.football.base, cfg.path, cfg.params);
+
+  const games = data.response || [];
+  res.json({
+    status: "ok",
+    count: games.length,
+    data: games.map((g) => ADAPTERS.football.extractLiveScore(g)),
+    raw: data.errors ? { errors: data.errors } : undefined,
+  });
+});
+
+// Estatísticas, gols, escanteios, cartões, odds, placar (por fixture)
+app.get("/football/match/:fixtureId", async (req, res) => {
+  const fixtureId = req.params.fixtureId;
+
+  const include = String(req.query.include || "score,stats,goals,corners,cards,odds").split(",");
+  const want = new Set(include.map((x) => x.trim()).filter(Boolean));
+
+  const out = { fixtureId };
+
+  // placar básico: pegamos pelo /fixtures?id=
+  if (want.has("score") || want.has("games")) {
+    const fixture = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
+    const item = (fixture.response || [])[0];
+    out.game = item || null;
+    out.live_score = item ? ADAPTERS.football.extractLiveScore(item) : null;
+  }
+
+  // stats
+  if (want.has("stats")) {
+    const s = await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
+    out.live_stats = s.response || [];
+    out._stats_errors = s.errors || undefined;
+  }
+
+  // events => goals, cards
+  if (want.has("goals") || want.has("cards") || want.has("events")) {
+    const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
+    const events = e.response || [];
+    out.events = want.has("events") ? events : undefined;
+    out.goals = want.has("goals") ? ADAPTERS.football.extractGoalsFromEvents(events) : undefined;
+    out.cards = want.has("cards") ? ADAPTERS.football.extractCardsFromEvents(events) : undefined;
+    out._events_errors = e.errors || undefined;
+  }
+
+  // corners from stats
+  if (want.has("corners")) {
+    const s = out.live_stats
+      ? { response: out.live_stats }
+      : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
+    out.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
+  }
+
+  // odds
+  if (want.has("odds")) {
+    const o = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
+    out.live_odds = o.response || [];
+    out._odds_errors = o.errors || undefined;
+  }
+
+  // IA
+  if (String(req.query.analysis || "").toLowerCase() === "true") {
+    out.ai_prediction = await getAIAnalysis(
+      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
+    );
+  }
+
+  res.json({ status: "ok", data: out });
+});
+
+// Classificação futebol
+app.get("/football/standings", async (req, res) => {
+  const league = req.query.league; // obrigatório no API-Football
+  const season = req.query.season; // obrigatório no API-Football
+
+  if (!league || !season) {
+    return res.status(400).json({ error: "Passe ?league=ID&season=YYYY" });
+  }
+
+  const s = await apiSports(FOOTBALL_BASE, "/standings", { league, season });
+  res.json({ status: "ok", data: s.response || [], raw: s.errors ? { errors: s.errors } : undefined });
+});
+
+// =====================
+// NBA ENDPOINTS
+// =====================
+
+// Jogos NBA por data
+app.get("/nba/games", async (req, res) => {
+  const date = req.query.date || todayISO();
+  const season = req.query.season || "2025";
+  const max = Number(req.query.max || 20);
+
+  const cfg = ADAPTERS.nba.getGames({ date, season });
+  const data = await apiSports(NBA_BASE, cfg.path, cfg.params);
+  const games = (data.response || []).slice(0, max);
+
+  res.json({
+    status: "ok",
+    count: games.length,
+    data: games.map((g) => ADAPTERS.nba.extractLiveScore(g)),
+    raw: data.errors ? { errors: data.errors } : undefined,
+  });
+});
+
+// Placar + estatísticas + odds (por game)
+app.get("/nba/match/:gameId", async (req, res) => {
+  const gameId = req.params.gameId;
+  const season = req.query.season || "2025";
+
+  const include = String(req.query.include || "score,stats,odds").split(",");
+  const want = new Set(include.map((x) => x.trim()).filter(Boolean));
+
+  const out = { gameId, season };
+
+  // score: pegamos do /games?id=
+  if (want.has("score")) {
+    const g = await apiSports(NBA_BASE, "/games", { id: gameId, season });
+    const item = (g.response || [])[0];
+    out.game = item || null;
+    out.live_score = item ? ADAPTERS.nba.extractLiveScore(item) : null;
+    out._game_errors = g.errors || undefined;
+  }
+
+  // stats
+  if (want.has("stats")) {
+    const s = await apiSports(NBA_BASE, "/games/statistics", { id: gameId });
+    out.live_stats = s.response || [];
+    out._stats_errors = s.errors || undefined;
+  }
+
+  // odds
+  if (want.has("odds")) {
+    const o = await apiSports(NBA_BASE, "/odds", { game: gameId, league: "standard", season });
+    out.live_odds = o.response || [];
+    out._odds_errors = o.errors || undefined;
+  }
+
+  // campos equivalentes solicitados
+  out.goals = []; // NBA não aplica
+  out.corners = { total: 0, perTeam: [] }; // NBA não aplica
+  out.cards = []; // NBA não aplica
+
+  // IA
+  if (String(req.query.analysis || "").toLowerCase() === "true") {
+    out.ai_prediction = await getAIAnalysis(
+      pick(out, ["live_score", "live_stats", "live_odds"])
+    );
+  }
+
+  res.json({ status: "ok", data: out });
+});
+
+// Classificação NBA
+app.get("/nba/standings", async (req, res) => {
+  const season = req.query.season || "2025";
+  const league = req.query.league || "standard";
+
+  const s = await apiSports(NBA_BASE, "/standings", { league, season });
+  res.json({ status: "ok", data: s.response || [], raw: s.errors ? { errors: s.errors } : undefined });
+});
+
+// =====================
+// UNIFIED SEARCH (POST) - compatível com seu endpoint antigo
+// =====================
 app.post("/alerts/search", async (req, res) => {
   try {
-    const { sport, date, maxGames = 6, include = {} } = req.body;
-    const adapter = ADAPTERS[sport];
+    const {
+      sport,
+      date,
+      maxGames = 6,
+      include = {
+        score: true,
+        stats: true,
+        goals: true,
+        corners: true,
+        cards: true,
+        odds: true,
+        standings: false,
+        analysis: false,
+      },
+      // standings params
+      league,
+      season,
+      // nba season
+      nbaSeason,
+      live = true,
+    } = req.body;
 
+    const adapter = ADAPTERS[sport];
     if (!adapter) return res.status(400).json({ error: "Esporte inválido." });
 
-    const gamesCfg = adapter.getGames(date);
+    // standings opcional
+    let standingsData = null;
+    if (include.standings) {
+      if (sport === "football") {
+        if (!league || !season) return res.status(400).json({ error: "Para futebol standings: informe league e season." });
+        const s = await apiSports(FOOTBALL_BASE, "/standings", { league, season });
+        standingsData = s.response || [];
+      } else if (sport === "nba") {
+        const s = await apiSports(NBA_BASE, "/standings", {
+          league: league || "standard",
+          season: nbaSeason || season || "2025",
+        });
+        standingsData = s.response || [];
+      }
+    }
+
+    // games
+    let gamesCfg;
+    if (sport === "football") {
+      gamesCfg = ADAPTERS.football.getGames({ date: date || todayISO(), live: !!live });
+    } else {
+      gamesCfg = ADAPTERS.nba.getGames({ date: date || todayISO(), season: nbaSeason || season || "2025" });
+    }
+
     const gamesData = await apiSports(adapter.base, gamesCfg.path, gamesCfg.params);
     const games = (gamesData.response || []).slice(0, maxGames);
 
-    const fullData = await Promise.all(games.map(async (game) => {
-      const id = adapter.extractId(game);
-      const details = { ...game };
+    const fullData = await Promise.all(
+      games.map(async (game) => {
+        const id = adapter.extractId(game);
+        const details = { ...game };
 
-      // Coleta Stats
-      if (include.stats) {
-        const s = await apiSports(adapter.base, adapter.stats(id).path, adapter.stats(id).params);
-        details.live_stats = s.response || [];
-      }
-      
-      // Coleta Odds
-      if (include.odds) {
-        const o = await apiSports(adapter.base, adapter.odds(id).path, adapter.odds(id).params);
-        details.live_odds = o.response || [];
-      }
+        // score
+        if (include.score) {
+          details.live_score =
+            sport === "football"
+              ? ADAPTERS.football.extractLiveScore(game)
+              : ADAPTERS.nba.extractLiveScore(game);
+        }
 
-      // Gera análise da IA se solicitado
-      if (include.analysis) {
-        details.ai_prediction = await getAIAnalysis({
-            teams: details.teams,
-            scores: details.scores,
-            stats: details.live_stats
-        });
-      }
+        // stats
+        if (include.stats) {
+          const sCfg = adapter.stats(id);
+          const s = await apiSports(adapter.base, sCfg.path, sCfg.params);
+          details.live_stats = s.response || [];
+        }
 
-      return details;
-    }));
+        // odds
+        if (include.odds) {
+          const oCfg = sport === "nba" ? adapter.odds(id, nbaSeason || season || "2025") : adapter.odds(id);
+          const o = await apiSports(adapter.base, oCfg.path, oCfg.params);
+          details.live_odds = o.response || [];
+        }
 
-    res.json({ status: "ok", count: fullData.length, data: fullData });
+        // futebol: goals/corners/cards
+        if (sport === "football") {
+          if (include.goals || include.cards) {
+            const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: id });
+            const events = e.response || [];
+            if (include.goals) details.goals = ADAPTERS.football.extractGoalsFromEvents(events);
+            if (include.cards) details.cards = ADAPTERS.football.extractCardsFromEvents(events);
+          }
+          if (include.corners) {
+            const s = details.live_stats
+              ? { response: details.live_stats }
+              : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: id });
+            details.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
+          }
+        } else {
+          // NBA não aplica
+          if (include.goals) details.goals = [];
+          if (include.cards) details.cards = [];
+          if (include.corners) details.corners = { total: 0, perTeam: [] };
+        }
 
+        // IA
+        if (include.analysis) {
+          details.ai_prediction = await getAIAnalysis({
+            sport,
+            score: details.live_score,
+            stats: details.live_stats,
+            odds: details.live_odds,
+            goals: details.goals,
+            cards: details.cards,
+            corners: details.corners,
+          });
+        }
+
+        return details;
+      })
+    );
+
+    res.json({
+      status: "ok",
+      sport,
+      count: fullData.length,
+      standings: standingsData,
+      data: fullData,
+      raw: gamesData.errors ? { errors: gamesData.errors } : undefined,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get("/", (req, res) => res.send("PredictIA Full Engine + AI Online"));
-
+// =====================
+// SERVER
+// =====================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
