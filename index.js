@@ -1,8 +1,9 @@
 // ======================================================
-// PredictIA Engine – index.js (COM GEMINI)
-// Lógica original PRESERVADA
-// Apenas: suporta filtro por leagueId no /football/live
-// + inclui league (id/name) no retorno do LIVE
+// PredictIA Engine – index.js (MODO ANTIGO / ESTÁVEL)
+// - Mantém o filtro por leagueId no /football/live (como combinamos)
+// - Mantém retorno do LIVE com league {id,name}
+// - VOLTA a IA para o modo antigo: prompt curto + gemini-pro
+// - Adiciona log do erro real (SEM mudar a resposta de erro)
 // ======================================================
 
 import "dotenv/config";
@@ -33,15 +34,29 @@ const NBA_BASE = "https://v2.nba.api-sports.io";
 // =====================
 const genAI = GENAI_KEY ? new GoogleGenerativeAI(GENAI_KEY) : null;
 
+// IA (MODO ANTIGO)
+async function getAIAnalysis(gameInfo) {
+  if (!genAI) return "IA não configurada.";
+  try {
+    const model = genAI.getGenerativeModel({ model: GENAI_MODEL });
+
+    const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
+Responda em PT-BR.
+Dê uma recomendação curta (máx 4 linhas), com risco (baixo/médio/alto) e 1 justificativa.
+Dados: ${JSON.stringify(gameInfo)}`;
+
+    const result = await model.generateContent(prompt);
+    return result.response.text();
+  } catch (err) {
+    console.error("GEMINI ERROR:", err?.message || err);
+    return "Erro na análise da IA.";
+  }
+}
+
 // =====================
 // UTILS
 // =====================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function todayISO() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
-}
 
 function pick(obj, keys) {
   const out = {};
@@ -94,7 +109,7 @@ async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1
 // =====================
 const ADAPTERS = {
   football: {
-    // >>> ALTERADO: aceita leagueId e repassa para a API-Football
+    // mantém o filtro leagueId (como combinamos)
     getGames: ({ date, live, leagueId }) => ({
       path: "/fixtures",
       params: live
@@ -102,7 +117,7 @@ const ADAPTERS = {
         : (leagueId ? { date, league: leagueId } : { date }),
     }),
 
-    // >>> ALTERADO: inclui league (id/name) no LIVE
+    // mantém league {id,name} no LIVE (para seu Android)
     extractLiveScore: (item) => ({
       fixtureId: item?.fixture?.id,
       league: item?.league ? { id: item.league.id, name: item.league.name } : null,
@@ -128,164 +143,16 @@ const ADAPTERS = {
       const total = perTeam.reduce((a, b) => a + Number(b.corners || 0), 0);
       return { total, perTeam };
     },
-
-    extractCornerLineFromOdds: (odds = []) => {
-      const markets = odds?.[0]?.odds || [];
-      const m =
-        markets.find((x) => /match corners/i.test(x.name)) ||
-        markets.find((x) => /total corners/i.test(x.name));
-      if (!m) return null;
-      const v = m.values.find((x) => x.handicap);
-      return { market: m.name, handicap: v?.handicap, odd: v?.odd };
-    },
   },
 };
-
-// =====================
-// COMPACTADORES (IA)
-// =====================
-function compactStats(live_stats = []) {
-  return live_stats.map((row) => {
-    const s = row.statistics || [];
-    const get = (t) => s.find((x) => x.type === t)?.value ?? null;
-    return {
-      team: row.team.name,
-      possession: get("Ball Possession"),
-      shots: get("Total Shots"),
-      shots_on_goal: get("Shots on Goal"),
-      corners: get("Corner Kicks"),
-      fouls: get("Fouls"),
-      xg: get("expected_goals"),
-    };
-  });
-}
-
-function compactOdds(live_odds = []) {
-  const odds = live_odds?.[0]?.odds || [];
-  const pick = (regex) => odds.find((o) => regex.test(o.name.toLowerCase()));
-  return {
-    match_corners: pick(/match corners|total corners/),
-    goals_ou: pick(/over\/under|total goals/),
-    btts: pick(/both teams to score|btts/),
-  };
-}
-
-function buildGeminiPayload(out) {
-  return {
-    fixtureId: out.fixtureId,
-    status: out.live_score?.status,
-    elapsed: out.live_score?.time,
-    teams: out.live_score?.teams,
-    goals: out.live_score?.goals,
-    stats: compactStats(out.live_stats),
-    corners: out.corners,
-    cards: out.cards,
-    goals_events: out.goals,
-    odds: compactOdds(out.live_odds),
-  };
-}
-
-// =====================
-// GEMINI ANALYSIS
-// =====================
-async function getAIAnalysis(payload) {
-  if (!genAI) return "IA não configurada.";
-
-  try {
-    const model = genAI.getGenerativeModel({ model: GENAI_MODEL });
-
-    const prompt = `
-Você é a PREDICT IA, um tipster profissional consolidado no mercado de apostas esportivas,
-com abordagem analítica, conservadora e orientada a valor esperado (EV).
-
-Você entende profundamente FUTEBOL e NBA e atua como um analista profissional,
-não como um apostador recreativo.
-
-════════════════════════════════════
-CONTEXTO DE ENTRADA
-════════════════════════════════════
-Você receberá EXCLUSIVAMENTE DADOS ESTRUTURADOS (JSON) de um jogo ao vivo,
-contendo informações como:
-placar, tempo, estatísticas, escanteios, cartões, eventos e odds.
-
-NÃO há imagem.
-NÃO há opinião do usuário.
-NÃO há dados externos além do JSON fornecido.
-
-════════════════════════════════════
-IDENTIFICAÇÃO DA MODALIDADE
-════════════════════════════════════
-Identifique a modalidade com base nos dados:
-
-• FUTEBOL
-• NBA
-
-Se não for possível identificar, responda apenas:
-INVALIDO
-
-════════════════════════════════════
-REGRAS GERAIS (INEGOCIÁVEIS)
-════════════════════════════════════
-• Nunca mencione IA, modelos, tecnologia ou fontes
-• Nunca prometa lucro garantido
-• Linguagem: português do Brasil
-• Seja técnico, objetivo e profissional
-• Baseie TODAS as decisões exclusivamente nos dados do JSON
-• NÃO invente gols, cartões, escanteios, tempo ou estatísticas
-• Se algum dado não existir, escreva: "não informado"
-• NÃO adapte respostas para agradar o usuário
-• NÃO valide apostas fora do critério mínimo
-
-════════════════════════════════════
-CRITÉRIO DE CONFIANÇA (REGRA CENTRAL)
-════════════════════════════════════
-• Apenas valide palpites com confiança estimada ≥ 65%
-• Qualquer mercado abaixo de 65% deve ser RECUSADO e NÃO listado
-
-════════════════════════════════════
-ANÁLISE – JOGO AO VIVO
-════════════════════════════════════
-Considere APENAS o que estiver disponível no JSON:
-• Placar atual e tempo
-• Posse de bola
-• Finalizações
-• xG
-• Escanteios
-• Cartões
-• Tendência do jogo
-• Odds e linhas disponíveis (se existirem)
-
-════════════════════════════════════
-ENTREGA DE PALPITES RECOMENDADOS
-════════════════════════════════════
-Entregue EXATAMENTE 3 palpites,
-ordenados do MAIS SEGURO para o MAIS ARRISCADO,
-TODOS com confiança estimada ≥ 65%.
-
-Para cada palpite, informe:
-• Mercado
-• Justificativa técnica (NO MÁXIMO 1 FRASE)
-• Confiança estimada (%)
-
-════════════════════════════════════
-DADOS DO JOGO (JSON)
-════════════════════════════════════
-${JSON.stringify(payload)}
-`.trim();
-
-    const r = await model.generateContent(prompt);
-    return r.response.text();
-  } catch {
-    return "Erro na análise da IA.";
-  }
-}
 
 // =====================
 // ROUTES
 // =====================
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 
-// >>> ALTERADO: aceita query ?leagueId=475 e repassa para ADAPTERS.football.getGames
+// LIVE com filtro por liga (como combinamos)
+// ex: /football/live?leagueId=475
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
 
@@ -294,20 +161,23 @@ app.get("/football/live", async (req, res) => {
 
   res.json({
     status: "ok",
-    data: data.response.map(ADAPTERS.football.extractLiveScore),
+    data: (data.response || []).map(ADAPTERS.football.extractLiveScore),
+    raw: data.errors ? { errors: data.errors } : undefined,
   });
 });
 
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
-  const wantAnalysis = req.query.analysis === "true";
+  const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
 
   const out = { fixtureId };
 
+  // base fixture sempre
   const base = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
   const item = base.response?.[0];
   if (!item) return res.status(404).json({ error: "Fixture não encontrado" });
 
+  out.game = item;
   out.live_score = ADAPTERS.football.extractLiveScore(item);
 
   const statsTry = await apiSportsRetryNonEmpty(
@@ -315,23 +185,21 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     "/fixtures/statistics",
     { fixture: fixtureId }
   );
-  out.live_stats = statsTry.response;
-  out.corners = ADAPTERS.football.extractCornersFromStats(statsTry.response);
+  out.live_stats = statsTry.response || [];
+  out.corners = ADAPTERS.football.extractCornersFromStats(out.live_stats);
 
-  const events = await apiSports(FOOTBALL_BASE, "/fixtures/events", {
-    fixture: fixtureId,
-  });
-  out.goals = ADAPTERS.football.extractGoalsFromEvents(events.response);
-  out.cards = ADAPTERS.football.extractCardsFromEvents(events.response);
+  const events = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
+  out.goals = ADAPTERS.football.extractGoalsFromEvents(events.response || []);
+  out.cards = ADAPTERS.football.extractCardsFromEvents(events.response || []);
 
-  const odds = await apiSports(FOOTBALL_BASE, "/odds/live", {
-    fixture: fixtureId,
-  });
-  out.live_odds = odds.response;
+  const odds = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
+  out.live_odds = odds.response || [];
 
   if (wantAnalysis) {
-    const payload = buildGeminiPayload(out);
-    out.ai_prediction = await getAIAnalysis(payload);
+    // MODO ANTIGO: manda dados “crus” (como antes) + prompt curto
+    out.ai_prediction = await getAIAnalysis(
+      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
+    );
   }
 
   res.json({ status: "ok", data: out });
