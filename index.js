@@ -3,21 +3,13 @@ import express from 'express';
 import cors from 'cors';
 
 const app = express();
-
-// Middlewares
 app.use(cors());
 app.use(express.json());
 
-// =========================
-// CONFIGURAÇÃO DE AMBIENTE
-// =========================
 const API_KEY = process.env.API_SPORTS_KEY;
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const NBA_BASE = "https://v2.nba.api-sports.io";
 
-// =========================
-// AUXILIAR DE REQUISIÇÃO
-// =========================
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
   Object.entries(params).forEach(([k, v]) => {
@@ -33,89 +25,68 @@ async function apiSports(base, path, params = {}) {
         "Accept": "application/json",
       }
     });
-
-    const data = await response.json();
-    return data;
+    return await response.json();
   } catch (error) {
-    console.error(`Erro na chamada API ${path}:`, error.message);
     return { response: [], errors: [error.message] };
   }
 }
 
-// =========================
-// ADAPTADORES
-// =========================
 const ADAPTERS = {
   football: {
     base: FOOTBALL_BASE,
-    liveGames: () => ({ path: "/fixtures", params: { live: "all" } }),
+    // Se passar data, usa data. Se não, usa live.
+    getGamesPath: (date) => ({ path: "/fixtures", params: date ? { date } : { live: "all" } }),
     stats: (id) => ({ path: "/fixtures/statistics", params: { fixture: id } }),
-    events: (id) => ({ path: "/fixtures/events", params: { fixture: id } }),
-    lineups: (id) => ({ path: "/fixtures/lineups", params: { fixture: id } }),
-    preLiveOdds: (id) => ({ path: "/odds", params: { fixture: id } }),
-    liveOdds: (id) => ({ path: "/odds/live", params: { fixture: id } }),
+    odds: (id) => ({ path: "/odds", params: { fixture: id } }),
     extractId: (item) => item.fixture?.id,
     extractMeta: (item) => ({
       id: item.fixture?.id,
-      home: item.teams?.home?.name,
-      away: item.teams?.away?.name,
-      score: `${item.goals?.home ?? 0}-${item.goals?.away ?? 0}`,
-      timer: item.fixture?.status?.elapsed
+      teams: `${item.teams?.home?.name} vs ${item.teams?.away?.name}`,
+      score: `${item.goals?.home ?? 0}-${item.goals?.away ?? 0}`
     })
   },
   nba: {
     base: NBA_BASE,
-    liveGames: () => ({ path: "/games", params: { live: "all" } }),
+    getGamesPath: (date) => ({ path: "/games", params: date ? { date } : { live: "all" } }),
     stats: (id) => ({ path: "/games/statistics", params: { id: id } }),
-    events: (id) => ({ path: "/games/events", params: { game: id } }),
-    lineups: (id) => ({ path: "/games/lineups", params: { game: id } }),
-    preLiveOdds: (id) => ({ path: "/odds", params: { game: id } }),
-    liveOdds: (id) => ({ path: "/odds", params: { game: id } }),
+    odds: (id) => ({ path: "/odds", params: { game: id } }),
     extractId: (item) => item.id,
     extractMeta: (item) => ({
       id: item.id,
-      home: item.teams?.home?.name,
-      away: item.teams?.visitors?.name,
-      score: `${item.scores?.home?.points ?? 0}-${item.scores?.visitors?.points ?? 0}`,
-      timer: item.status?.clock || item.status?.long
+      teams: `${item.teams?.home?.name} vs ${item.teams?.visitors?.name}`,
+      score: `${item.scores?.home?.points ?? 0}-${item.scores?.visitors?.points ?? 0}`
     })
   }
 };
 
-// =========================
-// ROTA PRINCIPAL
-// =========================
 app.post("/alerts/search", async (req, res) => {
   try {
-    const { sport, maxGames = 3, include = {} } = req.body;
+    const { sport, maxGames = 3, include = {}, date } = req.body;
     const adapter = ADAPTERS[sport];
 
     if (!adapter) return res.status(400).json({ error: "Sport inválido." });
 
-    const liveData = await apiSports(adapter.base, adapter.liveGames().path, adapter.liveGames().params);
-    const games = (liveData.response || []).slice(0, maxGames);
+    // Busca jogos (Live ou por Data)
+    const gamesCfg = adapter.getGamesPath(date);
+    const gamesData = await apiSports(adapter.base, gamesCfg.path, gamesCfg.params);
+    const games = (gamesData.response || []).slice(0, maxGames);
 
     const results = await Promise.all(games.map(async (game) => {
       const id = adapter.extractId(game);
-      const meta = adapter.extractMeta(game);
-      const details = { meta, live: game };
+      const details = { meta: adapter.extractMeta(game), live: game };
 
       if (include.stats) {
         const cfg = adapter.stats(id);
         details.stats = await apiSports(adapter.base, cfg.path, cfg.params);
       }
       if (include.odds) {
-        const pre = adapter.preLiveOdds(id);
-        const live = adapter.liveOdds(id);
-        details.odds = {
-          preLive: await apiSports(adapter.base, pre.path, pre.params),
-          live: await apiSports(adapter.base, live.path, live.params)
-        };
+        const cfg = adapter.odds(id);
+        details.odds = await apiSports(adapter.base, cfg.path, cfg.params);
       }
       return details;
     }));
 
-    res.json({ status: "ok", data: results });
+    res.json({ status: "ok", count: results.length, data: results });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -124,4 +95,4 @@ app.post("/alerts/search", async (req, res) => {
 app.get("/", (req, res) => res.send("PredictIA API Online"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor ativo na porta ${PORT}`));
