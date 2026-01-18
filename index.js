@@ -44,12 +44,11 @@ Dados: ${JSON.stringify(gameInfo)}`;
 // =====================
 // API-SPORTS CORE
 // =====================
-// FIX AQUI: NÃO USE "if (v)" (isso ignora 0/false). Use checagem correta.
+// FIX: NÃO IGNORAR 0/FALSE
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
 
   Object.entries(params).forEach(([k, v]) => {
-    // aceita 0, false, "0"; ignora apenas undefined, null e string vazia
     if (v !== undefined && v !== null && v !== "") {
       url.searchParams.set(k, String(v));
     }
@@ -92,24 +91,12 @@ const ADAPTERS = {
       params: live ? { live: "all" } : { date },
     }),
 
-    score: (fixture) => fixture?.goals ?? fixture?.score ?? {},
-
     stats: (fixtureId) => ({
       path: "/fixtures/statistics",
       params: { fixture: fixtureId },
     }),
 
     events: (fixtureId) => ({
-      path: "/fixtures/events",
-      params: { fixture: fixtureId },
-    }),
-
-    corners: (fixtureId) => ({
-      path: "/fixtures/statistics",
-      params: { fixture: fixtureId },
-    }),
-
-    cards: (fixtureId) => ({
       path: "/fixtures/events",
       params: { fixture: fixtureId },
     }),
@@ -265,49 +252,61 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
+// ✅ PATCH AQUI: SEMPRE BUSCAR O JOGO BASE + FIX include parsing + fixtureId numérico
 app.get("/football/match/:fixtureId", async (req, res) => {
-  const fixtureId = req.params.fixtureId;
+  const fixtureId = Number(req.params.fixtureId);
 
-  const include = String(req.query.include || "score,stats,goals,corners,cards,odds").split(",");
+  const includeRaw = req.query.include;
+  const include =
+    typeof includeRaw === "string" && includeRaw.trim().length > 0
+      ? includeRaw.split(",")
+      : ["score", "stats", "events", "goals", "corners", "cards", "odds"];
+
   const want = new Set(include.map((x) => x.trim()).filter(Boolean));
 
   const out = { fixtureId };
 
-  if (want.has("score") || want.has("games")) {
-    const fixture = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
-    const item = (fixture.response || [])[0];
-    out.game = item || null;
-    out.live_score = item ? ADAPTERS.football.extractLiveScore(item) : null;
+  // SEMPRE: buscar fixture base (placar/time/status)
+  const fixture = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
+  const item = (fixture.response || [])[0];
+
+  if (!item) {
+    return res.status(404).json({ error: "Fixture não encontrado", fixtureId });
   }
 
-  if (want.has("stats")) {
+  out.game = item;
+  out.live_score = ADAPTERS.football.extractLiveScore(item);
+
+  // stats
+  if (want.has("stats") || want.has("corners")) {
     const s = await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
-    out.live_stats = s.response || [];
+    if (want.has("stats")) out.live_stats = s.response || [];
     out._stats_errors = s.errors || undefined;
+
+    if (want.has("corners")) {
+      out.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
+    }
   }
 
-  if (want.has("goals") || want.has("cards") || want.has("events")) {
+  // events => goals/cards/events
+  if (want.has("events") || want.has("goals") || want.has("cards")) {
     const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
     const events = e.response || [];
-    out.events = want.has("events") ? events : undefined;
-    out.goals = want.has("goals") ? ADAPTERS.football.extractGoalsFromEvents(events) : undefined;
-    out.cards = want.has("cards") ? ADAPTERS.football.extractCardsFromEvents(events) : undefined;
     out._events_errors = e.errors || undefined;
+
+    if (want.has("events")) out.events = events;
+    if (want.has("goals")) out.goals = ADAPTERS.football.extractGoalsFromEvents(events);
+    if (want.has("cards")) out.cards = ADAPTERS.football.extractCardsFromEvents(events);
   }
 
-  if (want.has("corners")) {
-    const s = out.live_stats
-      ? { response: out.live_stats }
-      : await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
-    out.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
-  }
-
+  // odds
   if (want.has("odds")) {
     const o = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
     out.live_odds = o.response || [];
     out._odds_errors = o.errors || undefined;
   }
 
+  // IA
   if (String(req.query.analysis || "").toLowerCase() === "true") {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
