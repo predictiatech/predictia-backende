@@ -24,43 +24,66 @@ async function apiSports(base, path, params = {}) {
         "Accept": "application/json",
       }
     });
-    const json = await response.json();
-    return json;
+    return await response.json();
   } catch (error) {
-    return { errors: { internal: error.message } };
+    return { response: [], errors: { internal: error.message } };
   }
 }
 
+const ADAPTERS = {
+  football: {
+    base: FOOTBALL_BASE,
+    getGames: (date) => ({ path: "/fixtures", params: date ? { date } : { live: "all" } }),
+    stats: (id) => ({ path: "/fixtures/statistics", params: { fixture: id } }),
+    odds: (id) => ({ path: "/odds/live", params: { fixture: id } }), // Tenta odds ao vivo primeiro
+    extractId: (item) => item.fixture?.id
+  },
+  nba: {
+    base: NBA_BASE,
+    getGames: (date) => ({ path: "/games", params: { date: date || "2026-01-18", season: "2025" } }),
+    stats: (id) => ({ path: "/games/statistics", params: { id: id } }),
+    odds: (id) => ({ path: "/odds", params: { game: id } }),
+    extractId: (item) => item.id
+  }
+};
+
 app.post("/alerts/search", async (req, res) => {
   try {
-    const { sport, date, season = "2025" } = req.body;
-    const adapter = sport === 'nba' ? 
-      { base: NBA_BASE, path: "/games", params: { date, season } } :
-      { base: FOOTBALL_BASE, path: "/fixtures", params: { date } };
+    const { sport, date, maxGames = 6, include = {} } = req.body;
+    const adapter = ADAPTERS[sport];
 
-    // Caso não tenha data, tenta o live
-    if (!date) {
-      adapter.params = { live: "all" };
-    }
+    if (!adapter) return res.status(400).json({ error: "Esporte inválido." });
 
-    const gamesData = await apiSports(adapter.base, adapter.path, adapter.params);
+    const gamesCfg = adapter.getGames(date);
+    const gamesData = await apiSports(adapter.base, gamesCfg.path, gamesCfg.params);
+    const games = (gamesData.response || []).slice(0, maxGames);
 
-    // Retornamos TUDO para ver o que está acontecendo
-    res.json({
-      status: "check",
-      endpoint_chamado: adapter.path,
-      params_usados: adapter.params,
-      api_sports_errors: gamesData.errors, // <--- VEJA ISSO
-      api_sports_results: gamesData.results,
-      data: gamesData.response || []
-    });
+    // Agora buscamos os detalhes (Odds e Stats) para cada jogo em paralelo
+    const fullData = await Promise.all(games.map(async (game) => {
+      const id = adapter.extractId(game);
+      const details = { ...game };
+
+      if (include.stats) {
+        const s = await apiSports(adapter.base, adapter.stats(id).path, adapter.stats(id).params);
+        details.live_stats = s.response || [];
+      }
+      
+      if (include.odds) {
+        const o = await apiSports(adapter.base, adapter.odds(id).path, adapter.odds(id).params);
+        details.live_odds = o.response || [];
+      }
+
+      return details;
+    }));
+
+    res.json({ status: "ok", count: fullData.length, data: fullData });
 
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get("/", (req, res) => res.send("PredictIA Debug Mode Online"));
+app.get("/", (req, res) => res.send("PredictIA Full Engine Online"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
