@@ -1,198 +1,110 @@
-// ✅ COLE ESSE index.js COMPLETO (SUBSTITUI TUDO)
-// - NÃO usa gemini-1.5-flash fixo
-// - lista modelos reais do seu projeto (via sua GEMINI_API_KEY no Render)
-// - escolhe automaticamente um modelo que suporta generateContent
-// - cria /debug/gemini/models pra você testar com curl
-
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-const FOOTBALL_BASE = "https://v3.football.api-sports.io";
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const API_KEY = process.env.API_SPORTS_KEY;
+const FOOTBALL_BASE = process.env.FOOTBALL_BASE || "https://v3.football.api-sports.io";
+const NBA_BASE = process.env.NBA_BASE; // << OBRIGATÓRIO preencher no Render
 
-app.get("/", (_, res) => res.send("PredictIA backend v2 (debug-enabled)"));
+if (!API_KEY) console.warn("MISSING: API_SPORTS_KEY");
+if (!NBA_BASE) console.warn("MISSING: NBA_BASE");
 
-function extractJson(text) {
-  const s = text.indexOf("{");
-  const e = text.lastIndexOf("}");
-  if (s === -1 || e === -1 || e <= s) return null;
-  return text.slice(s, e + 1);
-}
-
-async function footballGet(path, qs = {}) {
-  const url = new URL(FOOTBALL_BASE + path);
-  Object.entries(qs).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
-  });
+async function apiSports(base, path, params = {}) {
+  const url = new URL(base + path);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== null && v !== undefined) url.searchParams.set(k, String(v));
+  }
 
   const r = await fetch(url.toString(), {
-    headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY },
+    headers: { "x-apisports-key": API_KEY },
   });
 
-  const raw = await r.text();
-  let data;
-  try { data = JSON.parse(raw); } catch { throw new Error(`API_FOOTBALL_BAD_JSON: ${raw.slice(0, 600)}`); }
-  if (!r.ok) throw new Error(`API_FOOTBALL_HTTP_${r.status}: ${raw.slice(0, 900)}`);
-
-  return data;
+  const text = await r.text();
+  if (!r.ok) throw new Error(`API_SPORTS_HTTP_${r.status}: ${text}`);
+  return JSON.parse(text);
 }
 
-async function geminiListModelsRaw() {
-  const r = await fetch(`${GEMINI_BASE}/models`, {
-    headers: { "x-goog-api-key": process.env.GEMINI_API_KEY },
-  });
+// ✅ MAPA DE ENDPOINTS
+// FUTEBOL (confirmado)
+const football = {
+  base: FOOTBALL_BASE,
+  liveGames: () => ({ path: "/fixtures", params: { live: "all" } }),
+  liveOdds: () => ({ path: "/odds/live", params: {} }),
+  stats: (fixtureId) => ({ path: "/fixtures/statistics", params: { fixture: fixtureId } }),
+  events: (fixtureId) => ({ path: "/fixtures/events", params: { fixture: fixtureId } }),
+  lineups: (fixtureId) => ({ path: "/fixtures/lineups", params: { fixture: fixtureId } }),
+  standings: (leagueId, season) => ({ path: "/standings", params: { league: leagueId, season } }),
+  predictions: (fixtureId) => ({ path: "/predictions", params: { fixture: fixtureId } }),
+};
 
-  const raw = await r.text();
-  let data;
-  try { data = JSON.parse(raw); } catch { throw new Error(`GEMINI_MODELS_BAD_JSON: ${raw.slice(0, 900)}`); }
-  if (!r.ok) throw new Error(`GEMINI_MODELS_HTTP_${r.status}: ${raw.slice(0, 1200)}`);
+// NBA (você vai colar os paths CERTOS do seu doc NBA)
+// ⚠️ Eu deixei placeholders porque cada produto NBA pode ter nomes diferentes.
+// Você vai só trocar as strings dos "path" abaixo conforme a doc da SUA conta.
+const nba = {
+  base: NBA_BASE,
+  liveGames: () => ({ path: "/games", params: { live: "all" } }),                 // <-- AJUSTE
+  liveOdds: () => ({ path: "/odds", params: { live: "all" } }),                   // <-- AJUSTE
+  stats: (gameId) => ({ path: "/games/statistics", params: { game: gameId } }),   // <-- AJUSTE
+  events: (gameId) => ({ path: "/games/events", params: { game: gameId } }),      // <-- AJUSTE (se existir)
+  lineups: (gameId) => ({ path: "/games/lineups", params: { game: gameId } }),    // <-- AJUSTE (se existir)
+  standings: (leagueId, season) => ({ path: "/standings", params: { league: leagueId, season } }), // <-- AJUSTE
+  predictions: (gameId) => ({ path: "/predictions", params: { game: gameId } }),  // <-- AJUSTE (se existir)
+};
 
-  return data.models ?? [];
-}
+const ADAPTERS = { football, nba };
 
-function supportsGenerateContent(m) {
-  const methods = m?.supportedGenerationMethods ?? [];
-  return Array.isArray(methods) && methods.includes("generateContent");
-}
-
-function normalizeModelName(name) {
-  if (!name) return null;
-  return String(name).replace(/^models\//, "");
-}
-
-async function pickGeminiModelId() {
-  // Se você definir no Render, força esse modelo:
-  // GEMINI_MODEL=gemini-pro   (exemplo)
-  if (process.env.GEMINI_MODEL) return process.env.GEMINI_MODEL;
-
-  const models = await geminiListModelsRaw();
-
-  // 1) pega qualquer modelo que suporta generateContent e pareça "gemini"
-  const candidates = models
-    .filter(supportsGenerateContent)
-    .map(m => m?.name)
-    .filter(Boolean)
-    .map(n => ({ raw: n, id: normalizeModelName(n), low: String(n).toLowerCase() }))
-    .filter(x => x.id && x.low.includes("gemini"));
-
-  if (candidates.length === 0) throw new Error("GEMINI_NO_COMPATIBLE_MODEL");
-
-  // 2) preferência: "pro" se existir, senão o primeiro
-  const pro = candidates.find(x => x.low.includes("pro"));
-  const chosen = (pro ?? candidates[0]).id;
-
-  console.log("GEMINI_MODEL_CHOSEN:", chosen);
-  return chosen;
-}
-
-// DEBUG: lista modelos disponíveis pro seu projeto (SEM mostrar sua key)
-app.get("/debug/gemini/models", async (req, res) => {
+// ✅ DEBUG: ver se a BASE NBA está certa e retorna algo
+app.get("/debug/nba/ping", async (req, res) => {
   try {
-    if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: "missing_env", missing: "GEMINI_API_KEY" });
-
-    const models = await geminiListModelsRaw();
-    const simplified = models.map(m => ({
-      name: m?.name,
-      supportedGenerationMethods: m?.supportedGenerationMethods ?? [],
-    }));
-
-    return res.json({ count: simplified.length, models: simplified });
+    if (!NBA_BASE) return res.status(500).json({ error: "missing_env", missing: "NBA_BASE" });
+    const { path, params } = nba.liveGames(); // tenta listar ao vivo
+    const data = await apiSports(nba.base, path, params);
+    return res.json({ ok: true, base: nba.base, sampleKeys: Object.keys(data) });
   } catch (e) {
-    console.error("DEBUG_MODELS_ERROR:", e);
-    return res.status(500).json({ error: "debug_models_error", detail: String(e?.message ?? e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-async function geminiGenerate(prompt) {
-  const modelId = await pickGeminiModelId();
-
-  const r = await fetch(`${GEMINI_BASE}/models/${modelId}:generateContent`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY,
-    },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2 },
-    }),
-  });
-
-  const raw = await r.text();
-  let data;
-  try { data = JSON.parse(raw); } catch { throw new Error(`GEMINI_HTTP_BAD_JSON: ${raw.slice(0, 1200)}`); }
-  if (!r.ok) throw new Error(`GEMINI_HTTP_${r.status}: ${raw.slice(0, 1400)}`);
-
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  if (!text) throw new Error(`GEMINI_EMPTY_TEXT: ${raw.slice(0, 900)}`);
-
-  return text;
-}
-
+// ✅ Endpoint principal do app
 app.post("/alerts/search", async (req, res) => {
   try {
-    if (!process.env.FOOTBALL_API_KEY) return res.status(500).json({ error: "missing_env", missing: "FOOTBALL_API_KEY" });
-    if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: "missing_env", missing: "GEMINI_API_KEY" });
+    const { sport } = req.body; // "football" ou "nba"
+    const a = ADAPTERS[sport];
+    if (!a) return res.status(400).json({ error: "invalid_sport" });
+    if (sport === "nba" && !NBA_BASE) return res.status(500).json({ error: "missing_env", missing: "NBA_BASE" });
 
-    const { sport, leagueId, teamId, all } = req.body ?? {};
-    if (sport !== "football") return res.json({ status: "empty", opportunities: [] });
+    // 1) pega jogos ao vivo
+    const liveCfg = a.liveGames();
+    const live = await apiSports(a.base, liveCfg.path, liveCfg.params);
 
-    const fixtures = await footballGet("/fixtures", {
-      live: "all",
-      league: all ? undefined : leagueId,
-      team: all ? undefined : teamId,
+    // 2) para cada jogo, você chama odds/stats/events/lineups/predictions/standings
+    // (aqui eu deixo só um exemplo com 1 jogo pra não explodir custo/tempo)
+    const first = live?.response?.[0];
+    if (!first) return res.json({ status: "ok", opportunities: [] });
+
+    const id = sport === "football" ? first.fixture?.id : (first.game?.id ?? first.id);
+
+    const odds = await apiSports(a.base, a.liveOdds().path, a.liveOdds().params);
+    const stats = await apiSports(a.base, a.stats(id).path, a.stats(id).params);
+
+    // (opcional) events/lineups/predictions/standings — só chamar igual:
+    // const events = await apiSports(a.base, a.events(id).path, a.events(id).params);
+
+    return res.json({
+      status: "ok",
+      debug: { sport, id },
+      live_sample: first,
+      odds_sample: odds?.response?.[0] ?? null,
+      stats_sample: stats?.response?.[0] ?? null,
     });
-
-    const list = fixtures?.response ?? [];
-
-    const candidates = list
-      .map((f) => ({
-        fixtureId: f?.fixture?.id,
-        league: f?.league?.name,
-        home: f?.teams?.home?.name,
-        away: f?.teams?.away?.name,
-        minute: f?.fixture?.status?.elapsed ?? 0,
-        score: `${f?.goals?.home ?? 0}-${f?.goals?.away ?? 0}`,
-      }))
-      .filter((x) => x.fixtureId && x.minute >= 50 && x.minute <= 88)
-      .slice(0, 8);
-
-    if (candidates.length === 0) return res.json({ status: "empty", opportunities: [] });
-
-    const prompt = `
-RESPONDA APENAS COM JSON VÁLIDO (sem texto extra, sem markdown).
-
-Formato:
-{"status":"ok","opportunities":[{"fixtureId":0,"league":"","home":"","away":"","minute":0,"score":"","tip":"","confidence":0}]}
-
-Se não houver oportunidade:
-{"status":"empty","opportunities":[]}
-
-Dados:
-${JSON.stringify(candidates)}
-`;
-
-    const modelText = await geminiGenerate(prompt);
-    const extracted = extractJson(modelText);
-    if (!extracted) return res.status(502).json({ error: "gemini_output_not_json", sample: modelText.slice(0, 400) });
-
-    let final;
-    try { final = JSON.parse(extracted); }
-    catch { return res.status(502).json({ error: "gemini_output_parse_fail", sample: extracted.slice(0, 600) }); }
-
-    if (!final?.status || !Array.isArray(final?.opportunities)) {
-      return res.status(502).json({ error: "gemini_bad_schema", final });
-    }
-
-    return res.json(final);
   } catch (e) {
-    console.error("BACKEND_ERROR:", e);
-    return res.status(500).json({ error: "backend_error", detail: String(e?.message ?? e) });
+    return res.status(500).json({ error: "backend_error", detail: String(e.message || e) });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+app.get("/", (req, res) => res.send("PredictIA backend (football+nba bases)"));
+
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Backend rodando na porta", PORT));
