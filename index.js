@@ -1,7 +1,8 @@
 // ======================================================
 // PredictIA Engine – index.js (COM GEMINI)
 // Lógica original PRESERVADA
-// Apenas: compactação + envio correto para IA
+// Apenas: suporta filtro por leagueId no /football/live
+// + inclui league (id/name) no retorno do LIVE
 // ======================================================
 
 import "dotenv/config";
@@ -93,13 +94,18 @@ async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1
 // =====================
 const ADAPTERS = {
   football: {
-    getGames: ({ date, live }) => ({
+    // >>> ALTERADO: aceita leagueId e repassa para a API-Football
+    getGames: ({ date, live, leagueId }) => ({
       path: "/fixtures",
-      params: live ? { live: "all" } : { date },
+      params: live
+        ? (leagueId ? { live: "all", league: leagueId } : { live: "all" })
+        : (leagueId ? { date, league: leagueId } : { date }),
     }),
 
+    // >>> ALTERADO: inclui league (id/name) no LIVE
     extractLiveScore: (item) => ({
       fixtureId: item?.fixture?.id,
+      league: item?.league ? { id: item.league.id, name: item.league.name } : null,
       teams: item?.teams,
       goals: item?.goals,
       score: item?.score,
@@ -156,8 +162,7 @@ function compactStats(live_stats = []) {
 
 function compactOdds(live_odds = []) {
   const odds = live_odds?.[0]?.odds || [];
-  const pick = (regex) =>
-    odds.find((o) => regex.test(o.name.toLowerCase()));
+  const pick = (regex) => odds.find((o) => regex.test(o.name.toLowerCase()));
   return {
     match_corners: pick(/match corners|total corners/),
     goals_ou: pick(/over\/under|total goals/),
@@ -275,15 +280,18 @@ ${JSON.stringify(payload)}
   }
 }
 
-
 // =====================
 // ROUTES
 // =====================
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 
-app.get("/football/live", async (_, res) => {
-  const cfg = ADAPTERS.football.getGames({ live: true });
+// >>> ALTERADO: aceita query ?leagueId=475 e repassa para ADAPTERS.football.getGames
+app.get("/football/live", async (req, res) => {
+  const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
+
+  const cfg = ADAPTERS.football.getGames({ live: true, leagueId });
   const data = await apiSports(FOOTBALL_BASE, cfg.path, cfg.params);
+
   res.json({
     status: "ok",
     data: data.response.map(ADAPTERS.football.extractLiveScore),
