@@ -1,4 +1,4 @@
-
+// ✅ package.json (recomendado) — garanta Node 20
 {
   "name": "predictia-backend",
   "version": "1.0.0",
