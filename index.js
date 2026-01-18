@@ -44,10 +44,15 @@ Dados: ${JSON.stringify(gameInfo)}`;
 // =====================
 // API-SPORTS CORE
 // =====================
+// FIX AQUI: NÃO USE "if (v)" (isso ignora 0/false). Use checagem correta.
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
+
   Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
+    // aceita 0, false, "0"; ignora apenas undefined, null e string vazia
+    if (v !== undefined && v !== null && v !== "") {
+      url.searchParams.set(k, String(v));
+    }
   });
 
   try {
@@ -60,6 +65,7 @@ async function apiSports(base, path, params = {}) {
     });
 
     const json = await response.json();
+
     if (!response.ok) {
       return {
         response: [],
@@ -67,6 +73,7 @@ async function apiSports(base, path, params = {}) {
         raw: json,
       };
     }
+
     return json;
   } catch (error) {
     return { response: [], errors: { internal: error.message } };
@@ -80,56 +87,45 @@ const ADAPTERS = {
   football: {
     base: FOOTBALL_BASE,
 
-    // jogos (live ou por data)
     getGames: ({ date, live }) => ({
       path: "/fixtures",
       params: live ? { live: "all" } : { date },
     }),
 
-    // placar do jogo (vem no /fixtures)
     score: (fixture) => fixture?.goals ?? fixture?.score ?? {},
 
-    // estatísticas ao vivo (posse, chutes, etc)
     stats: (fixtureId) => ({
       path: "/fixtures/statistics",
       params: { fixture: fixtureId },
     }),
 
-    // eventos ao vivo (gols, cartões, substituições)
     events: (fixtureId) => ({
       path: "/fixtures/events",
       params: { fixture: fixtureId },
     }),
 
-    // escanteios e cartões (também dá para derivar de stats/events)
-    // mantemos separado e normalizamos no extractor
-    // (não existe endpoint "corners" dedicado no v3; vem em statistics)
-    // cartões vêm em events
     corners: (fixtureId) => ({
       path: "/fixtures/statistics",
       params: { fixture: fixtureId },
     }),
+
     cards: (fixtureId) => ({
       path: "/fixtures/events",
       params: { fixture: fixtureId },
     }),
 
-    // odds (ao vivo)
     odds: (fixtureId) => ({
       path: "/odds/live",
       params: { fixture: fixtureId },
     }),
 
-    // classificação
     standings: ({ league, season }) => ({
       path: "/standings",
       params: { league, season },
     }),
 
-    // ids
     extractId: (item) => item?.fixture?.id,
 
-    // normalizações
     extractLiveScore: (item) => ({
       fixtureId: item?.fixture?.id,
       league: item?.league,
@@ -141,7 +137,7 @@ const ADAPTERS = {
     }),
 
     extractGoalsFromEvents: (events = []) =>
-      events
+      (events || [])
         .filter((e) => e?.type === "Goal")
         .map((e) => ({
           time: e?.time,
@@ -153,18 +149,17 @@ const ADAPTERS = {
         })),
 
     extractCardsFromEvents: (events = []) =>
-      events
+      (events || [])
         .filter((e) => e?.type === "Card")
         .map((e) => ({
           time: e?.time,
           team: e?.team,
           player: e?.player,
-          detail: e?.detail, // Yellow Card / Red Card etc.
+          detail: e?.detail,
           comments: e?.comments,
         })),
 
     extractCornersFromStats: (statsResponse = []) => {
-      // statsResponse: [{team, statistics:[{type,value},...]}]
       const perTeam = (statsResponse || []).map((row) => {
         const s = row?.statistics || [];
         const corners = s.find((x) => x?.type === "Corner Kicks")?.value ?? 0;
@@ -179,13 +174,11 @@ const ADAPTERS = {
   nba: {
     base: NBA_BASE,
 
-    // jogos (a API v2 NBA não tem "live=all" igual futebol; usa date + status se quiser)
     getGames: ({ date, season }) => ({
       path: "/games",
       params: { date, season },
     }),
 
-    // placar do jogo (vem em /games)
     extractLiveScore: (item) => ({
       gameId: item?.id,
       league: item?.league,
@@ -196,24 +189,16 @@ const ADAPTERS = {
       date: item?.date,
     }),
 
-    // estatísticas (team/player)
     stats: (gameId) => ({
       path: "/games/statistics",
       params: { id: gameId },
     }),
 
-    // "gols" no NBA = pontos (derivado do placar)
-    // "cartões" não aplica; retorna vazio
-    // "escanteios" não aplica; retorna vazio
-
-    // odds (ajuste: sua assinatura pode exigir endpoint /odds e params específicos)
-    // mantemos como estava, com liga + season
     odds: (gameId, season) => ({
       path: "/odds",
       params: { game: gameId, league: "standard", season },
     }),
 
-    // classificação NBA (standings)
     standings: ({ league, season }) => ({
       path: "/standings",
       params: { league: league || "standard", season },
@@ -245,15 +230,11 @@ function pick(obj, keys) {
 // =====================
 // ROUTES
 // =====================
-
-// Health
 app.get("/", (req, res) => res.send("PredictIA Engine Online"));
 
 // =====================
 // FOOTBALL ENDPOINTS
 // =====================
-
-// Jogos futebol (live ou por data)
 app.get("/football/games", async (req, res) => {
   const date = req.query.date || todayISO();
   const live = String(req.query.live || "").toLowerCase() === "true";
@@ -271,7 +252,6 @@ app.get("/football/games", async (req, res) => {
   });
 });
 
-// Placar ao vivo (mesmo /games mas filtrado)
 app.get("/football/live", async (req, res) => {
   const cfg = ADAPTERS.football.getGames({ live: true });
   const data = await apiSports(ADAPTERS.football.base, cfg.path, cfg.params);
@@ -285,7 +265,6 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// Estatísticas, gols, escanteios, cartões, odds, placar (por fixture)
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = req.params.fixtureId;
 
@@ -294,7 +273,6 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 
   const out = { fixtureId };
 
-  // placar básico: pegamos pelo /fixtures?id=
   if (want.has("score") || want.has("games")) {
     const fixture = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
     const item = (fixture.response || [])[0];
@@ -302,14 +280,12 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     out.live_score = item ? ADAPTERS.football.extractLiveScore(item) : null;
   }
 
-  // stats
   if (want.has("stats")) {
     const s = await apiSports(FOOTBALL_BASE, "/fixtures/statistics", { fixture: fixtureId });
     out.live_stats = s.response || [];
     out._stats_errors = s.errors || undefined;
   }
 
-  // events => goals, cards
   if (want.has("goals") || want.has("cards") || want.has("events")) {
     const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
     const events = e.response || [];
@@ -319,7 +295,6 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     out._events_errors = e.errors || undefined;
   }
 
-  // corners from stats
   if (want.has("corners")) {
     const s = out.live_stats
       ? { response: out.live_stats }
@@ -327,14 +302,12 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     out.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
   }
 
-  // odds
   if (want.has("odds")) {
     const o = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
     out.live_odds = o.response || [];
     out._odds_errors = o.errors || undefined;
   }
 
-  // IA
   if (String(req.query.analysis || "").toLowerCase() === "true") {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
@@ -344,10 +317,9 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   res.json({ status: "ok", data: out });
 });
 
-// Classificação futebol
 app.get("/football/standings", async (req, res) => {
-  const league = req.query.league; // obrigatório no API-Football
-  const season = req.query.season; // obrigatório no API-Football
+  const league = req.query.league;
+  const season = req.query.season;
 
   if (!league || !season) {
     return res.status(400).json({ error: "Passe ?league=ID&season=YYYY" });
@@ -360,8 +332,6 @@ app.get("/football/standings", async (req, res) => {
 // =====================
 // NBA ENDPOINTS
 // =====================
-
-// Jogos NBA por data
 app.get("/nba/games", async (req, res) => {
   const date = req.query.date || todayISO();
   const season = req.query.season || "2025";
@@ -379,7 +349,6 @@ app.get("/nba/games", async (req, res) => {
   });
 });
 
-// Placar + estatísticas + odds (por game)
 app.get("/nba/match/:gameId", async (req, res) => {
   const gameId = req.params.gameId;
   const season = req.query.season || "2025";
@@ -389,7 +358,6 @@ app.get("/nba/match/:gameId", async (req, res) => {
 
   const out = { gameId, season };
 
-  // score: pegamos do /games?id=
   if (want.has("score")) {
     const g = await apiSports(NBA_BASE, "/games", { id: gameId, season });
     const item = (g.response || [])[0];
@@ -398,36 +366,29 @@ app.get("/nba/match/:gameId", async (req, res) => {
     out._game_errors = g.errors || undefined;
   }
 
-  // stats
   if (want.has("stats")) {
     const s = await apiSports(NBA_BASE, "/games/statistics", { id: gameId });
     out.live_stats = s.response || [];
     out._stats_errors = s.errors || undefined;
   }
 
-  // odds
   if (want.has("odds")) {
     const o = await apiSports(NBA_BASE, "/odds", { game: gameId, league: "standard", season });
     out.live_odds = o.response || [];
     out._odds_errors = o.errors || undefined;
   }
 
-  // campos equivalentes solicitados
-  out.goals = []; // NBA não aplica
-  out.corners = { total: 0, perTeam: [] }; // NBA não aplica
-  out.cards = []; // NBA não aplica
+  out.goals = [];
+  out.corners = { total: 0, perTeam: [] };
+  out.cards = [];
 
-  // IA
   if (String(req.query.analysis || "").toLowerCase() === "true") {
-    out.ai_prediction = await getAIAnalysis(
-      pick(out, ["live_score", "live_stats", "live_odds"])
-    );
+    out.ai_prediction = await getAIAnalysis(pick(out, ["live_score", "live_stats", "live_odds"]));
   }
 
   res.json({ status: "ok", data: out });
 });
 
-// Classificação NBA
 app.get("/nba/standings", async (req, res) => {
   const season = req.query.season || "2025";
   const league = req.query.league || "standard";
@@ -437,7 +398,7 @@ app.get("/nba/standings", async (req, res) => {
 });
 
 // =====================
-// UNIFIED SEARCH (POST) - compatível com seu endpoint antigo
+// UNIFIED SEARCH (POST)
 // =====================
 app.post("/alerts/search", async (req, res) => {
   try {
@@ -455,10 +416,8 @@ app.post("/alerts/search", async (req, res) => {
         standings: false,
         analysis: false,
       },
-      // standings params
       league,
       season,
-      // nba season
       nbaSeason,
       live = true,
     } = req.body;
@@ -466,7 +425,6 @@ app.post("/alerts/search", async (req, res) => {
     const adapter = ADAPTERS[sport];
     if (!adapter) return res.status(400).json({ error: "Esporte inválido." });
 
-    // standings opcional
     let standingsData = null;
     if (include.standings) {
       if (sport === "football") {
@@ -482,7 +440,6 @@ app.post("/alerts/search", async (req, res) => {
       }
     }
 
-    // games
     let gamesCfg;
     if (sport === "football") {
       gamesCfg = ADAPTERS.football.getGames({ date: date || todayISO(), live: !!live });
@@ -498,7 +455,6 @@ app.post("/alerts/search", async (req, res) => {
         const id = adapter.extractId(game);
         const details = { ...game };
 
-        // score
         if (include.score) {
           details.live_score =
             sport === "football"
@@ -506,21 +462,18 @@ app.post("/alerts/search", async (req, res) => {
               : ADAPTERS.nba.extractLiveScore(game);
         }
 
-        // stats
         if (include.stats) {
           const sCfg = adapter.stats(id);
           const s = await apiSports(adapter.base, sCfg.path, sCfg.params);
           details.live_stats = s.response || [];
         }
 
-        // odds
         if (include.odds) {
           const oCfg = sport === "nba" ? adapter.odds(id, nbaSeason || season || "2025") : adapter.odds(id);
           const o = await apiSports(adapter.base, oCfg.path, oCfg.params);
           details.live_odds = o.response || [];
         }
 
-        // futebol: goals/corners/cards
         if (sport === "football") {
           if (include.goals || include.cards) {
             const e = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: id });
@@ -535,13 +488,11 @@ app.post("/alerts/search", async (req, res) => {
             details.corners = ADAPTERS.football.extractCornersFromStats(s.response || []);
           }
         } else {
-          // NBA não aplica
           if (include.goals) details.goals = [];
           if (include.cards) details.cards = [];
           if (include.corners) details.corners = { total: 0, perTeam: [] };
         }
 
-        // IA
         if (include.analysis) {
           details.ai_prediction = await getAIAnalysis({
             sport,
