@@ -1,12 +1,9 @@
 // ======================================================
-// PredictIA Engine – index.js (FOOTBALL + NBA + GEMINI 2.5 FLASH + GREEN %)
-// - NÃO encerra no start (logs de crash)
-// - Gemini: resolve modelo via ListModels (v1beta) e escolhe um que suporte generateContent
-// - Prompt força: "Probabilidade de GREEN: XX%" (para o app extrair)
-// - FOOTBALL: /football/live?leagueId=475  e /football/match/:fixtureId?analysis=true
-// - NBA: /nba/live?season=2024&league=12  e /nba/game/:gameId?analysis=true
-// - NBA Odds (opcional): The Odds API (ODDS_API_KEY) -> h2h/spreads/totals
-// - Rota debug: /gemini/models
+// PredictIA Engine – index.js (FOOTBALL + NBA LIVE ONLY + GEMINI + GREEN % FIX)
+// - NBA: SOMENTE jogos AO VIVO (bloqueia jogos finalizados/passados)
+// - IA: nunca retorna % duplicado (mantém só a primeira %)
+// - IA: não roda em jogo finalizado (retorna mensagem padrão)
+// - Mantém FUTEBOL como está
 // ======================================================
 
 import "dotenv/config";
@@ -26,13 +23,13 @@ app.use(express.json());
 // =====================
 // ENV
 // =====================
-const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY; // mesmo header x-apisports-key
+const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
 // Odds (opcional)
-const ODDS_API_KEY = process.env.ODDS_API_KEY || ""; // The Odds API v4
-const ODDS_BASE = "https://api.the-odds-api.com/v4"; // fixo
+const ODDS_API_KEY = process.env.ODDS_API_KEY || "";
+const ODDS_BASE = "https://api.the-odds-api.com/v4";
 
 if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
@@ -124,9 +121,31 @@ async function generateGemini(prompt) {
   return result?.response?.text?.() || "";
 }
 
-function ensureGreenPercent(text) {
-  if (/\b\d{2,3}%\b/.test(text)) return text;
-  return `${String(text || "").trim()}\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Estimativa padrão.`;
+// mantém APENAS a primeira porcentagem e remove duplicadas;
+// se não tiver %, adiciona um fallback (uma só vez).
+function ensureSingleGreenPercent(text) {
+  const t = String(text || "").trim();
+  const matches = [...t.matchAll(/(\d{2,3})%/g)];
+
+  if (matches.length === 0) {
+    return `${t}\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Estimativa padrão.`;
+  }
+
+  const first = matches[0][1]; // só o número
+  // remove QUALQUER linha "Probabilidade de GREEN: xx%" existente
+  // e remove qualquer "%"" restante
+  let cleaned = t
+    .replace(/(?i)probabilidade\s+de\s+green\s*:\s*\d{2,3}%/g, "")
+    .replace(/(\d{2,3})%/g, "")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+
+  // garante formato final com UMA única % no padrão
+  // mantém até 3 linhas acima; se vier mais, o app ainda aceita, mas aqui reduzimos
+  const lines = cleaned.split("\n").map((x) => x.trim()).filter(Boolean).slice(0, 3);
+  cleaned = lines.join("\n");
+
+  return `${cleaned}\nProbabilidade de GREEN: ${first}%`;
 }
 
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte") {
@@ -146,7 +165,7 @@ Dados: ${JSON.stringify(gameInfo)}`;
 
   try {
     const text = await generateGemini(prompt);
-    return ensureGreenPercent(text || "Erro na análise da IA.");
+    return ensureSingleGreenPercent(text || "Erro na análise da IA.");
   } catch (err) {
     console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
     console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
@@ -168,6 +187,34 @@ function pick(obj, keys) {
     if (obj?.[k] !== undefined) out[k] = obj[k];
   });
   return out;
+}
+
+// NBA: considera "ao vivo" somente se clock existir OU short indicar em andamento.
+// (mantém tolerante porque a API pode variar)
+function isNbaLiveGame(game) {
+  const short = Number(game?.status?.short);
+  const clock = game?.status?.clock;
+
+  // heurística segura:
+  // - clock presente => ao vivo
+  if (clock !== null && clock !== undefined && String(clock).trim() !== "") return true;
+
+  // alguns retornos: short 1/2 = em andamento; 3 = finished
+  // se for diferente de 3 e tiver periods.current > 0, trata como em andamento
+  const periodsCurrent = Number(game?.periods?.current || 0);
+  if (short && short !== 3 && periodsCurrent > 0) return true;
+
+  // fallback: status.long contém "live"/"in play"
+  const long = String(game?.status?.long || "").toLowerCase();
+  if (long.includes("live") || long.includes("in play") || long.includes("in progress")) return true;
+
+  return false;
+}
+
+function isNbaFinishedGame(game) {
+  const short = Number(game?.status?.short);
+  const long = String(game?.status?.long || "").toLowerCase();
+  return short === 3 || long.includes("finished") || long.includes("final");
 }
 
 // =====================
@@ -207,10 +254,11 @@ async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1
 // =====================
 // THE ODDS API (OPCIONAL) - NBA
 // =====================
-// Observação: isso NÃO vem do API-SPORTS NBA. É um provedor externo.
-// Ative com ODDS_API_KEY no Render.
-// Retorna odds pré-jogo e/ou em tempo real dependendo do mercado/região.
-async function getNbaOddsFromOddsApi({ regions = "us", markets = "h2h,spreads,totals", oddsFormat = "decimal" } = {}) {
+async function getNbaOddsFromOddsApi({
+  regions = "us",
+  markets = "h2h,spreads,totals",
+  oddsFormat = "decimal",
+} = {}) {
   if (!ODDS_API_KEY) return { ok: false, data: [], error: "ODDS_API_KEY não configurada." };
 
   const url = new URL(`${ODDS_BASE}/sports/basketball_nba/odds`);
@@ -229,7 +277,6 @@ async function getNbaOddsFromOddsApi({ regions = "us", markets = "h2h,spreads,to
   }
 }
 
-// tenta casar odds por nome de time (simples)
 function matchOddsByTeams(oddsEvents, homeName, awayName) {
   const h = String(homeName || "").toLowerCase();
   const a = String(awayName || "").toLowerCase();
@@ -284,9 +331,6 @@ const ADAPTERS = {
   },
 
   nba: {
-    // /games
-    // params úteis: id, live, date, season, league
-    // league geralmente é "12" (NBA) em muitos setups do API-NBA
     getGames: ({ id, live, date, season, league }) => ({
       path: "/games",
       params: id
@@ -296,20 +340,21 @@ const ADAPTERS = {
           : { date, season, league },
     }),
 
-    // /games/statistics
     getGameStats: ({ game }) => ({ path: "/games/statistics", params: { game } }),
+    getPlayersStats: ({ game, season }) => ({
+      path: "/players/statistics",
+      params: { game, season },
+    }),
 
-    // /players/statistics (player stats por jogo)
-    // alguns planos/contas suportam game=ID
-    getPlayersStats: ({ game, season }) => ({ path: "/players/statistics", params: { game, season } }),
-
-    // estrutura típica: response -> itens com game, teams, scores, status
     extractLiveGame: (item) => ({
       gameId: item?.id,
-      league: item?.league ? { id: item.league.id, name: item.league.name, season: item.league.season } : null,
+      league: item?.league
+        ? { id: item.league.id, name: item.league.name, season: item.league.season }
+        : null,
       teams: item?.teams,
       scores: item?.scores,
       status: item?.status,
+      periods: item?.periods,
     }),
   },
 };
@@ -338,10 +383,8 @@ app.get("/gemini/models", async (_, res) => {
 });
 
 // ---------------------
-// FOOTBALL
+// FOOTBALL (mantido)
 // ---------------------
-
-// /football/live?leagueId=475
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
 
@@ -355,7 +398,6 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// /football/match/:fixtureId?analysis=true
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
@@ -395,7 +437,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 });
 
 // ---------------------
-// NBA
+// NBA (LIVE ONLY)
 // ---------------------
 
 // /nba/live?season=2024&league=12
@@ -406,14 +448,18 @@ app.get("/nba/live", async (req, res) => {
   const cfg = ADAPTERS.nba.getGames({ live: true, season, league });
   const data = await apiSports(NBA_BASE, cfg.path, cfg.params);
 
+  // GARANTE: só retorna os que estão ao vivo (heurística)
+  const liveOnly = (data.response || []).filter((g) => isNbaLiveGame(g));
+
   res.json({
     status: "ok",
-    data: (data.response || []).map(ADAPTERS.nba.extractLiveGame),
+    data: liveOnly.map(ADAPTERS.nba.extractLiveGame),
     raw: data.errors ? { errors: data.errors } : undefined,
   });
 });
 
 // /nba/game/:gameId?analysis=true&season=2024&league=12
+// BLOQUEIA jogos não-ao-vivo (passados/finalizados)
 app.get("/nba/game/:gameId", async (req, res) => {
   const gameId = Number(req.params.gameId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
@@ -422,34 +468,37 @@ app.get("/nba/game/:gameId", async (req, res) => {
 
   const out = { gameId };
 
-  // 1) jogo base
   const baseCfg = ADAPTERS.nba.getGames({ id: gameId, season, league });
   const base = await apiSports(NBA_BASE, baseCfg.path, baseCfg.params);
 
   const game = base.response?.[0];
   if (!game) return res.status(404).json({ error: "Game não encontrado" });
 
+  // SE NÃO ESTIVER AO VIVO, BLOQUEIA
+  if (!isNbaLiveGame(game) || isNbaFinishedGame(game)) {
+    return res.status(409).json({
+      status: "not-live",
+      error: "Somente jogos ao vivo são permitidos para NBA.",
+      data: { gameId, status: game?.status, teams: game?.teams },
+    });
+  }
+
   out.game = game;
   out.live_game = ADAPTERS.nba.extractLiveGame(game);
 
-  // 2) stats por time (do jogo)
   const statsCfg = ADAPTERS.nba.getGameStats({ game: gameId });
   const statsTry = await apiSportsRetryNonEmpty(NBA_BASE, statsCfg.path, statsCfg.params);
   out.team_stats = statsTry.response || [];
 
-  // 3) stats de jogadores (por jogo) - se endpoint estiver disponível no seu plano
-  // Se vier vazio, não quebra.
   const plyCfg = ADAPTERS.nba.getPlayersStats({ game: gameId, season });
   const plyTry = await apiSportsRetryNonEmpty(NBA_BASE, plyCfg.path, plyCfg.params, 2, 900);
   out.player_stats = plyTry.response || [];
 
-  // 4) odds (opcional, via The Odds API)
-  // tentamos casar pelo nome dos times
   const homeName = game?.teams?.home?.name || "";
-  const awayName = game?.teams?.away?.name || "";
+  const awayName = game?.teams?.visitors?.name || game?.teams?.away?.name || "";
 
   if (ODDS_API_KEY) {
-    const oddsAll = await getNbaOddsFromOddsApi(); 
+    const oddsAll = await getNbaOddsFromOddsApi();
     out.odds_source = oddsAll.ok ? "the-odds-api" : "the-odds-api-error";
     out.odds_error = oddsAll.ok ? undefined : oddsAll.error;
     out.odds_raw = oddsAll.ok ? undefined : oddsAll.raw;
@@ -461,7 +510,6 @@ app.get("/nba/game/:gameId", async (req, res) => {
     out.odds_source = "not-configured";
   }
 
-  // 5) IA
   if (wantAnalysis) {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_game", "team_stats", "player_stats", "odds_event"]),
