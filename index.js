@@ -1,13 +1,18 @@
 // ======================================================
-// CAUSA DO ERRO:
-// - IA falhou por QUOTA (HTTP 429 Too Many Requests) no Gemini Free Tier.
-// - A API respondeu inclusive com retryDelay ~55s.
-// OBJETIVO DO FIX:
-// - NÃO retornar "Erro na análise da IA." em 429
-// - Aplicar retry automático respeitando retryDelay (1 tentativa)
-// - Aplicar rate-limit por fixture/game (cache curto) p/ não estourar quota
-// - Manter futebol + NBA + live-only como está
-// - Odds NBA: continua tentando /odds (se vier vazio é porque o endpoint/plano ainda não retorna odds para live)
+// OBJETIVO:
+// - Manter futebol como está
+// - Pegar NBA AO VIVO + stats + players + odds usando API-BASKETBALL (assinatura "basketball")
+// - Sem quebrar seu provider atual (API-NBA v2): você escolhe via ENV
+//
+// COMO USAR (ENV):
+//   NBA_PROVIDER=basketball   -> usa https://v1.basketball.api-sports.io (API-BASKETBALL)  ✅ recomendado p/ sua assinatura
+//   NBA_PROVIDER=nba          -> usa https://v2.nba.api-sports.io (API-NBA) (se você tiver esse plano)
+//
+// OBS:
+// - Base URL do Basketball: https://v1.basketball.api-sports.io
+// - Endpoint de team stats: /games/statistics/teams
+//   (aparece na doc/refs)  https://v1.basketball.api-sports.io/games/statistics/teams  :contentReference[oaicite:0]{index=0}
+//
 // ======================================================
 
 import "dotenv/config";
@@ -31,11 +36,19 @@ const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
+const NBA_PROVIDER = (process.env.NBA_PROVIDER || "basketball").toLowerCase(); // "basketball" | "nba"
+
+// NBA League ID (API-BASKETBALL). Se você souber o ID certo da NBA na sua conta, coloque aqui:
+const BASKETBALL_NBA_LEAGUE_ID = process.env.BASKETBALL_NBA_LEAGUE_ID
+  ? Number(process.env.BASKETBALL_NBA_LEAGUE_ID)
+  : undefined;
+
 if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
 
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const NBA_BASE = "https://v2.nba.api-sports.io";
+const BASKETBALL_BASE = "https://v1.basketball.api-sports.io"; // :contentReference[oaicite:1]{index=1}
 
 // =====================
 // GEMINI (AUTO-LISTMODELS)
@@ -154,11 +167,8 @@ function ensureSingleGreenPercent(text) {
 // =====================
 // IA QUOTA PROTECTION (CACHE + RETRY 429)
 // =====================
-
-// cache por jogo/fixture para não chamar Gemini repetidamente
-// TTL curto porque é "ao vivo"
-const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000); // 60s
-const _aiCache = new Map(); // key -> { value, exp }
+const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000);
+const _aiCache = new Map();
 
 function aiCacheGet(key) {
   const row = _aiCache.get(key);
@@ -174,13 +184,12 @@ function aiCacheSet(key, value) {
   _aiCache.set(key, { value, exp: Date.now() + AI_CACHE_TTL_MS });
 }
 
-// extrai retryDelay do erro do Gemini (errorDetails)
 function parseRetryDelaySeconds(err) {
   const details = err?.errorDetails;
   if (!Array.isArray(details)) return null;
 
   const retryInfo = details.find((d) => d?.["@type"] === "type.googleapis.com/google.rpc.RetryInfo");
-  const raw = retryInfo?.retryDelay; // ex "55s"
+  const raw = retryInfo?.retryDelay;
   if (!raw) return null;
 
   const m = String(raw).match(/(\d+)\s*s/i);
@@ -192,10 +201,19 @@ function parseRetryDelaySeconds(err) {
   return sec;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function pick(obj, keys) {
+  const out = {};
+  keys.forEach((k) => {
+    if (obj?.[k] !== undefined) out[k] = obj[k];
+  });
+  return out;
+}
+
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
 
-  // 1) cache
   if (cacheKey) {
     const cached = aiCacheGet(cacheKey);
     if (cached) return cached;
@@ -213,7 +231,6 @@ Risco: baixo|médio|alto
 Justificativa: <1 frase>
 Dados: ${JSON.stringify(gameInfo)}`;
 
-  // 2) tentativa + retry 429 (1 vez)
   try {
     const text = await generateGemini(prompt);
     const finalText = ensureSingleGreenPercent(text || "Erro na análise da IA.");
@@ -222,18 +239,15 @@ Dados: ${JSON.stringify(gameInfo)}`;
   } catch (err) {
     const status = err?.status;
 
-    // QUOTA / RATE LIMIT
     if (status === 429) {
       const sec = parseRetryDelaySeconds(err);
-      // resposta amigável (e consistente para o app)
       const msg = sec
         ? `IA em limite de uso. Tente novamente em ~${sec}s.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Limite de cota/velocidade da IA.`
         : `IA em limite de uso. Tente novamente mais tarde.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Limite de cota/velocidade da IA.`;
 
-      // opcional: retry automático 1x, mas só se o delay for pequeno (<=60s)
       if (sec && sec <= 60) {
         try {
-          await new Promise((r) => setTimeout(r, (sec + 1) * 1000));
+          await sleep((sec + 1) * 1000);
           const text2 = await generateGemini(prompt);
           const finalText2 = ensureSingleGreenPercent(text2 || msg);
           if (cacheKey) aiCacheSet(cacheKey, finalText2);
@@ -260,20 +274,11 @@ Dados: ${JSON.stringify(gameInfo)}`;
 }
 
 // =====================
-// UTILS
+// LIVE CHECKS
 // =====================
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function pick(obj, keys) {
-  const out = {};
-  keys.forEach((k) => {
-    if (obj?.[k] !== undefined) out[k] = obj[k];
-  });
-  return out;
-}
-
-// NBA LIVE checks
-function isNbaLiveGame(game) {
+// Provider API-NBA v2 (seu atual)
+function isNbaLiveGame_v2(game) {
   const short = Number(game?.status?.short);
   const clock = game?.status?.clock;
 
@@ -288,10 +293,31 @@ function isNbaLiveGame(game) {
   return false;
 }
 
-function isNbaFinishedGame(game) {
+function isNbaFinishedGame_v2(game) {
   const short = Number(game?.status?.short);
   const long = String(game?.status?.long || "").toLowerCase();
   return short === 3 || long.includes("finished") || long.includes("final");
+}
+
+// Provider API-BASKETBALL v1 (assinatura "basketball")
+function isBasketballLiveGame_v1(game) {
+  const status = String(game?.status?.short || game?.status?.long || "").toLowerCase();
+  const timer = game?.timer;
+
+  // doc/status: tipicamente "live" / "inplay" / "1q" etc (varia por liga)
+  if (timer !== null && timer !== undefined && String(timer).trim() !== "") return true;
+
+  if (status.includes("live") || status.includes("in play") || status.includes("inplay")) return true;
+
+  const st = String(game?.status?.short || "").toUpperCase();
+  if (["Q1", "Q2", "Q3", "Q4", "OT", "HT"].includes(st)) return true;
+
+  return false;
+}
+
+function isBasketballFinishedGame_v1(game) {
+  const st = String(game?.status?.short || game?.status?.long || "").toLowerCase();
+  return st.includes("ft") || st.includes("finished") || st.includes("final") || st === "end";
 }
 
 // =====================
@@ -368,22 +394,15 @@ const ADAPTERS = {
     },
   },
 
-  nba: {
-    // FIX: live deve ser usado sozinho
+  // SEU ADAPTER ATUAL (API-NBA v2)
+  nba_v2: {
     getGames: ({ id, live, date, season, league }) => ({
       path: "/games",
       params: id ? { id } : live ? { live: "all" } : { date, season, league },
     }),
 
     getGameStats: ({ game }) => ({ path: "/games/statistics", params: { game } }),
-
-    getPlayersStats: ({ game, season }) => ({
-      path: "/players/statistics",
-      params: { game, season },
-    }),
-
-    // ODDS via API-SPORTS NBA (tentativa padrão)
-    // Se sua conta exigir outro endpoint/param, me envie o erro que ajusto.
+    getPlayersStats: ({ game, season }) => ({ path: "/players/statistics", params: { game, season } }),
     getOdds: ({ game }) => ({ path: "/odds", params: { game } }),
 
     extractLiveGame: (item) => ({
@@ -397,30 +416,48 @@ const ADAPTERS = {
       periods: item?.periods,
     }),
   },
+
+  // NOVO ADAPTER (API-BASKETBALL v1) - assinatura "basketball"
+  basketball_v1: {
+    // /games?live=all (&league=NBA_ID opcional)
+    getGames: ({ id, live, date, league }) => ({
+      path: "/games",
+      params: id
+        ? { id }
+        : live
+          ? league
+            ? { live: "all", league }
+            : { live: "all" }
+          : { date, league },
+    }),
+
+    // Team stats: /games/statistics/teams?game=ID  :contentReference[oaicite:2]{index=2}
+    getTeamStats: ({ game }) => ({ path: "/games/statistics/teams", params: { game } }),
+
+    // Player stats: /games/statistics/players?game=ID  (padrão do API-BASKETBALL)
+    getPlayersStats: ({ game }) => ({ path: "/games/statistics/players", params: { game } }),
+
+    // Odds: /odds?game=ID  (se vier vazio, é cobertura/plano/mercado)
+    getOdds: ({ game }) => ({ path: "/odds", params: { game } }),
+
+    extractLiveGame: (item) => ({
+      gameId: item?.id,
+      league: item?.league ? { id: item.league.id, name: item.league.name, season: item.league.season } : null,
+      country: item?.country ? { id: item.country.id, name: item.country.name } : null,
+      teams: item?.teams,
+      scores: item?.scores,
+      status: item?.status,
+      timer: item?.timer,
+      date: item?.date,
+      time: item?.time,
+    }),
+  },
 };
 
 // =====================
 // ROUTES
 // =====================
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
-
-// DEBUG: modelos Gemini
-app.get("/gemini/models", async (_, res) => {
-  try {
-    if (!genAI) return res.status(500).json({ status: "error", error: "IA não configurada." });
-
-    const models = await listGeminiModels();
-    const supported = pickSupportedGenerateContent(models).map((m) => ({
-      name: normalizeModelName(m?.name),
-      supportedGenerationMethods: m?.supportedGenerationMethods,
-    }));
-    const resolved = await getResolvedModelName();
-
-    res.json({ status: "ok", raw: GENAI_MODEL_RAW, resolved, supported });
-  } catch (e) {
-    res.status(500).json({ status: "error", error: e?.message || String(e), raw: e?.raw });
-  }
-});
 
 // ---------------------
 // FOOTBALL (mantido)
@@ -478,37 +515,67 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 });
 
 // ---------------------
-// NBA (LIVE ONLY + ODDS via API-SPORTS NBA)
+// NBA (LIVE ONLY) - PROVIDER SWITCH
 // ---------------------
+
+function getNbaProvider() {
+  if (NBA_PROVIDER === "nba") {
+    return {
+      base: NBA_BASE,
+      adapter: ADAPTERS.nba_v2,
+      isLive: isNbaLiveGame_v2,
+      isFinished: isNbaFinishedGame_v2,
+      leagueParam: undefined,
+      label: "NBA (Basquete) - API-NBA v2",
+    };
+  }
+
+  return {
+    base: BASKETBALL_BASE,
+    adapter: ADAPTERS.basketball_v1,
+    isLive: isBasketballLiveGame_v1,
+    isFinished: isBasketballFinishedGame_v1,
+    leagueParam: BASKETBALL_NBA_LEAGUE_ID,
+    label: "NBA (Basquete) - API-BASKETBALL v1",
+  };
+}
 
 // /nba/live
 app.get("/nba/live", async (_req, res) => {
-  const cfg = ADAPTERS.nba.getGames({ live: true });
-  const data = await apiSports(NBA_BASE, cfg.path, cfg.params);
+  const p = getNbaProvider();
 
-  const liveOnly = (data.response || []).filter((g) => isNbaLiveGame(g));
+  const cfg = p.adapter.getGames({
+    live: true,
+    league: p.leagueParam,
+  });
+
+  const data = await apiSports(p.base, cfg.path, cfg.params);
+  const liveOnly = (data.response || []).filter((g) => p.isLive(g) && !p.isFinished(g));
 
   res.json({
     status: "ok",
-    data: liveOnly.map(ADAPTERS.nba.extractLiveGame),
+    provider: NBA_PROVIDER,
+    data: liveOnly.map(p.adapter.extractLiveGame),
     raw: data.errors ? { errors: data.errors } : undefined,
   });
 });
 
 // /nba/game/:gameId?analysis=true
 app.get("/nba/game/:gameId", async (req, res) => {
+  const p = getNbaProvider();
+
   const gameId = Number(req.params.gameId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
 
-  const out = { gameId };
+  const out = { gameId, provider: NBA_PROVIDER };
 
-  const baseCfg = ADAPTERS.nba.getGames({ id: gameId });
-  const base = await apiSports(NBA_BASE, baseCfg.path, baseCfg.params);
+  const baseCfg = p.adapter.getGames({ id: gameId });
+  const base = await apiSports(p.base, baseCfg.path, baseCfg.params);
 
   const game = base.response?.[0];
   if (!game) return res.status(404).json({ error: "Game não encontrado" });
 
-  if (!isNbaLiveGame(game) || isNbaFinishedGame(game)) {
+  if (!p.isLive(game) || p.isFinished(game)) {
     return res.status(409).json({
       status: "not-live",
       error: "Somente jogos ao vivo são permitidos para NBA.",
@@ -517,25 +584,36 @@ app.get("/nba/game/:gameId", async (req, res) => {
   }
 
   out.game = game;
-  out.live_game = ADAPTERS.nba.extractLiveGame(game);
+  out.live_game = p.adapter.extractLiveGame(game);
 
-  const statsCfg = ADAPTERS.nba.getGameStats({ game: gameId });
-  const statsTry = await apiSportsRetryNonEmpty(NBA_BASE, statsCfg.path, statsCfg.params);
-  out.team_stats = statsTry.response || [];
+  // STATS / PLAYERS / ODDS (dependem do provider)
+  if (NBA_PROVIDER === "nba") {
+    const statsCfg = p.adapter.getGameStats({ game: gameId });
+    const statsTry = await apiSportsRetryNonEmpty(p.base, statsCfg.path, statsCfg.params);
+    out.team_stats = statsTry.response || [];
 
-  const plyCfg = ADAPTERS.nba.getPlayersStats({ game: gameId });
-  const plyTry = await apiSportsRetryNonEmpty(NBA_BASE, plyCfg.path, plyCfg.params, 2, 900);
-  out.player_stats = plyTry.response || [];
+    const plyCfg = p.adapter.getPlayersStats({ game: gameId });
+    const plyTry = await apiSportsRetryNonEmpty(p.base, plyCfg.path, plyCfg.params, 2, 900);
+    out.player_stats = plyTry.response || [];
+  } else {
+    const statsCfg = p.adapter.getTeamStats({ game: gameId });
+    const statsTry = await apiSportsRetryNonEmpty(p.base, statsCfg.path, statsCfg.params);
+    out.team_stats = statsTry.response || [];
 
-  const oddsCfg = ADAPTERS.nba.getOdds({ game: gameId });
-  const oddsTry = await apiSportsRetryNonEmpty(NBA_BASE, oddsCfg.path, oddsCfg.params, 2, 900);
+    const plyCfg = p.adapter.getPlayersStats({ game: gameId });
+    const plyTry = await apiSportsRetryNonEmpty(p.base, plyCfg.path, plyCfg.params, 2, 900);
+    out.player_stats = plyTry.response || [];
+  }
+
+  const oddsCfg = p.adapter.getOdds({ game: gameId });
+  const oddsTry = await apiSportsRetryNonEmpty(p.base, oddsCfg.path, oddsCfg.params, 2, 900);
   out.live_odds = oddsTry.response || [];
 
   if (wantAnalysis) {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_game", "team_stats", "player_stats", "live_odds"]),
-      "NBA (Basquete)",
-      `nba:${gameId}`
+      p.label,
+      `nba:${NBA_PROVIDER}:${gameId}`
     );
   }
 
