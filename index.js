@@ -1,10 +1,12 @@
 // ======================================================
-// PredictIA Engine – index.js (FIX + GREEN % NO PALPITE)
+// PredictIA Engine – index.js (FOOTBALL + NBA + GEMINI 2.5 FLASH + GREEN %)
 // - NÃO encerra no start (logs de crash)
 // - Gemini: resolve modelo via ListModels (v1beta) e escolhe um que suporte generateContent
-// - Prompt força: "Probabilidade de GREEN: XX%"
-// - Mantém rotas: /football/live e /football/match/:fixtureId?analysis=true
-// - Rota extra: /gemini/models (debug)
+// - Prompt força: "Probabilidade de GREEN: XX%" (para o app extrair)
+// - FOOTBALL: /football/live?leagueId=475  e /football/match/:fixtureId?analysis=true
+// - NBA: /nba/live?season=2024&league=12  e /nba/game/:gameId?analysis=true
+// - NBA Odds (opcional): The Odds API (ODDS_API_KEY) -> h2h/spreads/totals
+// - Rota debug: /gemini/models
 // ======================================================
 
 import "dotenv/config";
@@ -12,13 +14,9 @@ import express from "express";
 import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// ---------- BOOT SAFETY (pra ver o erro real no Render) ----------
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT_EXCEPTION:", err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("UNHANDLED_REJECTION:", reason);
-});
+// ---------- BOOT SAFETY ----------
+process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION:", err));
+process.on("unhandledRejection", (reason) => console.error("UNHANDLED_REJECTION:", reason));
 
 // ---------- APP ----------
 const app = express();
@@ -28,20 +26,22 @@ app.use(express.json());
 // =====================
 // ENV
 // =====================
-const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
+const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY; // mesmo header x-apisports-key
 const GENAI_KEY = process.env.GEMINI_API_KEY;
-
-// Render:
-// GEMINI_MODEL=gemini-2.5-flash
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
+
+// Odds (opcional)
+const ODDS_API_KEY = process.env.ODDS_API_KEY || ""; // The Odds API v4
+const ODDS_BASE = "https://api.the-odds-api.com/v4"; // fixo
 
 if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
 
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
+const NBA_BASE = "https://v2.nba.api-sports.io";
 
 // =====================
-// GEMINI
+// GEMINI (AUTO-LISTMODELS)
 // =====================
 const genAI = GENAI_KEY ? new GoogleGenerativeAI(GENAI_KEY) : null;
 
@@ -66,7 +66,6 @@ async function listGeminiModels() {
     e.raw = j;
     throw e;
   }
-
   return Array.isArray(j?.models) ? j.models : [];
 }
 
@@ -81,15 +80,12 @@ function resolveByHint(models, hintRaw) {
   const supported = pickSupportedGenerateContent(models);
   const names = supported.map((m) => normalizeModelName(m?.name));
 
-  // 1) match exato
   const exact = names.find((n) => n.toLowerCase() === hint);
   if (exact) return exact;
 
-  // 2) match por prefixo
   const prefix = names.find((n) => n.toLowerCase().startsWith(hint));
   if (prefix) return prefix;
 
-  // 3) heurística: se pedir 2.5 flash, tenta achar algo que contenha 2.5 + flash
   if (hint.includes("2.5") && hint.includes("flash")) {
     const flash25 = names.find(
       (n) => n.toLowerCase().includes("2.5") && n.toLowerCase().includes("flash")
@@ -97,7 +93,6 @@ function resolveByHint(models, hintRaw) {
     if (flash25) return flash25;
   }
 
-  // 4) fallback: primeiro suportado
   return names[0] || null;
 }
 
@@ -110,7 +105,7 @@ async function getResolvedModelName() {
   const models = await listGeminiModels();
   const resolved = resolveByHint(models, GENAI_MODEL_RAW);
 
-  _cachedResolvedModel = resolved; // sem "models/"
+  _cachedResolvedModel = resolved;
   _cachedAt = now;
 
   return _cachedResolvedModel;
@@ -130,18 +125,15 @@ async function generateGemini(prompt) {
 }
 
 function ensureGreenPercent(text) {
-  // garante que exista algum "XX%"
   if (/\b\d{2,3}%\b/.test(text)) return text;
-
-  // fallback controlado (pra não quebrar seu regex no Android)
   return `${String(text || "").trim()}\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Estimativa padrão.`;
 }
 
-async function getAIAnalysis(gameInfo) {
+async function getAIAnalysis(gameInfo, sportLabel = "Esporte") {
   if (!genAI) return "IA não configurada.";
 
-  // PROMPT FORÇANDO % (para seu app mostrar)
   const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
+Esporte: ${sportLabel}
 Responda em PT-BR.
 Retorne APENAS texto simples (sem Markdown).
 Máximo 4 linhas.
@@ -184,9 +176,7 @@ function pick(obj, keys) {
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
   Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== "") {
-      url.searchParams.set(k, String(v));
-    }
+    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   });
 
   try {
@@ -195,9 +185,7 @@ async function apiSports(base, path, params = {}) {
     });
 
     const json = await response.json();
-    if (!response.ok) {
-      return { response: [], errors: { http: response.status }, raw: json };
-    }
+    if (!response.ok) return { response: [], errors: { http: response.status }, raw: json };
     return json;
   } catch (e) {
     return { response: [], errors: { internal: e?.message || String(e) } };
@@ -214,6 +202,45 @@ async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1
     if (i < tries - 1) await sleep(delayMs);
   }
   return { ...(last || { response: [] }), _retry: { tries, ok: false } };
+}
+
+// =====================
+// THE ODDS API (OPCIONAL) - NBA
+// =====================
+// Observação: isso NÃO vem do API-SPORTS NBA. É um provedor externo.
+// Ative com ODDS_API_KEY no Render.
+// Retorna odds pré-jogo e/ou em tempo real dependendo do mercado/região.
+async function getNbaOddsFromOddsApi({ regions = "us", markets = "h2h,spreads,totals", oddsFormat = "decimal" } = {}) {
+  if (!ODDS_API_KEY) return { ok: false, data: [], error: "ODDS_API_KEY não configurada." };
+
+  const url = new URL(`${ODDS_BASE}/sports/basketball_nba/odds`);
+  url.searchParams.set("apiKey", ODDS_API_KEY);
+  url.searchParams.set("regions", regions);
+  url.searchParams.set("markets", markets);
+  url.searchParams.set("oddsFormat", oddsFormat);
+
+  try {
+    const r = await fetch(url.toString());
+    const j = await r.json();
+    if (!r.ok) return { ok: false, data: [], error: `HTTP ${r.status}`, raw: j };
+    return { ok: true, data: j };
+  } catch (e) {
+    return { ok: false, data: [], error: e?.message || String(e) };
+  }
+}
+
+// tenta casar odds por nome de time (simples)
+function matchOddsByTeams(oddsEvents, homeName, awayName) {
+  const h = String(homeName || "").toLowerCase();
+  const a = String(awayName || "").toLowerCase();
+
+  const ev = (oddsEvents || []).find((x) => {
+    const oh = String(x?.home_team || "").toLowerCase();
+    const oa = String(x?.away_team || "").toLowerCase();
+    return (oh.includes(h) && oa.includes(a)) || (oh.includes(a) && oa.includes(h));
+  });
+
+  return ev || null;
 }
 
 // =====================
@@ -255,6 +282,36 @@ const ADAPTERS = {
       return { total, perTeam };
     },
   },
+
+  nba: {
+    // /games
+    // params úteis: id, live, date, season, league
+    // league geralmente é "12" (NBA) em muitos setups do API-NBA
+    getGames: ({ id, live, date, season, league }) => ({
+      path: "/games",
+      params: id
+        ? { id }
+        : live
+          ? { live: "all", season, league }
+          : { date, season, league },
+    }),
+
+    // /games/statistics
+    getGameStats: ({ game }) => ({ path: "/games/statistics", params: { game } }),
+
+    // /players/statistics (player stats por jogo)
+    // alguns planos/contas suportam game=ID
+    getPlayersStats: ({ game, season }) => ({ path: "/players/statistics", params: { game, season } }),
+
+    // estrutura típica: response -> itens com game, teams, scores, status
+    extractLiveGame: (item) => ({
+      gameId: item?.id,
+      league: item?.league ? { id: item.league.id, name: item.league.name, season: item.league.season } : null,
+      teams: item?.teams,
+      scores: item?.scores,
+      status: item?.status,
+    }),
+  },
 };
 
 // =====================
@@ -262,7 +319,7 @@ const ADAPTERS = {
 // =====================
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 
-// DEBUG: ver modelos disponíveis e qual foi escolhido
+// DEBUG: modelos Gemini
 app.get("/gemini/models", async (_, res) => {
   try {
     if (!genAI) return res.status(500).json({ status: "error", error: "IA não configurada." });
@@ -280,7 +337,11 @@ app.get("/gemini/models", async (_, res) => {
   }
 });
 
-// LIVE com filtro por liga: /football/live?leagueId=475
+// ---------------------
+// FOOTBALL
+// ---------------------
+
+// /football/live?leagueId=475
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
 
@@ -294,7 +355,7 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// Jogo: /football/match/:fixtureId?analysis=true
+// /football/match/:fixtureId?analysis=true
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
@@ -325,7 +386,86 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 
   if (wantAnalysis) {
     out.ai_prediction = await getAIAnalysis(
-      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
+      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"]),
+      "Futebol"
+    );
+  }
+
+  res.json({ status: "ok", data: out });
+});
+
+// ---------------------
+// NBA
+// ---------------------
+
+// /nba/live?season=2024&league=12
+app.get("/nba/live", async (req, res) => {
+  const season = req.query.season ? Number(req.query.season) : undefined;
+  const league = req.query.league ? Number(req.query.league) : 12;
+
+  const cfg = ADAPTERS.nba.getGames({ live: true, season, league });
+  const data = await apiSports(NBA_BASE, cfg.path, cfg.params);
+
+  res.json({
+    status: "ok",
+    data: (data.response || []).map(ADAPTERS.nba.extractLiveGame),
+    raw: data.errors ? { errors: data.errors } : undefined,
+  });
+});
+
+// /nba/game/:gameId?analysis=true&season=2024&league=12
+app.get("/nba/game/:gameId", async (req, res) => {
+  const gameId = Number(req.params.gameId);
+  const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
+  const season = req.query.season ? Number(req.query.season) : undefined;
+  const league = req.query.league ? Number(req.query.league) : 12;
+
+  const out = { gameId };
+
+  // 1) jogo base
+  const baseCfg = ADAPTERS.nba.getGames({ id: gameId, season, league });
+  const base = await apiSports(NBA_BASE, baseCfg.path, baseCfg.params);
+
+  const game = base.response?.[0];
+  if (!game) return res.status(404).json({ error: "Game não encontrado" });
+
+  out.game = game;
+  out.live_game = ADAPTERS.nba.extractLiveGame(game);
+
+  // 2) stats por time (do jogo)
+  const statsCfg = ADAPTERS.nba.getGameStats({ game: gameId });
+  const statsTry = await apiSportsRetryNonEmpty(NBA_BASE, statsCfg.path, statsCfg.params);
+  out.team_stats = statsTry.response || [];
+
+  // 3) stats de jogadores (por jogo) - se endpoint estiver disponível no seu plano
+  // Se vier vazio, não quebra.
+  const plyCfg = ADAPTERS.nba.getPlayersStats({ game: gameId, season });
+  const plyTry = await apiSportsRetryNonEmpty(NBA_BASE, plyCfg.path, plyCfg.params, 2, 900);
+  out.player_stats = plyTry.response || [];
+
+  // 4) odds (opcional, via The Odds API)
+  // tentamos casar pelo nome dos times
+  const homeName = game?.teams?.home?.name || "";
+  const awayName = game?.teams?.away?.name || "";
+
+  if (ODDS_API_KEY) {
+    const oddsAll = await getNbaOddsFromOddsApi();
+    out.odds_source = oddsAll.ok ? "the-odds-api" : "the-odds-api-error";
+    out.odds_error = oddsAll.ok ? undefined : oddsAll.error;
+    out.odds_raw = oddsAll.ok ? undefined : oddsAll.raw;
+
+    if (oddsAll.ok) {
+      out.odds_event = matchOddsByTeams(oddsAll.data, homeName, awayName);
+    }
+  } else {
+    out.odds_source = "not-configured";
+  }
+
+  // 5) IA
+  if (wantAnalysis) {
+    out.ai_prediction = await getAIAnalysis(
+      pick(out, ["live_game", "team_stats", "player_stats", "odds_event"]),
+      "NBA (Basquete)"
     );
   }
 
