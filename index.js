@@ -1,8 +1,48 @@
+// ======================================================
+// PredictIA Engine – index.js (FIX: NÃO ENCERRA NO START + GEMINI 2.5 FLASH)
+// - Sem "export" (evita crash em runtime por cópia/cola)
+// - Logs de erro no boot (uncaughtException/unhandledRejection)
+// - Gemini: resolve modelo via ListModels (v1beta) e escolhe um que suporte generateContent
+// - Mantém rotas: /football/live e /football/match/:fixtureId?analysis=true
+// - Rota extra: /gemini/models (debug)
+// ======================================================
+
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+// ---------- BOOT SAFETY (pra ver o erro real no Render) ----------
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT_EXCEPTION:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED_REJECTION:", reason);
+});
+
+// ---------- APP ----------
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// =====================
+// ENV
+// =====================
+const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
+
+// você pode setar no Render:
+// GEMINI_MODEL=gemini-2.5-flash
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
+if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
+if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
+
+const FOOTBALL_BASE = "https://v3.football.api-sports.io";
+
+// =====================
+// GEMINI
+// =====================
 const genAI = GENAI_KEY ? new GoogleGenerativeAI(GENAI_KEY) : null;
 
 let _cachedResolvedModel = null;
@@ -41,13 +81,15 @@ function resolveByHint(models, hintRaw) {
   const supported = pickSupportedGenerateContent(models);
   const names = supported.map((m) => normalizeModelName(m?.name));
 
+  // 1) match exato
   const exact = names.find((n) => n.toLowerCase() === hint);
   if (exact) return exact;
 
+  // 2) match por prefixo
   const prefix = names.find((n) => n.toLowerCase().startsWith(hint));
   if (prefix) return prefix;
 
-  // fallback: tenta algo que contenha "2.5" e "flash"
+  // 3) heurística: se pedir 2.5 flash, tenta achar algo que contenha 2.5 + flash
   if (hint.includes("2.5") && hint.includes("flash")) {
     const flash25 = names.find(
       (n) => n.toLowerCase().includes("2.5") && n.toLowerCase().includes("flash")
@@ -55,6 +97,7 @@ function resolveByHint(models, hintRaw) {
     if (flash25) return flash25;
   }
 
+  // 4) fallback: primeiro suportado
   return names[0] || null;
 }
 
@@ -67,7 +110,7 @@ async function getResolvedModelName() {
   const models = await listGeminiModels();
   const resolved = resolveByHint(models, GENAI_MODEL_RAW);
 
-  _cachedResolvedModel = resolved;
+  _cachedResolvedModel = resolved; // sem "models/"
   _cachedAt = now;
 
   return _cachedResolvedModel;
@@ -86,7 +129,7 @@ async function generateGemini(prompt) {
   return result?.response?.text?.() || "";
 }
 
-export async function getAIAnalysis(gameInfo) {
+async function getAIAnalysis(gameInfo) {
   if (!genAI) return "IA não configurada.";
 
   const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
@@ -106,3 +149,176 @@ Dados: ${JSON.stringify(gameInfo)}`;
     return "Erro na análise da IA.";
   }
 }
+
+// =====================
+// UTILS
+// =====================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function pick(obj, keys) {
+  const out = {};
+  keys.forEach((k) => {
+    if (obj?.[k] !== undefined) out[k] = obj[k];
+  });
+  return out;
+}
+
+// =====================
+// API-SPORTS CORE
+// =====================
+async function apiSports(base, path, params = {}) {
+  const url = new URL(base + path);
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") {
+      url.searchParams.set(k, String(v));
+    }
+  });
+
+  try {
+    const response = await fetch(url.toString(), {
+      headers: { "x-apisports-key": API_KEY },
+    });
+
+    const json = await response.json();
+    if (!response.ok) {
+      return { response: [], errors: { http: response.status }, raw: json };
+    }
+    return json;
+  } catch (e) {
+    return { response: [], errors: { internal: e?.message || String(e) } };
+  }
+}
+
+async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1200) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    last = await apiSports(base, path, params);
+    if (Array.isArray(last.response) && last.response.length > 0) {
+      return { ...last, _retry: { tries: i + 1, ok: true } };
+    }
+    if (i < tries - 1) await sleep(delayMs);
+  }
+  return { ...(last || { response: [] }), _retry: { tries, ok: false } };
+}
+
+// =====================
+// ADAPTERS
+// =====================
+const ADAPTERS = {
+  football: {
+    getGames: ({ date, live, leagueId }) => ({
+      path: "/fixtures",
+      params: live
+        ? leagueId
+          ? { live: "all", league: leagueId }
+          : { live: "all" }
+        : leagueId
+          ? { date, league: leagueId }
+          : { date },
+    }),
+
+    extractLiveScore: (item) => ({
+      fixtureId: item?.fixture?.id,
+      league: item?.league ? { id: item.league.id, name: item.league.name } : null,
+      teams: item?.teams,
+      goals: item?.goals,
+      score: item?.score,
+      status: item?.fixture?.status,
+      time: item?.fixture?.status?.elapsed,
+    }),
+
+    extractGoalsFromEvents: (events = []) => events.filter((e) => e?.type === "Goal"),
+    extractCardsFromEvents: (events = []) => events.filter((e) => e?.type === "Card"),
+
+    extractCornersFromStats: (stats = []) => {
+      const perTeam = stats.map((row) => {
+        const s = row.statistics || [];
+        const c = s.find((x) => x.type === "Corner Kicks")?.value ?? 0;
+        return { team: row.team, corners: c };
+      });
+      const total = perTeam.reduce((a, b) => a + Number(b.corners || 0), 0);
+      return { total, perTeam };
+    },
+  },
+};
+
+// =====================
+// ROUTES
+// =====================
+app.get("/", (_, res) => res.send("PredictIA Engine Online"));
+
+// DEBUG: ver modelos disponíveis e qual foi escolhido
+app.get("/gemini/models", async (_, res) => {
+  try {
+    if (!genAI) return res.status(500).json({ status: "error", error: "IA não configurada." });
+
+    const models = await listGeminiModels();
+    const supported = pickSupportedGenerateContent(models).map((m) => ({
+      name: normalizeModelName(m?.name),
+      supportedGenerationMethods: m?.supportedGenerationMethods,
+    }));
+    const resolved = await getResolvedModelName();
+
+    res.json({ status: "ok", raw: GENAI_MODEL_RAW, resolved, supported });
+  } catch (e) {
+    res.status(500).json({ status: "error", error: e?.message || String(e), raw: e?.raw });
+  }
+});
+
+// LIVE com filtro por liga: /football/live?leagueId=475
+app.get("/football/live", async (req, res) => {
+  const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
+
+  const cfg = ADAPTERS.football.getGames({ live: true, leagueId });
+  const data = await apiSports(FOOTBALL_BASE, cfg.path, cfg.params);
+
+  res.json({
+    status: "ok",
+    data: (data.response || []).map(ADAPTERS.football.extractLiveScore),
+    raw: data.errors ? { errors: data.errors } : undefined,
+  });
+});
+
+// Jogo: /football/match/:fixtureId?analysis=true
+app.get("/football/match/:fixtureId", async (req, res) => {
+  const fixtureId = Number(req.params.fixtureId);
+  const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
+
+  const out = { fixtureId };
+
+  const base = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
+  const item = base.response?.[0];
+  if (!item) return res.status(404).json({ error: "Fixture não encontrado" });
+
+  out.game = item;
+  out.live_score = ADAPTERS.football.extractLiveScore(item);
+
+  const statsTry = await apiSportsRetryNonEmpty(
+    FOOTBALL_BASE,
+    "/fixtures/statistics",
+    { fixture: fixtureId }
+  );
+  out.live_stats = statsTry.response || [];
+  out.corners = ADAPTERS.football.extractCornersFromStats(out.live_stats);
+
+  const events = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
+  out.goals = ADAPTERS.football.extractGoalsFromEvents(events.response || []);
+  out.cards = ADAPTERS.football.extractCardsFromEvents(events.response || []);
+
+  const odds = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
+  out.live_odds = odds.response || [];
+
+  if (wantAnalysis) {
+    out.ai_prediction = await getAIAnalysis(
+      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"])
+    );
+  }
+
+  res.json({ status: "ok", data: out });
+});
+
+// =====================
+// SERVER
+// =====================
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
