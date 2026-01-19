@@ -2,6 +2,7 @@
 // PredictIA Engine – index.js (FOOTBALL + NBA LIVE ONLY + API-SPORTS NBA ODDS + GEMINI + GREEN % FIX)
 // - MANTÉM FUTEBOL como está (rotas e estrutura)
 // - NBA: SOMENTE AO VIVO (bloqueia jogos passados/finalizados)
+// - NBA: /games LIVE -> o campo live deve ser usado sozinho (corrigido)
 // - NBA: pega jogo, placar, times, stats de time, stats de jogadores e ODDS (API-SPORTS NBA)
 // - IA: nunca retorna % duplicado (mantém só a primeira %)
 // - IA: não roda em jogo finalizado / não-ao-vivo
@@ -129,17 +130,14 @@ function ensureSingleGreenPercent(text) {
     return `${t}\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Estimativa padrão.`;
   }
 
-  const first = matches[0][1]; // número
+  const first = matches[0][1];
 
   let cleaned = t
-    // remove linhas "Probabilidade de GREEN: xx%"
     .replace(/probabilidade\s+de\s+green\s*:\s*\d{2,3}%/gi, "")
-    // remove qualquer "%"" residual
     .replace(/(\d{2,3})%/g, "")
     .replace(/\n{2,}/g, "\n")
     .trim();
 
-  // mantém até 3 linhas (recomendação, risco, justificativa) e depois injeta % única
   const lines = cleaned
     .split("\n")
     .map((x) => x.trim())
@@ -289,27 +287,24 @@ const ADAPTERS = {
   },
 
   nba: {
-    // /games: live=all ou id
-    getGames: ({ id, live, season, league }) => ({
+    // ✅ FIX CRÍTICO: live deve ser usado sozinho (sem season/league/date)
+    getGames: ({ id, live, date, season, league }) => ({
       path: "/games",
       params: id
         ? { id }
         : live
-          ? { live: "all", season, league }
-          : { season, league },
+          ? { live: "all" } // <- AQUI está o fix
+          : { date, season, league },
     }),
 
-    // /games/statistics (stats de time)
     getGameStats: ({ game }) => ({ path: "/games/statistics", params: { game } }),
 
-    // /players/statistics (stats de jogadores no jogo)
     getPlayersStats: ({ game, season }) => ({
       path: "/players/statistics",
       params: { game, season },
     }),
 
-    // ODDS (API-SPORTS NBA): /odds (varia por plano; aqui tentamos game=ID)
-    // Se seu plano usa outro nome (ex: /odds/...), me diga o endpoint exato do painel.
+    // ODDS (API-SPORTS NBA) - tentamos /odds?game=ID
     getOdds: ({ game }) => ({ path: "/odds", params: { game } }),
 
     extractLiveGame: (item) => ({
@@ -406,12 +401,9 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 // NBA (LIVE ONLY + ODDS via API-SPORTS NBA)
 // ---------------------
 
-// /nba/live?season=2024&league=12
-app.get("/nba/live", async (req, res) => {
-  const season = req.query.season ? Number(req.query.season) : undefined;
-  const league = req.query.league ? Number(req.query.league) : 12;
-
-  const cfg = ADAPTERS.nba.getGames({ live: true, season, league });
+// /nba/live  (SEM season/league, porque live deve ser sozinho)
+app.get("/nba/live", async (_req, res) => {
+  const cfg = ADAPTERS.nba.getGames({ live: true });
   const data = await apiSports(NBA_BASE, cfg.path, cfg.params);
 
   const liveOnly = (data.response || []).filter((g) => isNbaLiveGame(g));
@@ -423,17 +415,15 @@ app.get("/nba/live", async (req, res) => {
   });
 });
 
-// /nba/game/:gameId?analysis=true&season=2024&league=12
+// /nba/game/:gameId?analysis=true
 app.get("/nba/game/:gameId", async (req, res) => {
   const gameId = Number(req.params.gameId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
-  const season = req.query.season ? Number(req.query.season) : undefined;
-  const league = req.query.league ? Number(req.query.league) : 12;
 
   const out = { gameId };
 
   // 1) jogo base
-  const baseCfg = ADAPTERS.nba.getGames({ id: gameId, season, league });
+  const baseCfg = ADAPTERS.nba.getGames({ id: gameId });
   const base = await apiSports(NBA_BASE, baseCfg.path, baseCfg.params);
 
   const game = base.response?.[0];
@@ -456,18 +446,18 @@ app.get("/nba/game/:gameId", async (req, res) => {
   const statsTry = await apiSportsRetryNonEmpty(NBA_BASE, statsCfg.path, statsCfg.params);
   out.team_stats = statsTry.response || [];
 
-  // 3) stats de jogadores (se habilitado no plano)
-  const plyCfg = ADAPTERS.nba.getPlayersStats({ game: gameId, season });
+  // 3) stats de jogadores (pode vir vazio dependendo do plano, mas não quebra)
+  // aqui NÃO passamos season obrigatoriamente
+  const plyCfg = ADAPTERS.nba.getPlayersStats({ game: gameId });
   const plyTry = await apiSportsRetryNonEmpty(NBA_BASE, plyCfg.path, plyCfg.params, 2, 900);
   out.player_stats = plyTry.response || [];
 
-  // 4) ODDS via API-SPORTS NBA (seu plano basketball)
-  // se vier vazio, não quebra
+  // 4) ODDS via API-SPORTS NBA
   const oddsCfg = ADAPTERS.nba.getOdds({ game: gameId });
   const oddsTry = await apiSportsRetryNonEmpty(NBA_BASE, oddsCfg.path, oddsCfg.params, 2, 900);
   out.live_odds = oddsTry.response || [];
 
-  // 5) IA (agora com odds oficiais do seu plano)
+  // 5) IA
   if (wantAnalysis) {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_game", "team_stats", "player_stats", "live_odds"]),
