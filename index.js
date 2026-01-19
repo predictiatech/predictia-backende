@@ -1,18 +1,22 @@
 // ======================================================
-// OBJETIVO:
-// - Manter futebol como está
-// - Pegar NBA AO VIVO + stats + players + odds usando API-BASKETBALL (assinatura "basketball")
-// - Sem quebrar seu provider atual (API-NBA v2): você escolhe via ENV
+// OBJETIVO (IMPLEMENTADO):
+// - Manter futebol como está (NÃO ALTERADO)
+// - NBA AO VIVO + stats + players + odds usando API-BASKETBALL (assinatura "basketball")
+// - Sem quebrar provider antigo (API-NBA v2): escolhe via ENV NBA_PROVIDER
 //
-// COMO USAR (ENV):
-//   NBA_PROVIDER=basketball   -> usa https://v1.basketball.api-sports.io (API-BASKETBALL)  ✅ recomendado p/ sua assinatura
-//   NBA_PROVIDER=nba          -> usa https://v2.nba.api-sports.io (API-NBA) (se você tiver esse plano)
+// FIX CRÍTICO:
+// - API-BASKETBALL NÃO aceita ?live=all  -> retorna "The Live field do not exist."
+// - Portanto: /nba/live (basketball) busca jogos DO DIA (date) e filtra AO VIVO localmente
 //
-// OBS:
-// - Base URL do Basketball: https://v1.basketball.api-sports.io
-// - Endpoint de team stats: /games/statistics/teams
-//   (aparece na doc/refs)  https://v1.basketball.api-sports.io/games/statistics/teams  :contentReference[oaicite:0]{index=0}
+// ENV:
+//   NBA_PROVIDER=basketball (default)  -> https://v1.basketball.api-sports.io
+//   NBA_PROVIDER=nba                  -> https://v2.nba.api-sports.io
+//   BASKETBALL_NBA_LEAGUE_ID=??       -> (opcional mas recomendado) filtra só NBA
 //
+// ROTAS:
+//   GET /nba/live
+//   GET /nba/game/:gameId
+//   GET /nba/game/:gameId?analysis=true
 // ======================================================
 
 import "dotenv/config";
@@ -38,7 +42,7 @@ const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
 const NBA_PROVIDER = (process.env.NBA_PROVIDER || "basketball").toLowerCase(); // "basketball" | "nba"
 
-// NBA League ID (API-BASKETBALL). Se você souber o ID certo da NBA na sua conta, coloque aqui:
+// NBA League ID (API-BASKETBALL). Recomendado para evitar pegar outras ligas do dia.
 const BASKETBALL_NBA_LEAGUE_ID = process.env.BASKETBALL_NBA_LEAGUE_ID
   ? Number(process.env.BASKETBALL_NBA_LEAGUE_ID)
   : undefined;
@@ -48,7 +52,7 @@ if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
 
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const NBA_BASE = "https://v2.nba.api-sports.io";
-const BASKETBALL_BASE = "https://v1.basketball.api-sports.io"; // :contentReference[oaicite:1]{index=1}
+const BASKETBALL_BASE = "https://v1.basketball.api-sports.io";
 
 // =====================
 // GEMINI (AUTO-LISTMODELS)
@@ -301,23 +305,23 @@ function isNbaFinishedGame_v2(game) {
 
 // Provider API-BASKETBALL v1 (assinatura "basketball")
 function isBasketballLiveGame_v1(game) {
-  const status = String(game?.status?.short || game?.status?.long || "").toLowerCase();
+  const stShort = String(game?.status?.short || "").toUpperCase();
+  const stLong = String(game?.status?.long || "").toLowerCase();
   const timer = game?.timer;
 
-  // doc/status: tipicamente "live" / "inplay" / "1q" etc (varia por liga)
   if (timer !== null && timer !== undefined && String(timer).trim() !== "") return true;
 
-  if (status.includes("live") || status.includes("in play") || status.includes("inplay")) return true;
+  if (stLong.includes("live") || stLong.includes("in play") || stLong.includes("inplay")) return true;
 
-  const st = String(game?.status?.short || "").toUpperCase();
-  if (["Q1", "Q2", "Q3", "Q4", "OT", "HT"].includes(st)) return true;
+  if (["Q1", "Q2", "Q3", "Q4", "OT", "HT"].includes(stShort)) return true;
 
   return false;
 }
 
 function isBasketballFinishedGame_v1(game) {
-  const st = String(game?.status?.short || game?.status?.long || "").toLowerCase();
-  return st.includes("ft") || st.includes("finished") || st.includes("final") || st === "end";
+  const stShort = String(game?.status?.short || "").toLowerCase();
+  const stLong = String(game?.status?.long || "").toLowerCase();
+  return stShort === "ft" || stShort === "end" || stLong.includes("finished") || stLong.includes("final");
 }
 
 // =====================
@@ -394,7 +398,7 @@ const ADAPTERS = {
     },
   },
 
-  // SEU ADAPTER ATUAL (API-NBA v2)
+  // SEU PROVIDER ATUAL (API-NBA v2)
   nba_v2: {
     getGames: ({ id, live, date, season, league }) => ({
       path: "/games",
@@ -417,27 +421,16 @@ const ADAPTERS = {
     }),
   },
 
-  // NOVO ADAPTER (API-BASKETBALL v1) - assinatura "basketball"
+  // API-BASKETBALL v1 (assinatura "basketball")
   basketball_v1: {
-    // /games?live=all (&league=NBA_ID opcional)
-    getGames: ({ id, live, date, league }) => ({
+    // FIX: NÃO EXISTE live=all -> sempre busca por date e filtra live localmente
+    getGames: ({ id, date, league }) => ({
       path: "/games",
-      params: id
-        ? { id }
-        : live
-          ? league
-            ? { live: "all", league }
-            : { live: "all" }
-          : { date, league },
+      params: id ? { id } : league ? { date, league } : { date },
     }),
 
-    // Team stats: /games/statistics/teams?game=ID  :contentReference[oaicite:2]{index=2}
     getTeamStats: ({ game }) => ({ path: "/games/statistics/teams", params: { game } }),
-
-    // Player stats: /games/statistics/players?game=ID  (padrão do API-BASKETBALL)
     getPlayersStats: ({ game }) => ({ path: "/games/statistics/players", params: { game } }),
-
-    // Odds: /odds?game=ID  (se vier vazio, é cobertura/plano/mercado)
     getOdds: ({ game }) => ({ path: "/odds", params: { game } }),
 
     extractLiveGame: (item) => ({
@@ -540,14 +533,25 @@ function getNbaProvider() {
   };
 }
 
+function yyyyMmDdLocal() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 // /nba/live
 app.get("/nba/live", async (_req, res) => {
   const p = getNbaProvider();
 
-  const cfg = p.adapter.getGames({
-    live: true,
-    league: p.leagueParam,
-  });
+  // FIX: se provider=basketball -> busca jogos do DIA e filtra ao vivo localmente
+  const date = yyyyMmDdLocal();
+
+  const cfg =
+    NBA_PROVIDER === "basketball"
+      ? p.adapter.getGames({ date, league: p.leagueParam })
+      : p.adapter.getGames({ live: true });
 
   const data = await apiSports(p.base, cfg.path, cfg.params);
   const liveOnly = (data.response || []).filter((g) => p.isLive(g) && !p.isFinished(g));
@@ -555,6 +559,7 @@ app.get("/nba/live", async (_req, res) => {
   res.json({
     status: "ok",
     provider: NBA_PROVIDER,
+    date,
     data: liveOnly.map(p.adapter.extractLiveGame),
     raw: data.errors ? { errors: data.errors } : undefined,
   });
@@ -586,7 +591,7 @@ app.get("/nba/game/:gameId", async (req, res) => {
   out.game = game;
   out.live_game = p.adapter.extractLiveGame(game);
 
-  // STATS / PLAYERS / ODDS (dependem do provider)
+  // STATS / PLAYERS / ODDS
   if (NBA_PROVIDER === "nba") {
     const statsCfg = p.adapter.getGameStats({ game: gameId });
     const statsTry = await apiSportsRetryNonEmpty(p.base, statsCfg.path, statsCfg.params);
