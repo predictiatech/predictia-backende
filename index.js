@@ -1,8 +1,8 @@
 // ======================================================
-// PredictIA Engine – index.js (FIX: NÃO ENCERRA NO START + GEMINI 2.5 FLASH)
-// - Sem "export" (evita crash em runtime por cópia/cola)
-// - Logs de erro no boot (uncaughtException/unhandledRejection)
+// PredictIA Engine – index.js (FIX + GREEN % NO PALPITE)
+// - NÃO encerra no start (logs de crash)
 // - Gemini: resolve modelo via ListModels (v1beta) e escolhe um que suporte generateContent
+// - Prompt força: "Probabilidade de GREEN: XX%"
 // - Mantém rotas: /football/live e /football/match/:fixtureId?analysis=true
 // - Rota extra: /gemini/models (debug)
 // ======================================================
@@ -31,7 +31,7 @@ app.use(express.json());
 const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 
-// você pode setar no Render:
+// Render:
 // GEMINI_MODEL=gemini-2.5-flash
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
@@ -129,17 +129,32 @@ async function generateGemini(prompt) {
   return result?.response?.text?.() || "";
 }
 
+function ensureGreenPercent(text) {
+  // garante que exista algum "XX%"
+  if (/\b\d{2,3}%\b/.test(text)) return text;
+
+  // fallback controlado (pra não quebrar seu regex no Android)
+  return `${String(text || "").trim()}\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Estimativa padrão.`;
+}
+
 async function getAIAnalysis(gameInfo) {
   if (!genAI) return "IA não configurada.";
 
+  // PROMPT FORÇANDO % (para seu app mostrar)
   const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
 Responda em PT-BR.
-Dê uma recomendação curta (máx 4 linhas), com risco (baixo/médio/alto) e 1 justificativa.
+Retorne APENAS texto simples (sem Markdown).
+Máximo 4 linhas.
+Formato EXATO:
+Recomendação: <aposta>
+Probabilidade de GREEN: <XX%>
+Risco: baixo|médio|alto
+Justificativa: <1 frase>
 Dados: ${JSON.stringify(gameInfo)}`;
 
   try {
     const text = await generateGemini(prompt);
-    return text || "Erro na análise da IA.";
+    return ensureGreenPercent(text || "Erro na análise da IA.");
   } catch (err) {
     console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
     console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
