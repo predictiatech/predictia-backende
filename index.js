@@ -449,7 +449,7 @@ app.get("/nba/game/:gameId", async (req, res) => {
   const awayName = game?.teams?.away?.name || "";
 
   if (ODDS_API_KEY) {
-    const oddsAll = await getNbaOddsFromOddsApi();
+    const oddsAll = await getNbaOddsFromOddsApi(); 
     out.odds_source = oddsAll.ok ? "the-odds-api" : "the-odds-api-error";
     out.odds_error = oddsAll.ok ? undefined : oddsAll.error;
     out.odds_raw = oddsAll.ok ? undefined : oddsAll.raw;
