@@ -1,7 +1,8 @@
 // ======================================================
-// PredictIA Engine – index.js (VERSÃO FINAL DE ALTA COMPATIBILIDADE)
-// - Força o uso do modelo 'latest' para evitar Erro 404
-// - Logs verbosos para depuração no Render
+// PredictIA Engine – index.js (VERSÃO FINAL ESTABILIZADA)
+// - Correção do erro 404 (Modelo Gemini)
+// - Suporte a filtros de liga para o App Kotlin
+// - Log de erro detalhado para o painel do Render
 // ======================================================
 
 import "dotenv/config";
@@ -19,10 +20,10 @@ app.use(express.json());
 const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 
-// AJUSTE: Se o Render não enviar o modelo, usamos o 'latest' por padrão
-const GENAI_MODEL = (process.env.GEMINI_MODEL || "gemini-1.5-flash-latest").trim(); 
+// O .trim() é vital para evitar que espaços invisíveis causem o erro 404
+const GENAI_MODEL = (process.env.GEMINI_MODEL || "gemini-1.5-flash").trim(); 
 
-console.log(`[CONFIG] Iniciando com o modelo: "${GENAI_MODEL}"`);
+console.log(`[CONFIG] Servidor iniciando com o modelo: "${GENAI_MODEL}"`);
 
 if (!API_KEY) console.error("FALTA API_KEY: Configure no painel do Render.");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY: A IA não funcionará sem a chave.");
@@ -38,15 +39,12 @@ async function getAIAnalysis(gameInfo) {
   if (!genAI) return "IA não configurada no servidor.";
 
   try {
-    // Usamos a v1beta que tem melhor suporte para o sufixo -latest em contas gratuitas
-    const model = genAI.getGenerativeModel(
-      { model: GENAI_MODEL },
-      { apiVersion: "v1beta" }
-    );
+    // Definimos o modelo de forma direta para maior compatibilidade
+    const model = genAI.getGenerativeModel({ model: GENAI_MODEL });
 
     const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
 Responda em Português (PT-BR).
-Dê uma recomendação curta (máx 4 linhas), com risco (baixo/médio/alto) e 1 justificativa técnica.
+Dê uma recomendação curta (máx 4 linhas), com nível de risco (baixo/médio/alto) e uma justificativa técnica.
 Dados do Jogo: ${JSON.stringify(gameInfo)}`;
 
     const result = await model.generateContent(prompt);
@@ -54,14 +52,14 @@ Dados do Jogo: ${JSON.stringify(gameInfo)}`;
     return response.text();
 
   } catch (err) {
+    // Log detalhado para monitoramento no painel do Render
     console.error("--- ERRO GEMINI ---");
     console.error("Mensagem:", err?.message);
     
-    // Se o erro for 404, damos uma instrução clara para o usuário
-    if (err?.message?.includes("404")) {
-      return "Erro: O modelo especificado não foi encontrado pela Google. Tente mudar para 'gemini-1.5-flash-latest' no Render.";
+    if (err?.message?.includes("not found")) {
+      return "Erro: Modelo Gemini não reconhecido. Verifique o nome no painel do Render.";
     }
-    return "Análise indisponível no momento. Verifique os logs.";
+    return "Análise indisponível no momento. Tente novamente em instantes.";
   }
 }
 
@@ -135,6 +133,7 @@ const ADAPTERS = {
 // =====================
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 
+// Rota para listagem de jogos (Suporta filtro ?leagueId=XXX)
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
   const cfg = ADAPTERS.football.getGames({ live: true, leagueId });
@@ -146,6 +145,7 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
+// Rota de detalhes da partida com análise da Gemini
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = req.query.analysis === "true";
@@ -153,7 +153,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 
   const base = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
   const item = base.response?.[0];
-  if (!item) return res.status(404).json({ error: "Fixture não encontrado" });
+  if (!item) return res.status(404).json({ error: "Partida não encontrada" });
 
   out.game = item;
   out.live_score = ADAPTERS.football.extractLiveScore(item);
@@ -175,4 +175,4 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor PredictIA na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor PredictIA rodando na porta ${PORT}`));
