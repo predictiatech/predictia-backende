@@ -1,12 +1,13 @@
 // ======================================================
-// PredictIA Engine – index.js (FOOTBALL + NBA LIVE ONLY + API-SPORTS NBA ODDS + GEMINI + GREEN % FIX)
-// - MANTÉM FUTEBOL como está (rotas e estrutura)
-// - NBA: SOMENTE AO VIVO (bloqueia jogos passados/finalizados)
-// - NBA: /games LIVE -> o campo live deve ser usado sozinho (corrigido)
-// - NBA: pega jogo, placar, times, stats de time, stats de jogadores e ODDS (API-SPORTS NBA)
-// - IA: nunca retorna % duplicado (mantém só a primeira %)
-// - IA: não roda em jogo finalizado / não-ao-vivo
-// - Debug Gemini: /gemini/models
+// CAUSA DO ERRO:
+// - IA falhou por QUOTA (HTTP 429 Too Many Requests) no Gemini Free Tier.
+// - A API respondeu inclusive com retryDelay ~55s.
+// OBJETIVO DO FIX:
+// - NÃO retornar "Erro na análise da IA." em 429
+// - Aplicar retry automático respeitando retryDelay (1 tentativa)
+// - Aplicar rate-limit por fixture/game (cache curto) p/ não estourar quota
+// - Manter futebol + NBA + live-only como está
+// - Odds NBA: continua tentando /odds (se vier vazio é porque o endpoint/plano ainda não retorna odds para live)
 // ======================================================
 
 import "dotenv/config";
@@ -120,8 +121,9 @@ async function generateGemini(prompt) {
   return result?.response?.text?.() || "";
 }
 
-// mantém APENAS a primeira porcentagem e remove duplicadas;
-// se não tiver %, adiciona um fallback (uma só vez).
+// =====================
+// IA RESPONSE NORMALIZATION
+// =====================
 function ensureSingleGreenPercent(text) {
   const t = String(text || "").trim();
   const matches = [...t.matchAll(/(\d{2,3})%/g)];
@@ -149,8 +151,55 @@ function ensureSingleGreenPercent(text) {
   return `${cleaned}\nProbabilidade de GREEN: ${first}%`;
 }
 
-async function getAIAnalysis(gameInfo, sportLabel = "Esporte") {
+// =====================
+// IA QUOTA PROTECTION (CACHE + RETRY 429)
+// =====================
+
+// cache por jogo/fixture para não chamar Gemini repetidamente
+// TTL curto porque é "ao vivo"
+const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000); // 60s
+const _aiCache = new Map(); // key -> { value, exp }
+
+function aiCacheGet(key) {
+  const row = _aiCache.get(key);
+  if (!row) return null;
+  if (Date.now() > row.exp) {
+    _aiCache.delete(key);
+    return null;
+  }
+  return row.value;
+}
+
+function aiCacheSet(key, value) {
+  _aiCache.set(key, { value, exp: Date.now() + AI_CACHE_TTL_MS });
+}
+
+// extrai retryDelay do erro do Gemini (errorDetails)
+function parseRetryDelaySeconds(err) {
+  const details = err?.errorDetails;
+  if (!Array.isArray(details)) return null;
+
+  const retryInfo = details.find((d) => d?.["@type"] === "type.googleapis.com/google.rpc.RetryInfo");
+  const raw = retryInfo?.retryDelay; // ex "55s"
+  if (!raw) return null;
+
+  const m = String(raw).match(/(\d+)\s*s/i);
+  if (!m) return null;
+
+  const sec = Number(m[1]);
+  if (!Number.isFinite(sec) || sec <= 0) return null;
+
+  return sec;
+}
+
+async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
+
+  // 1) cache
+  if (cacheKey) {
+    const cached = aiCacheGet(cacheKey);
+    if (cached) return cached;
+  }
 
   const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
 Esporte: ${sportLabel}
@@ -164,16 +213,49 @@ Risco: baixo|médio|alto
 Justificativa: <1 frase>
 Dados: ${JSON.stringify(gameInfo)}`;
 
+  // 2) tentativa + retry 429 (1 vez)
   try {
     const text = await generateGemini(prompt);
-    return ensureSingleGreenPercent(text || "Erro na análise da IA.");
+    const finalText = ensureSingleGreenPercent(text || "Erro na análise da IA.");
+    if (cacheKey) aiCacheSet(cacheKey, finalText);
+    return finalText;
   } catch (err) {
+    const status = err?.status;
+
+    // QUOTA / RATE LIMIT
+    if (status === 429) {
+      const sec = parseRetryDelaySeconds(err);
+      // resposta amigável (e consistente para o app)
+      const msg = sec
+        ? `IA em limite de uso. Tente novamente em ~${sec}s.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Limite de cota/velocidade da IA.`
+        : `IA em limite de uso. Tente novamente mais tarde.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Limite de cota/velocidade da IA.`;
+
+      // opcional: retry automático 1x, mas só se o delay for pequeno (<=60s)
+      if (sec && sec <= 60) {
+        try {
+          await new Promise((r) => setTimeout(r, (sec + 1) * 1000));
+          const text2 = await generateGemini(prompt);
+          const finalText2 = ensureSingleGreenPercent(text2 || msg);
+          if (cacheKey) aiCacheSet(cacheKey, finalText2);
+          return finalText2;
+        } catch (err2) {
+          console.error("GEMINI RETRY FAILED:", err2);
+        }
+      }
+
+      if (cacheKey) aiCacheSet(cacheKey, msg);
+      return msg;
+    }
+
     console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
     console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
     console.error("GEMINI ERROR (FULL):", err);
-    console.error("GEMINI ERROR (STATUS):", err?.status);
+    console.error("GEMINI ERROR (STATUS):", status);
     console.error("GEMINI ERROR (RAW):", err?.raw);
-    return "Erro na análise da IA.";
+
+    const fallback = "Erro na análise da IA.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Falha ao consultar a IA.";
+    if (cacheKey) aiCacheSet(cacheKey, fallback);
+    return fallback;
   }
 }
 
@@ -190,7 +272,7 @@ function pick(obj, keys) {
   return out;
 }
 
-// NBA: considera ao vivo se clock existir OU status.short != 3 e periods.current > 0 OU status.long indicar "live"
+// NBA LIVE checks
 function isNbaLiveGame(game) {
   const short = Number(game?.status?.short);
   const clock = game?.status?.clock;
@@ -287,14 +369,10 @@ const ADAPTERS = {
   },
 
   nba: {
-    // ✅ FIX CRÍTICO: live deve ser usado sozinho (sem season/league/date)
+    // FIX: live deve ser usado sozinho
     getGames: ({ id, live, date, season, league }) => ({
       path: "/games",
-      params: id
-        ? { id }
-        : live
-          ? { live: "all" } // <- AQUI está o fix
-          : { date, season, league },
+      params: id ? { id } : live ? { live: "all" } : { date, season, league },
     }),
 
     getGameStats: ({ game }) => ({ path: "/games/statistics", params: { game } }),
@@ -304,7 +382,8 @@ const ADAPTERS = {
       params: { game, season },
     }),
 
-    // ODDS (API-SPORTS NBA) - tentamos /odds?game=ID
+    // ODDS via API-SPORTS NBA (tentativa padrão)
+    // Se sua conta exigir outro endpoint/param, me envie o erro que ajusto.
     getOdds: ({ game }) => ({ path: "/odds", params: { game } }),
 
     extractLiveGame: (item) => ({
@@ -390,7 +469,8 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   if (wantAnalysis) {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"]),
-      "Futebol"
+      "Futebol",
+      `football:${fixtureId}`
     );
   }
 
@@ -401,7 +481,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 // NBA (LIVE ONLY + ODDS via API-SPORTS NBA)
 // ---------------------
 
-// /nba/live  (SEM season/league, porque live deve ser sozinho)
+// /nba/live
 app.get("/nba/live", async (_req, res) => {
   const cfg = ADAPTERS.nba.getGames({ live: true });
   const data = await apiSports(NBA_BASE, cfg.path, cfg.params);
@@ -422,14 +502,12 @@ app.get("/nba/game/:gameId", async (req, res) => {
 
   const out = { gameId };
 
-  // 1) jogo base
   const baseCfg = ADAPTERS.nba.getGames({ id: gameId });
   const base = await apiSports(NBA_BASE, baseCfg.path, baseCfg.params);
 
   const game = base.response?.[0];
   if (!game) return res.status(404).json({ error: "Game não encontrado" });
 
-  // LIVE ONLY
   if (!isNbaLiveGame(game) || isNbaFinishedGame(game)) {
     return res.status(409).json({
       status: "not-live",
@@ -441,27 +519,23 @@ app.get("/nba/game/:gameId", async (req, res) => {
   out.game = game;
   out.live_game = ADAPTERS.nba.extractLiveGame(game);
 
-  // 2) stats por time
   const statsCfg = ADAPTERS.nba.getGameStats({ game: gameId });
   const statsTry = await apiSportsRetryNonEmpty(NBA_BASE, statsCfg.path, statsCfg.params);
   out.team_stats = statsTry.response || [];
 
-  // 3) stats de jogadores (pode vir vazio dependendo do plano, mas não quebra)
-  // aqui NÃO passamos season obrigatoriamente
   const plyCfg = ADAPTERS.nba.getPlayersStats({ game: gameId });
   const plyTry = await apiSportsRetryNonEmpty(NBA_BASE, plyCfg.path, plyCfg.params, 2, 900);
   out.player_stats = plyTry.response || [];
 
-  // 4) ODDS via API-SPORTS NBA
   const oddsCfg = ADAPTERS.nba.getOdds({ game: gameId });
   const oddsTry = await apiSportsRetryNonEmpty(NBA_BASE, oddsCfg.path, oddsCfg.params, 2, 900);
   out.live_odds = oddsTry.response || [];
 
-  // 5) IA
   if (wantAnalysis) {
     out.ai_prediction = await getAIAnalysis(
       pick(out, ["live_game", "team_stats", "player_stats", "live_odds"]),
-      "NBA (Basquete)"
+      "NBA (Basquete)",
+      `nba:${gameId}`
     );
   }
 
