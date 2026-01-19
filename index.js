@@ -17,7 +17,7 @@ app.use(express.json());
 // =====================
 const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
-const GENAI_MODEL = process.env.GEMINI_MODEL || "gemini-pro";
+const GENAI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 
 if (!API_KEY) {
   console.error("FALTA API_KEY: defina API_SPORTS_KEY ou FOOTBALL_API_KEY no Render.");
