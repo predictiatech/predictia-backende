@@ -1,8 +1,7 @@
 // ======================================================
-// PredictIA Engine – index.js (VERSÃO FINAL ESTABILIZADA)
-// - Filtro de liga mantido e funcional para Android
-// - Ajuste para apiVersion: "v1" (Corrige o Erro 404)
-// - Gemini 1.5-Flash com limpeza de espaços (trim)
+// PredictIA Engine – index.js (VERSÃO FINAL DE ALTA COMPATIBILIDADE)
+// - Força o uso do modelo 'latest' para evitar Erro 404
+// - Logs verbosos para depuração no Render
 // ======================================================
 
 import "dotenv/config";
@@ -20,8 +19,10 @@ app.use(express.json());
 const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 
-// O .trim() é essencial para evitar erros de leitura do Render
-const GENAI_MODEL = (process.env.GEMINI_MODEL || "gemini-1.5-flash").trim(); 
+// AJUSTE: Se o Render não enviar o modelo, usamos o 'latest' por padrão
+const GENAI_MODEL = (process.env.GEMINI_MODEL || "gemini-1.5-flash-latest").trim(); 
+
+console.log(`[CONFIG] Iniciando com o modelo: "${GENAI_MODEL}"`);
 
 if (!API_KEY) console.error("FALTA API_KEY: Configure no painel do Render.");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY: A IA não funcionará sem a chave.");
@@ -37,10 +38,10 @@ async function getAIAnalysis(gameInfo) {
   if (!genAI) return "IA não configurada no servidor.";
 
   try {
-    // AJUSTE CRÍTICO: Força a versão 'v1' para evitar o erro 404 vindo da v1beta
+    // Usamos a v1beta que tem melhor suporte para o sufixo -latest em contas gratuitas
     const model = genAI.getGenerativeModel(
       { model: GENAI_MODEL },
-      { apiVersion: "v1" }
+      { apiVersion: "v1beta" }
     );
 
     const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
@@ -53,12 +54,12 @@ Dados do Jogo: ${JSON.stringify(gameInfo)}`;
     return response.text();
 
   } catch (err) {
-    // Registra o erro exato no log do Render para monitoramento
     console.error("--- ERRO GEMINI ---");
     console.error("Mensagem:", err?.message);
     
-    if (err?.message?.includes("not found")) {
-      return "Erro: Modelo Gemini não reconhecido. Verifique o nome no Render.";
+    // Se o erro for 404, damos uma instrução clara para o usuário
+    if (err?.message?.includes("404")) {
+      return "Erro: O modelo especificado não foi encontrado pela Google. Tente mudar para 'gemini-1.5-flash-latest' no Render.";
     }
     return "Análise indisponível no momento. Verifique os logs.";
   }
@@ -134,7 +135,6 @@ const ADAPTERS = {
 // =====================
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 
-// Rota LIVE para o App Android
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
   const cfg = ADAPTERS.football.getGames({ live: true, leagueId });
@@ -146,7 +146,6 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// Detalhes da Partida com IA
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = req.query.analysis === "true";
@@ -176,4 +175,4 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Servidor PredictIA rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor PredictIA na porta ${PORT}`));
