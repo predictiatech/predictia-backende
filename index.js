@@ -8,15 +8,9 @@
 // - API-BASKETBALL NÃO aceita ?live=all  -> retorna "The Live field do not exist."
 // - Portanto: /nba/live (basketball) busca jogos DO DIA (date) e filtra AO VIVO localmente
 //
-// ENV:
-//   NBA_PROVIDER=basketball (default)  -> https://v1.basketball.api-sports.io
-//   NBA_PROVIDER=nba                  -> https://v2.nba.api-sports.io
-//   BASKETBALL_NBA_LEAGUE_ID=??       -> (opcional mas recomendado) filtra só NBA
-//
-// ROTAS:
-//   GET /nba/live
-//   GET /nba/game/:gameId
-//   GET /nba/game/:gameId?analysis=true
+// ✅ FIX ADICIONAL (SEM ALTERAR O RESTANTE):
+// - /nba/game/:gameId NÃO deve retornar HTTP 409 (isso derruba o Retrofit e vira "Erro ao buscar análise da IA.")
+// - Agora, quando não estiver live, retorna 200 com status "not-live" e data.
 // ======================================================
 
 import "dotenv/config";
@@ -580,11 +574,14 @@ app.get("/nba/game/:gameId", async (req, res) => {
   const game = base.response?.[0];
   if (!game) return res.status(404).json({ error: "Game não encontrado" });
 
+  // ✅ AQUI É A ÚNICA MUDANÇA: NÃO RETORNAR 409 (para não derrubar o Retrofit)
   if (!p.isLive(game) || p.isFinished(game)) {
-    return res.status(409).json({
+    out.game = game;
+    out.live_game = p.adapter.extractLiveGame(game);
+
+    return res.json({
       status: "not-live",
-      error: "Somente jogos ao vivo são permitidos para NBA.",
-      data: { gameId, status: game?.status, teams: game?.teams },
+      data: out,
     });
   }
 
