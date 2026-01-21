@@ -110,17 +110,13 @@ async function generateGemini(prompt) {
 
 // ======================================================
 // ✅ SEÇÃO: IA RESPONSE NORMALIZATION (AJUSTADA)
-// - Remove travas e “injeções” de 65%
-// - Mantém apenas limpeza básica e validação de formato
 // ======================================================
 function ensureAIFormat(text) {
   const t = String(text || "").trim();
   if (!t) return "Erro na análise da IA.";
 
-  // mantém só texto e corta excessos
   const cleaned = t.replace(/\n{3,}/g, "\n\n").trim();
 
-  // opcional: limita para no máximo 6 linhas (conforme prompt)
   const lines = cleaned
     .split("\n")
     .map((x) => x.trim())
@@ -179,16 +175,15 @@ function pick(obj, keys) {
 
 // ======================================================
 // ✅ NOVO: IA RATE LIMIT (FILA + CONCORRÊNCIA + ESPAÇAMENTO + DEDUPE)
-// NÃO altera lógica existente: só organiza QUANDO a IA é chamada
 // ======================================================
-const AI_MAX_CONCURRENCY = Number(process.env.AI_MAX_CONCURRENCY || 1); // 1 = recomendado
-const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 1200); // ajuste conforme seu RPM
+const AI_MAX_CONCURRENCY = Number(process.env.AI_MAX_CONCURRENCY || 1);
+const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 1200);
 const AI_QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 300);
 
 let _aiActive = 0;
 let _aiLastStartAt = 0;
 const _aiQueue = [];
-const _aiInFlight = new Map(); // cacheKey -> Promise
+const _aiInFlight = new Map();
 
 function _aiRunNext() {
   if (_aiActive >= AI_MAX_CONCURRENCY) return;
@@ -234,7 +229,6 @@ function enqueueAI(cacheKey, fn) {
   return p;
 }
 
-// Wrapper com a MESMA assinatura de getAIAnalysis
 async function getAIAnalysisQueued(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
 
@@ -249,9 +243,161 @@ async function getAIAnalysisQueued(gameInfo, sportLabel = "Esporte", cacheKey = 
 }
 
 // ======================================================
+// ✅ NOVO: COMPACTAÇÃO DO INPUT PARA IA (EVITA PROMPT GIGANTE)
+// ======================================================
+function safeNumber(v, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+
+function extractStatValue(statsTeamRow, type) {
+  const s = statsTeamRow?.statistics || [];
+  const it = s.find((x) => x?.type === type);
+  const v = it?.value;
+  if (typeof v === "string" && v.endsWith("%")) return safeNumber(v.replace("%", ""), 0);
+  return safeNumber(v, 0);
+}
+
+function compactLiveStats(live_stats = []) {
+  const home = live_stats?.[0] || null;
+  const away = live_stats?.[1] || null;
+
+  return {
+    home: home?.team?.name || null,
+    away: away?.team?.name || null,
+    shots_on_goal: {
+      home: extractStatValue(home, "Shots on Goal"),
+      away: extractStatValue(away, "Shots on Goal"),
+    },
+    shots_off_goal: {
+      home: extractStatValue(home, "Shots off Goal"),
+      away: extractStatValue(away, "Shots off Goal"),
+    },
+    total_shots: {
+      home: extractStatValue(home, "Total Shots"),
+      away: extractStatValue(away, "Total Shots"),
+    },
+    dangerous_attacks: {
+      home: extractStatValue(home, "Dangerous Attacks"),
+      away: extractStatValue(away, "Dangerous Attacks"),
+    },
+    attacks: {
+      home: extractStatValue(home, "Attacks"),
+      away: extractStatValue(away, "Attacks"),
+    },
+    possession: {
+      home: extractStatValue(home, "Ball Possession"),
+      away: extractStatValue(away, "Ball Possession"),
+    },
+    corners: {
+      home: extractStatValue(home, "Corner Kicks"),
+      away: extractStatValue(away, "Corner Kicks"),
+    },
+    yellow: {
+      home: extractStatValue(home, "Yellow Cards"),
+      away: extractStatValue(away, "Yellow Cards"),
+    },
+    red: {
+      home: extractStatValue(home, "Red Cards"),
+      away: extractStatValue(away, "Red Cards"),
+    },
+  };
+}
+
+function compactEvents(goals = [], cards = []) {
+  const g = Array.isArray(goals) ? goals : [];
+  const c = Array.isArray(cards) ? cards : [];
+
+  const yellow = c.filter((x) => String(x?.detail || "").toLowerCase().includes("yellow")).length;
+  const red = c.filter((x) => String(x?.detail || "").toLowerCase().includes("red")).length;
+
+  return {
+    goals: g.length,
+    cards: c.length,
+    yellow,
+    red,
+  };
+}
+
+function compactLiveOdds(live_odds = []) {
+  const wanted = new Set([
+    "Match Winner",
+    "Double Chance",
+    "Goals Over/Under",
+    "Total Goals",
+    "Corners Over Under",
+    "Total Corners",
+    "Cards Over/Under",
+    "Total Cards",
+  ]);
+
+  const arr = Array.isArray(live_odds) ? live_odds : [];
+  const out = [];
+
+  for (const root of arr) {
+    const bookmakers = Array.isArray(root?.bookmakers) ? root.bookmakers : [];
+    for (const bm of bookmakers) {
+      const bets = Array.isArray(bm?.bets) ? bm.bets : [];
+      for (const bet of bets) {
+        const name = String(bet?.name || "");
+        if (!wanted.has(name)) continue;
+
+        const values = Array.isArray(bet?.values) ? bet.values : [];
+        for (const v of values) {
+          const odd = safeNumber(v?.odd, 0);
+          if (odd >= 1.5 && odd <= 2.3) {
+            out.push({
+              bookmaker: bm?.name || null,
+              market: name,
+              selection: v?.value || null,
+              odd: Number(odd.toFixed(2)),
+            });
+          }
+          if (out.length >= 50) return out;
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+function buildAIInput(out) {
+  const live_score = out?.live_score || {};
+  const status = live_score?.status || out?.game?.fixture?.status || {};
+  const elapsed = safeNumber(live_score?.time ?? status?.elapsed, 0);
+
+  const goals = live_score?.goals || out?.game?.goals || {};
+
+  return {
+    match: {
+      fixtureId: live_score?.fixtureId || out?.fixtureId || null,
+      league: live_score?.league?.name || null,
+      teams: {
+        home: live_score?.teams?.home?.name || null,
+        away: live_score?.teams?.away?.name || null,
+      },
+      time: {
+        elapsed,
+        short: status?.short || null,
+        long: status?.long || null,
+      },
+      score: {
+        home: safeNumber(goals?.home, 0),
+        away: safeNumber(goals?.away, 0),
+      },
+    },
+    live: {
+      corners_total: safeNumber(out?.corners?.total, 0),
+      events: compactEvents(out?.goals, out?.cards),
+      stats: compactLiveStats(out?.live_stats || []),
+      odds: compactLiveOdds(out?.live_odds || []),
+    },
+  };
+}
+
+// ======================================================
 // ✅ FUNÇÃO ORIGINAL: getAIAnalysis (LÓGICA MANTIDA)
-// - Apenas prompt atualizado
-// - Removida a “trava” de 65% (agora só a IA obedece o prompt)
 // ======================================================
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
@@ -387,9 +533,6 @@ async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1
 // ✅ SEÇÃO: ADAPTERS (EXISTENTE)
 // ======================================================
 const ADAPTERS = {
-  // ---------------------
-  // FUTEBOL (EXISTENTE)
-  // ---------------------
   football: {
     getGames: ({ date, live, leagueId }) => ({
       path: "/fixtures",
@@ -477,8 +620,10 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   out.live_odds = odds.response || [];
 
   if (wantAnalysis) {
+    const aiInput = buildAIInput(out);
+
     out.ai_prediction = await getAIAnalysisQueued(
-      pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"]),
+      aiInput,
       "Futebol",
       `football:${fixtureId}`
     );
