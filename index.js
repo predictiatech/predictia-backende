@@ -185,6 +185,83 @@ function pick(obj, keys) {
   return out;
 }
 
+// ======================================================
+// ✅ NOVO: IA RATE LIMIT (FILA + CONCORRÊNCIA + ESPAÇAMENTO + DEDUPE)
+// NÃO altera lógica existente: só organiza QUANDO a IA é chamada
+// ======================================================
+const AI_MAX_CONCURRENCY = Number(process.env.AI_MAX_CONCURRENCY || 1); // 1 = recomendado
+const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 1200); // ajuste conforme seu RPM
+const AI_QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 300);
+
+let _aiActive = 0;
+let _aiLastStartAt = 0;
+const _aiQueue = [];
+const _aiInFlight = new Map(); // cacheKey -> Promise
+
+function _aiRunNext() {
+  if (_aiActive >= AI_MAX_CONCURRENCY) return;
+  if (_aiQueue.length === 0) return;
+
+  const now = Date.now();
+  const wait = Math.max(0, (_aiLastStartAt + AI_MIN_INTERVAL_MS) - now);
+
+  const job = _aiQueue.shift();
+  _aiActive++;
+
+  setTimeout(async () => {
+    _aiLastStartAt = Date.now();
+    try {
+      const result = await job.fn();
+      job.resolve(result);
+    } catch (e) {
+      job.reject(e);
+    } finally {
+      _aiActive--;
+      _aiRunNext();
+    }
+  }, wait);
+}
+
+function enqueueAI(cacheKey, fn) {
+  if (cacheKey && _aiInFlight.has(cacheKey)) return _aiInFlight.get(cacheKey);
+
+  if (_aiQueue.length >= AI_QUEUE_MAX) {
+    return Promise.resolve(
+      "IA em fila cheia. Tente novamente.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Controle de fila/RPM."
+    );
+  }
+
+  const p = new Promise((resolve, reject) => {
+    _aiQueue.push({ fn, resolve, reject });
+    _aiRunNext();
+  });
+
+  if (cacheKey) {
+    _aiInFlight.set(cacheKey, p);
+    p.finally(() => _aiInFlight.delete(cacheKey));
+  }
+
+  return p;
+}
+
+// Wrapper com a MESMA assinatura de getAIAnalysis
+async function getAIAnalysisQueued(gameInfo, sportLabel = "Esporte", cacheKey = "") {
+  if (!genAI) return "IA não configurada.";
+
+  if (cacheKey) {
+    const cached = aiCacheGet(cacheKey);
+    if (cached) return cached;
+  }
+
+  return enqueueAI(cacheKey || "", async () => {
+    // chama a função original sem mudar nada dela
+    return getAIAnalysis(gameInfo, sportLabel, cacheKey);
+  });
+}
+
+// ======================================================
+// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (EXISTENTE - NÃO ALTERAR)
+// ======================================================
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
 
@@ -376,7 +453,8 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   out.live_odds = odds.response || [];
 
   if (wantAnalysis) {
-    out.ai_prediction = await getAIAnalysis(
+    // ÚNICA troca: usa o wrapper com fila/limite (mesma assinatura)
+    out.ai_prediction = await getAIAnalysisQueued(
       pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"]),
       "Futebol",
       `football:${fixtureId}`
