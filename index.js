@@ -109,33 +109,25 @@ async function generateGemini(prompt) {
 }
 
 // ======================================================
-// ✅ SEÇÃO: IA RESPONSE NORMALIZATION (EXISTENTE)
+// ✅ SEÇÃO: IA RESPONSE NORMALIZATION (AJUSTADA)
+// - Remove travas e “injeções” de 65%
+// - Mantém apenas limpeza básica e validação de formato
 // ======================================================
-function ensureSingleGreenPercent(text) {
+function ensureAIFormat(text) {
   const t = String(text || "").trim();
-  const matches = [...t.matchAll(/(\d{2,3})%/g)];
+  if (!t) return "Erro na análise da IA.";
 
-  if (matches.length === 0) {
-    return `${t}\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Estimativa padrão.`;
-  }
+  // mantém só texto e corta excessos
+  const cleaned = t.replace(/\n{3,}/g, "\n\n").trim();
 
-  const first = matches[0][1];
-
-  let cleaned = t
-    .replace(/probabilidade\s+de\s+green\s*:\s*\d{2,3}%/gi, "")
-    .replace(/(\d{2,3})%/g, "")
-    .replace(/\n{2,}/g, "\n")
-    .trim();
-
+  // opcional: limita para no máximo 6 linhas (conforme prompt)
   const lines = cleaned
     .split("\n")
     .map((x) => x.trim())
-    .filter(Boolean)
-    .slice(0, 3);
+    .filter((x) => x.length > 0)
+    .slice(0, 6);
 
-  cleaned = lines.join("\n");
-
-  return `${cleaned}\nProbabilidade de GREEN: ${first}%`;
+  return lines.join("\n");
 }
 
 // ======================================================
@@ -226,9 +218,7 @@ function enqueueAI(cacheKey, fn) {
   if (cacheKey && _aiInFlight.has(cacheKey)) return _aiInFlight.get(cacheKey);
 
   if (_aiQueue.length >= AI_QUEUE_MAX) {
-    return Promise.resolve(
-      "IA em fila cheia. Tente novamente.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Controle de fila/RPM."
-    );
+    return Promise.resolve("IA em fila cheia. Tente novamente.");
   }
 
   const p = new Promise((resolve, reject) => {
@@ -254,13 +244,14 @@ async function getAIAnalysisQueued(gameInfo, sportLabel = "Esporte", cacheKey = 
   }
 
   return enqueueAI(cacheKey || "", async () => {
-    // chama a função original sem mudar nada dela
     return getAIAnalysis(gameInfo, sportLabel, cacheKey);
   });
 }
 
 // ======================================================
-// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (EXISTENTE - NÃO ALTERAR)
+// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (LÓGICA MANTIDA)
+// - Apenas prompt atualizado
+// - Removida a “trava” de 65% (agora só a IA obedece o prompt)
 // ======================================================
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
@@ -270,21 +261,55 @@ async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
     if (cached) return cached;
   }
 
-  const prompt = `Aja como um analista esportivo profissional para o app PredictIA.
-Esporte: ${sportLabel}
-Responda em PT-BR.
-Retorne APENAS texto simples (sem Markdown).
-Máximo 4 linhas.
-Formato EXATO:
-Recomendação: <aposta>
+  const prompt = `Você é um analista profissional de apostas esportivas (futebol) para o app PredictIA.
+Contexto: jogo AO VIVO, com estatísticas em tempo real. O usuário pode atualizar a página e solicitar nova análise; cada requisição é independente.
+OBJETIVO:
+Selecionar UM ÚNICO palpite com o melhor Valor Esperado (EV) PARA O MOMENTO ATUAL DO JOGO. Ao ser chamado novamente, reavalie os dados atualizados e gere um novo palpite se fizer sentido.
+
+REGRAS OBRIGATÓRIAS:
+1) Responda em PT-BR, APENAS texto simples (sem Markdown).
+2) Máximo 6 linhas.
+3) Escolha somente 1 mercado dentre (sempre especificar período quando aplicável):
+   - GOLS: Over/Under (ex: Over 0.5, Over 1.5, Under 3.5 etc.) (Período: FT quando não especificar)
+   - VITÓRIA: 1X2 ou Dupla Chance (1X, X2, 12)
+   - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT)
+   - CARTÕES: Over/Under (Período: 1ºT | 2ºT | FT)
+4) A ODD do palpite DEVE estar entre 1.50 e 2.30 (inclusive).
+   - Se NÃO houver odds nesse intervalo nos dados, use Odd: 1.70 (estimada) e deixe explícito na Justificativa.
+5) Probabilidade de GREEN (P) deve estar entre 65% e 100% (inclusive).
+   - Nunca escreva abaixo de 65%.
+   - Evite 95%+ salvo se os dados forem extremamente fortes.
+6) Cálculo do EV (fundamental):
+   - EV = (P_decimal * odd) - 1
+   - P_decimal = P% / 100
+   - Mostre EV com 2 casas e sinal (ex: +0.26, -0.05).
+7) Otimização:
+   - Prefira EV mais alto com risco mais baixo quando próximos.
+   - Se EV ficar negativo, troque o mercado/linha/período até EV >= 0.
+   - Se TODOS ficarem negativos, retorne o menor negativo possível e explique rapidamente.
+8) Lógica ao vivo (usar sinais do LIVE):
+   - Considere tempo decorrido, placar atual, tendência (pressão/ataques/chutes/escanteios), disciplina (cartões/faltas) e odds ao vivo.
+   - Ajuste linha e período para ficar coerente com o relógio do jogo.
+   - Evite recomendações incoerentes com o tempo (ex.: 1ºT quando já está no 2ºT).
+9) Consistência:
+   - Não liste múltiplos palpites.
+   - Não explique a matemática passo a passo; apenas entregue o resultado final.
+   - Não invente dados fora do JSON; se faltar algo, seja conservador.
+
+FORMATO EXATO (copie exatamente as chaves e ordem):
+Recomendação: <mercado + linha + período>
+Odd: <X.XX>
 Probabilidade de GREEN: <XX%>
+EV: <+0.00>
 Risco: baixo|médio|alto
-Justificativa: <1 frase>
-Dados: ${JSON.stringify(gameInfo)}`;
+Justificativa: <1 frase objetiva baseada nos dados ao vivo e odds>
+
+DADOS AO VIVO (use somente isto):
+${JSON.stringify(gameInfo)}`;
 
   try {
     const text = await generateGemini(prompt);
-    const finalText = ensureSingleGreenPercent(text || "Erro na análise da IA.");
+    const finalText = ensureAIFormat(text);
     if (cacheKey) aiCacheSet(cacheKey, finalText);
     return finalText;
   } catch (err) {
@@ -293,14 +318,14 @@ Dados: ${JSON.stringify(gameInfo)}`;
     if (status === 429) {
       const sec = parseRetryDelaySeconds(err);
       const msg = sec
-        ? `IA em limite de uso. Tente novamente em ~${sec}s.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Limite de cota/velocidade da IA.`
-        : `IA em limite de uso. Tente novamente mais tarde.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Limite de cota/velocidade da IA.`;
+        ? `IA em limite de uso. Tente novamente em ~${sec}s.`
+        : `IA em limite de uso. Tente novamente mais tarde.`;
 
       if (sec && sec <= 60) {
         try {
           await sleep((sec + 1) * 1000);
           const text2 = await generateGemini(prompt);
-          const finalText2 = ensureSingleGreenPercent(text2 || msg);
+          const finalText2 = ensureAIFormat(text2 || msg);
           if (cacheKey) aiCacheSet(cacheKey, finalText2);
           return finalText2;
         } catch (err2) {
@@ -318,8 +343,7 @@ Dados: ${JSON.stringify(gameInfo)}`;
     console.error("GEMINI ERROR (STATUS):", status);
     console.error("GEMINI ERROR (RAW):", err?.raw);
 
-    const fallback =
-      "Erro na análise da IA.\nProbabilidade de GREEN: 65%\nRisco: médio\nJustificativa: Falha ao consultar a IA.";
+    const fallback = "Erro na análise da IA.";
     if (cacheKey) aiCacheSet(cacheKey, fallback);
     return fallback;
   }
@@ -453,7 +477,6 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   out.live_odds = odds.response || [];
 
   if (wantAnalysis) {
-    // ÚNICA troca: usa o wrapper com fila/limite (mesma assinatura)
     out.ai_prediction = await getAIAnalysisQueued(
       pick(out, ["live_score", "live_stats", "goals", "cards", "corners", "live_odds"]),
       "Futebol",
