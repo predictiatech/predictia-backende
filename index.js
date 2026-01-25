@@ -258,13 +258,61 @@ function extractStatValue(statsTeamRow, type) {
   return safeNumber(v, 0);
 }
 
+// ======================================================
+// ✅ IMPLEMENTAÇÃO (SOMENTE) - XG / EXPECTED GOALS
+// ======================================================
+function extractStatAny(statsTeamRow, aliases = []) {
+  const s = statsTeamRow?.statistics || [];
+  const norm = (x) => String(x || "").toLowerCase().trim();
+
+  for (const a of aliases) {
+    const it = s.find((x) => norm(x?.type) === norm(a));
+    if (!it) continue;
+
+    const v = it?.value;
+
+    if (typeof v === "string") {
+      const vv = v.replace(",", ".").replace(/[^\d.%-]/g, "");
+      if (vv.endsWith("%")) return safeNumber(vv.replace("%", ""), 0);
+      return safeNumber(vv, 0);
+    }
+
+    return safeNumber(v, 0);
+  }
+
+  return 0;
+}
+
+function extractXG(statsTeamRow) {
+  return extractStatAny(statsTeamRow, [
+    "Expected Goals",
+    "Expected goals",
+    "Expected Goals (xG)",
+    "Expected goals (xG)",
+    "xG",
+    "xGoals",
+  ]);
+}
+
 function compactLiveStats(live_stats = []) {
   const home = live_stats?.[0] || null;
   const away = live_stats?.[1] || null;
 
+  // ✅ IMPLEMENTAÇÃO (SOMENTE): xG
+  const xgHome = extractXG(home);
+  const xgAway = extractXG(away);
+
   return {
     home: home?.team?.name || null,
     away: away?.team?.name || null,
+
+    // ✅ IMPLEMENTAÇÃO (SOMENTE): xG passa para a IA via stats
+    xg: {
+      home: xgHome,
+      away: xgAway,
+      total: Number((xgHome + xgAway).toFixed(2)),
+    },
+
     shots_on_goal: {
       home: extractStatValue(home, "Shots on Goal"),
       away: extractStatValue(away, "Shots on Goal"),
