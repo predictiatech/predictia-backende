@@ -127,6 +127,47 @@ function ensureAIFormat(text) {
 }
 
 // ======================================================
+// ✅ IMPLEMENTAÇÃO (SOMENTE): VALIDADORES DE ODD REAL (CATÁLOGO)
+// ======================================================
+function parseOddIdFromAI(text) {
+  const m = String(text || "").match(/ODD_ID\s*=\s*(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
+function validateAIWithOdds(aiText, aiInput) {
+  const t = String(aiText || "").trim();
+  const catalog = aiInput?.live?.odds || [];
+
+  if (!t) return null;
+  if (!Array.isArray(catalog) || catalog.length === 0) return null;
+
+  const oddId = parseOddIdFromAI(t);
+  if (!oddId) return null;
+
+  const row = catalog.find((x) => Number(x?.id) === Number(oddId));
+  if (!row) return null;
+
+  const odd = safeNumber(row?.odd, 0);
+  if (odd < 1.5 || odd > 2.3) return null;
+
+  return row;
+}
+
+function patchOddLineWithRealOdd(aiText, realOdd) {
+  const oddReal = Number(safeNumber(realOdd, 0)).toFixed(2);
+  const text = String(aiText || "");
+
+  if (/\bOdd\s*:\s*/i.test(text)) {
+    return text.replace(
+      /\bOdd\s*:\s*[0-9]+(?:[.,][0-9]+)?\b/i,
+      `Odd: ${oddReal}`
+    );
+  }
+
+  return `${text}\nOdd: ${oddReal}`;
+}
+
+// ======================================================
 // ✅ SEÇÃO: IA QUOTA PROTECTION (CACHE + RETRY 429) (EXISTENTE)
 // ======================================================
 const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000);
@@ -298,7 +339,6 @@ function compactLiveStats(live_stats = []) {
   const home = live_stats?.[0] || null;
   const away = live_stats?.[1] || null;
 
-  // ✅ IMPLEMENTAÇÃO (SOMENTE): xG
   const xgHome = extractXG(home);
   const xgAway = extractXG(away);
 
@@ -306,7 +346,6 @@ function compactLiveStats(live_stats = []) {
     home: home?.team?.name || null,
     away: away?.team?.name || null,
 
-    // ✅ IMPLEMENTAÇÃO (SOMENTE): xG passa para a IA via stats
     xg: {
       home: xgHome,
       away: xgAway,
@@ -367,7 +406,10 @@ function compactEvents(goals = [], cards = []) {
   };
 }
 
-function compactLiveOdds(live_odds = []) {
+// ======================================================
+// ✅ IMPLEMENTAÇÃO (SOMENTE): CATÁLOGO DE ODD REAL (COM ODD_ID)
+// ======================================================
+function compactLiveOdds(live_odds = [], live_score = null) {
   const wanted = new Set([
     "Match Winner",
     "Double Chance",
@@ -379,8 +421,12 @@ function compactLiveOdds(live_odds = []) {
     "Total Cards",
   ]);
 
+  const homeTeam = live_score?.teams?.home?.name || null;
+  const awayTeam = live_score?.teams?.away?.name || null;
+
   const arr = Array.isArray(live_odds) ? live_odds : [];
   const out = [];
+  let idSeq = 1;
 
   for (const root of arr) {
     const bookmakers = Array.isArray(root?.bookmakers) ? root.bookmakers : [];
@@ -390,50 +436,52 @@ function compactLiveOdds(live_odds = []) {
         const name = String(bet?.name || "");
         if (!wanted.has(name)) continue;
 
+        const marketName = String(bet?.name || "").toLowerCase();
+
+        let period = "FT";
+        if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
+        if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
+
         const values = Array.isArray(bet?.values) ? bet.values : [];
         for (const v of values) {
           const odd = safeNumber(v?.odd, 0);
 
-          if (odd >= 1.5 && odd <= 2.3) {
+          // ✅ mantém o range aqui (catálogo só entra com odd válida)
+          if (odd < 1.5 || odd > 2.3) continue;
 
-            // ================================
-            // IMPLEMENTAÇÃO (SOMENTE)
-            // ================================
-            const marketName = String(bet?.name || "").toLowerCase();
-            const selection = String(v?.value || "").toLowerCase();
+          const selectionRaw = String(v?.value || "");
+          const selection = selectionRaw.toLowerCase();
 
-            let side = "game";
-            let team = null;
+          let side = "game";
+          let team = null;
 
-            if (marketName.includes("team") || selection.includes("home") || selection.includes("away")) {
-              if (selection.includes("home")) {
-                side = "home";
-                team = root?.teams?.home?.name || null;
-              } else if (selection.includes("away")) {
-                side = "away";
-                team = root?.teams?.away?.name || null;
-              }
-            }
-
-            let period = "FT";
-            if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
-            if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
-
-            // ================================
-
-            out.push({
-              bookmaker: bm?.name || null,
-              market: name,
-              selection: v?.value || null,
-              handicap: v?.handicap || null,     // ✅ linha real
-              side: side,                        // ✅ game | home | away
-              team: team,                        // ✅ nome do time quando aplicável
-              period: period,                    // ✅ FT | 1H | 2H
-              odd: Number(odd.toFixed(2)),
-            });
+          if (selection.includes("home") || selectionRaw === "1") {
+            side = "home";
+            team = homeTeam;
+          } else if (selection.includes("away") || selectionRaw === "2") {
+            side = "away";
+            team = awayTeam;
+          } else if (homeTeam && selection.includes(homeTeam.toLowerCase())) {
+            side = "home";
+            team = homeTeam;
+          } else if (awayTeam && selection.includes(awayTeam.toLowerCase())) {
+            side = "away";
+            team = awayTeam;
           }
 
-          if (out.length >= 50) return out;
+          out.push({
+            id: idSeq++,
+            bookmaker: bm?.name || null,
+            market: name,
+            selection: selectionRaw || null,
+            handicap: v?.handicap || null,
+            side,
+            team,
+            period,
+            odd: Number(odd.toFixed(2)),
+          });
+
+          if (out.length >= 80) return out;
         }
       }
     }
@@ -441,7 +489,6 @@ function compactLiveOdds(live_odds = []) {
 
   return out;
 }
-
 
 function buildAIInput(out) {
   const live_score = out?.live_score || {};
@@ -472,7 +519,7 @@ function buildAIInput(out) {
       corners_total: safeNumber(out?.corners?.total, 0),
       events: compactEvents(out?.goals, out?.cards),
       stats: compactLiveStats(out?.live_stats || []),
-      odds: compactLiveOdds(out?.live_odds || []),
+      odds: compactLiveOdds(out?.live_odds || [], live_score),
     },
   };
 }
@@ -502,7 +549,8 @@ REGRAS OBRIGATÓRIAS:
    - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT)
    - CARTÕES: Over/Under (Período: 1ºT | 2ºT | FT)
 4) A ODD do palpite DEVE estar entre 1.50 e 2.30 (inclusive).
-   - Se NÃO houver odds nesse intervalo nos dados, use Odd: 1.70 (estimada) e deixe explícito na Justificativa.
+   - A ODD DEVE ser REAL e EXISTIR no JSON em live.odds (catálogo).
+   - NUNCA use odd estimada. Se não existir odd real no range, responda exatamente: Sem oportunidades no range 1.50–2.30.
 5) Probabilidade de GREEN (P) deve estar entre 65% e 100% (inclusive).
    - Nunca escreva abaixo de 65%.
    - Evite 95%+ salvo se os dados forem extremamente fortes.
@@ -518,13 +566,14 @@ REGRAS OBRIGATÓRIAS:
    - Considere tempo decorrido, placar atual, tendência (pressão/ataques/chutes/escanteios), disciplina (cartões/faltas) e odds ao vivo.
    - Ajuste linha e período para ficar coerente com o relógio do jogo.
    - Evite recomendações incoerentes com o tempo (ex.: 1ºT quando já está no 2ºT).
-9) Consistência:
-   - Não liste múltiplos palpites.
-   - Não explique a matemática passo a passo; apenas entregue o resultado final.
-   - Não invente dados fora do JSON; se faltar algo, seja conservador.
+9) CONSISTÊNCIA DO MERCADO:
+   - Sempre informar ALVO: JOGO | CASA | FORA
+   - Quando houver linha/handicap, informar a linha real (handicap).
+10) SELEÇÃO DA ODD:
+   - Você DEVE escolher 1 item do catálogo live.odds e usar o ID dele.
 
 FORMATO EXATO (copie exatamente as chaves e ordem):
-Recomendação: <mercado + linha + período>
+Recomendação: <mercado + linha + período> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
 Odd: <X.XX>
 Probabilidade de GREEN: <XX%>
 EV: <+0.00>
@@ -537,8 +586,18 @@ ${JSON.stringify(gameInfo)}`;
   try {
     const text = await generateGemini(prompt);
     const finalText = ensureAIFormat(text);
-    if (cacheKey) aiCacheSet(cacheKey, finalText);
-    return finalText;
+
+    const picked = validateAIWithOdds(finalText, gameInfo);
+    if (!picked) {
+      const msg = "Sem oportunidades no range 1.50–2.30.";
+      if (cacheKey) aiCacheSet(cacheKey, msg);
+      return msg;
+    }
+
+    const patched = patchOddLineWithRealOdd(finalText, picked.odd);
+
+    if (cacheKey) aiCacheSet(cacheKey, patched);
+    return patched;
   } catch (err) {
     const status = err?.status;
 
@@ -553,8 +612,18 @@ ${JSON.stringify(gameInfo)}`;
           await sleep((sec + 1) * 1000);
           const text2 = await generateGemini(prompt);
           const finalText2 = ensureAIFormat(text2 || msg);
-          if (cacheKey) aiCacheSet(cacheKey, finalText2);
-          return finalText2;
+
+          const picked2 = validateAIWithOdds(finalText2, gameInfo);
+          if (!picked2) {
+            const msg2 = "Sem oportunidades no range 1.50–2.30.";
+            if (cacheKey) aiCacheSet(cacheKey, msg2);
+            return msg2;
+          }
+
+          const patched2 = patchOddLineWithRealOdd(finalText2, picked2.odd);
+
+          if (cacheKey) aiCacheSet(cacheKey, patched2);
+          return patched2;
         } catch (err2) {
           console.error("GEMINI RETRY FAILED:", err2);
         }
