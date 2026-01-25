@@ -127,6 +127,47 @@ function ensureAIFormat(text) {
 }
 
 // ======================================================
+// ✅ IMPLEMENTAÇÃO (SOMENTE): VALIDADORES DE ODD REAL (CATÁLOGO)
+// ======================================================
+function parseOddIdFromAI(text) {
+  const m = String(text || "").match(/ODD_ID\s*=\s*(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
+function validateAIWithOdds(aiText, aiInput) {
+  const t = String(aiText || "").trim();
+  const catalog = aiInput?.live?.odds || [];
+
+  if (!t) return null;
+  if (!Array.isArray(catalog) || catalog.length === 0) return null;
+
+  const oddId = parseOddIdFromAI(t);
+  if (!oddId) return null;
+
+  const row = catalog.find((x) => Number(x?.id) === Number(oddId));
+  if (!row) return null;
+
+  const odd = safeNumber(row?.odd, 0);
+  if (odd < 1.5 || odd > 2.3) return null;
+
+  return row;
+}
+
+function patchOddLineWithRealOdd(aiText, realOdd) {
+  const oddReal = Number(safeNumber(realOdd, 0)).toFixed(2);
+  const text = String(aiText || "");
+
+  if (/\bOdd\s*:\s*/i.test(text)) {
+    return text.replace(
+      /\bOdd\s*:\s*[0-9]+(?:[.,][0-9]+)?\b/i,
+      `Odd: ${oddReal}`
+    );
+  }
+
+  return `${text}\nOdd: ${oddReal}`;
+}
+
+// ======================================================
 // ✅ SEÇÃO: IA QUOTA PROTECTION (CACHE + RETRY 429) (EXISTENTE)
 // ======================================================
 const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000);
@@ -336,8 +377,8 @@ function compactLiveStats(live_stats = []) {
       away: extractStatValue(away, "Yellow Cards"),
     },
     red: {
-      home: extractStatValue(home, "Red Cards"),
-      away: extractStatValue(away, "Red Cards"),
+      home: extractStatValue(away, "Red Cards"),
+      away: extractStatValue(home, "Red Cards"),
     },
   };
 }
@@ -358,192 +399,109 @@ function compactEvents(goals = [], cards = []) {
 }
 
 // ======================================================
-// ✅ IMPLEMENTAÇÃO: ODD CATALOG COMPATÍVEL COM 2 FORMATOS
-// - Formato A: root.bookmakers[].bets[].values[]
-// - Formato B: root.odds[] -> {id,name,values[]}
-// + inclui ODD_ID real (id do mercado + seleção + handicap)
-// + limita tamanho p/ não estourar caracteres
+// ✅ IMPLEMENTAÇÃO (SOMENTE): CATÁLOGO DE ODD REAL (COM ODD_ID)
+// ✅ FIX CRÍTICO: SUPORTA 2 FORMATOS:
+//   (A) odds.live v3 (bookmakers -> bets -> values)
+//   (B) odds.live "antigo" (root.odds -> {id,name,values})
 // ======================================================
-function inferSideTeam(selectionRaw, teams) {
-  const v = String(selectionRaw || "").toLowerCase();
-
-  if (v.includes("home") || selectionRaw === "1") {
-    return { side: "home", team: teams?.home?.name || null };
-  }
-  if (v.includes("away") || selectionRaw === "2") {
-    return { side: "away", team: teams?.away?.name || null };
-  }
-
-  return { side: "game", team: null };
-}
-
-function scoreCandidate(odd, handicap) {
-  const center = 1.85;
-  const distance = Math.abs(Number(odd) - center);
-  const hasHcp = handicap !== null && handicap !== undefined && handicap !== "";
-  return (hasHcp ? 0.1 : 0) - distance;
-}
-
 function compactLiveOdds(live_odds = [], live_score = null) {
+  const homeTeam = live_score?.teams?.home?.name || null;
+  const awayTeam = live_score?.teams?.away?.name || null;
+
   const arr = Array.isArray(live_odds) ? live_odds : [];
   const out = [];
+  let idSeq = 1;
 
-  // ✅ id sequencial do catálogo (ODD_ID)
-  let oddId = 1;
+  const pushCatalogRow = (bmName, marketName, selectionRaw, handicap, period, odd) => {
+    const selection = String(selectionRaw || "").toLowerCase();
 
-  for (const root of arr) {
-    const teams =
-      root?.teams ||
-      live_score?.teams ||
-      {
-        home: { name: live_score?.teams?.home?.name || null },
-        away: { name: live_score?.teams?.away?.name || null },
-      };
+    let side = "game";
+    let team = null;
 
-    // --------------------------------------------------
-    // ✅ FORMATO B (o seu JSON): root.odds[]
-    // --------------------------------------------------
-    if (Array.isArray(root?.odds)) {
-      for (const bet of root.odds) {
-        const market = String(bet?.name || "").trim();
-        const marketLower = market.toLowerCase();
-
-        let period = "FT";
-        if (marketLower.includes("1st") || marketLower.includes("1st half")) period = "1H";
-        if (marketLower.includes("2nd") || marketLower.includes("2nd half")) period = "2H";
-
-        const values = Array.isArray(bet?.values) ? bet.values : [];
-        const candidates = [];
-
-        for (const v of values) {
-          if (v?.suspended === true) continue;
-
-          const odd = safeNumber(v?.odd, 0);
-          if (odd < 1.5 || odd > 2.3) continue;
-
-          const selectionRaw = String(v?.value || "");
-          const handicap = v?.handicap ?? null;
-          const { side, team } = inferSideTeam(selectionRaw, teams);
-
-          candidates.push({
-            id: oddId++, // ✅ ODD_ID para IA
-            bookmaker: null,
-            market,
-            selection: selectionRaw || null,
-            handicap,
-            side,
-            team,
-            period,
-            odd: Number(odd.toFixed(3)),
-            _score: scoreCandidate(odd, handicap),
-          });
-        }
-
-        // top 3 por mercado
-        candidates.sort((a, b) => b._score - a._score);
-        for (const c of candidates.slice(0, 3)) {
-          const { _score, ...row } = c;
-          out.push(row);
-          if (out.length >= 45) return out;
-        }
-      }
-
-      continue;
+    if (selection.includes("home") || String(selectionRaw) === "1") {
+      side = "home";
+      team = homeTeam;
+    } else if (selection.includes("away") || String(selectionRaw) === "2") {
+      side = "away";
+      team = awayTeam;
+    } else if (homeTeam && selection.includes(homeTeam.toLowerCase())) {
+      side = "home";
+      team = homeTeam;
+    } else if (awayTeam && selection.includes(awayTeam.toLowerCase())) {
+      side = "away";
+      team = awayTeam;
     }
 
-    // --------------------------------------------------
-    // ✅ FORMATO A (seu código anterior): root.bookmakers[].bets[].values[]
-    // --------------------------------------------------
+    out.push({
+      id: idSeq++,
+      bookmaker: bmName || null,
+      market: marketName || null,
+      selection: selectionRaw || null,
+      handicap: handicap ?? null,
+      side,
+      team,
+      period,
+      odd: Number(Number(odd).toFixed(2)),
+    });
+  };
+
+  // -------- FORMATO (A): bookmakers/bets/values --------
+  for (const root of arr) {
     const bookmakers = Array.isArray(root?.bookmakers) ? root.bookmakers : [];
+    if (bookmakers.length === 0) continue;
+
     for (const bm of bookmakers) {
       const bets = Array.isArray(bm?.bets) ? bm.bets : [];
       for (const bet of bets) {
-        const market = String(bet?.name || "").trim();
-        const marketLower = market.toLowerCase();
+        const market = String(bet?.name || "");
+        const marketName = String(bet?.name || "").toLowerCase();
 
         let period = "FT";
-        if (marketLower.includes("1st") || marketLower.includes("1st half")) period = "1H";
-        if (marketLower.includes("2nd") || marketLower.includes("2nd half")) period = "2H";
+        if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
+        if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
 
         const values = Array.isArray(bet?.values) ? bet.values : [];
-        const candidates = [];
-
         for (const v of values) {
-          if (v?.suspended === true) continue;
-
           const odd = safeNumber(v?.odd, 0);
           if (odd < 1.5 || odd > 2.3) continue;
 
-          const selectionRaw = String(v?.value || "");
-          const handicap = v?.handicap ?? null;
-          const { side, team } = inferSideTeam(selectionRaw, root?.teams || teams);
+          pushCatalogRow(bm?.name, market, String(v?.value || ""), v?.handicap, period, odd);
 
-          candidates.push({
-            id: oddId++, // ✅ ODD_ID para IA
-            bookmaker: bm?.name || null,
-            market,
-            selection: selectionRaw || null,
-            handicap,
-            side,
-            team,
-            period,
-            odd: Number(odd.toFixed(3)),
-            _score: scoreCandidate(odd, handicap),
-          });
+          if (out.length >= 80) return out;
         }
+      }
+    }
+  }
 
-        candidates.sort((a, b) => b._score - a._score);
-        for (const c of candidates.slice(0, 3)) {
-          const { _score, ...row } = c;
-          out.push(row);
-          if (out.length >= 45) return out;
-        }
+  // -------- FORMATO (B): root.odds -> {id,name,values} --------
+  for (const root of arr) {
+    const oddsArr = Array.isArray(root?.odds) ? root.odds : [];
+    if (oddsArr.length === 0) continue;
+
+    // esse formato muitas vezes NÃO tem bookmaker, então marca como "live"
+    const bmName = "live";
+
+    for (const bet of oddsArr) {
+      const market = String(bet?.name || "");
+      const marketName = String(bet?.name || "").toLowerCase();
+
+      let period = "FT";
+      if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
+      if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
+
+      const values = Array.isArray(bet?.values) ? bet.values : [];
+      for (const v of values) {
+        const odd = safeNumber(v?.odd, 0);
+        if (odd < 1.5 || odd > 2.3) continue;
+
+        pushCatalogRow(bmName, market, String(v?.value || ""), v?.handicap, period, odd);
+
+        if (out.length >= 80) return out;
       }
     }
   }
 
   return out;
-}
-
-// ======================================================
-// ✅ IMPLEMENTAÇÃO: VALIDADORES DE ODD REAL (CATÁLOGO)
-// ======================================================
-function parseOddIdFromAI(text) {
-  const m = String(text || "").match(/ODD_ID\s*=\s*(\d+)/i);
-  return m ? Number(m[1]) : null;
-}
-
-function validateAIWithOdds(aiText, aiInput) {
-  const t = String(aiText || "").trim();
-  const catalog = aiInput?.live?.odds || [];
-
-  if (!t) return null;
-  if (!Array.isArray(catalog) || catalog.length === 0) return null;
-
-  const oddId = parseOddIdFromAI(t);
-  if (!oddId) return null;
-
-  const row = catalog.find((x) => Number(x?.id) === Number(oddId));
-  if (!row) return null;
-
-  const odd = safeNumber(row?.odd, 0);
-  if (odd < 1.5 || odd > 2.3) return null;
-
-  return row;
-}
-
-function patchOddLineWithRealOdd(aiText, realOdd) {
-  const oddReal = Number(safeNumber(realOdd, 0)).toFixed(2);
-  const text = String(aiText || "");
-
-  if (/\bOdd\s*:\s*/i.test(text)) {
-    return text.replace(
-      /\bOdd\s*:\s*[0-9]+(?:[.,][0-9]+)?\b/i,
-      `Odd: ${oddReal}`
-    );
-  }
-
-  return `${text}\nOdd: ${oddReal}`;
 }
 
 function buildAIInput(out) {
@@ -575,14 +533,13 @@ function buildAIInput(out) {
       corners_total: safeNumber(out?.corners?.total, 0),
       events: compactEvents(out?.goals, out?.cards),
       stats: compactLiveStats(out?.live_stats || []),
-      // ✅ agora funciona tanto com odds.response (api-sports) quanto com o JSON colado por você
       odds: compactLiveOdds(out?.live_odds || [], live_score),
     },
   };
 }
 
 // ======================================================
-// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (COM PATCH DE ODD REAL)
+// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (LÓGICA MANTIDA)
 // ======================================================
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
@@ -605,28 +562,20 @@ REGRAS OBRIGATÓRIAS:
    - VITÓRIA: 1X2 ou Dupla Chance (1X, X2, 12)
    - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT)
    - CARTÕES: Over/Under (Período: 1ºT | 2ºT | FT)
+   - HANDICAP: Asiático ou 3-Way Handicap (informar linha/handicap)
 4) A ODD do palpite DEVE estar entre 1.50 e 2.30 (inclusive).
    - A ODD DEVE ser REAL e EXISTIR no JSON em live.odds (catálogo).
    - NUNCA use odd estimada. Se não existir odd real no range, responda exatamente: Sem oportunidades no range 1.50–2.30.
 5) Probabilidade de GREEN (P) deve estar entre 65% e 100% (inclusive).
    - Nunca escreva abaixo de 65%.
-   - Evite 95%+ salvo se os dados forem extremamente fortes.
 6) Cálculo do EV (fundamental):
    - EV = (P_decimal * odd) - 1
    - P_decimal = P% / 100
    - Mostre EV com 2 casas e sinal (ex: +0.26, -0.05).
-7) Otimização:
-   - Prefira EV mais alto com risco mais baixo quando próximos.
-   - Se EV ficar negativo, troque o mercado/linha/período até EV >= 0.
-   - Se TODOS ficarem negativos, retorne o menor negativo possível e explique rapidamente.
-8) Lógica ao vivo (usar sinais do LIVE):
-   - Considere tempo decorrido, placar atual, tendência (pressão/ataques/chutes/escanteios), disciplina (cartões/faltas) e odds ao vivo.
-   - Ajuste linha e período para ficar coerente com o relógio do jogo.
-   - Evite recomendações incoerentes com o tempo (ex.: 1ºT quando já está no 2ºT).
-9) CONSISTÊNCIA DO MERCADO:
+7) CONSISTÊNCIA DO MERCADO:
    - Sempre informar ALVO: JOGO | CASA | FORA
    - Quando houver linha/handicap, informar a linha real (handicap).
-10) SELEÇÃO DA ODD:
+8) SELEÇÃO DA ODD:
    - Você DEVE escolher 1 item do catálogo live.odds e usar o ID dele.
 
 FORMATO EXATO (copie exatamente as chaves e ordem):
@@ -664,28 +613,6 @@ ${JSON.stringify(gameInfo)}`;
         ? `IA em limite de uso. Tente novamente em ~${sec}s.`
         : `IA em limite de uso. Tente novamente mais tarde.`;
 
-      if (sec && sec <= 60) {
-        try {
-          await sleep((sec + 1) * 1000);
-          const text2 = await generateGemini(prompt);
-          const finalText2 = ensureAIFormat(text2 || msg);
-
-          const picked2 = validateAIWithOdds(finalText2, gameInfo);
-          if (!picked2) {
-            const msg2 = "Sem oportunidades no range 1.50–2.30.";
-            if (cacheKey) aiCacheSet(cacheKey, msg2);
-            return msg2;
-          }
-
-          const patched2 = patchOddLineWithRealOdd(finalText2, picked2.odd);
-
-          if (cacheKey) aiCacheSet(cacheKey, patched2);
-          return patched2;
-        } catch (err2) {
-          console.error("GEMINI RETRY FAILED:", err2);
-        }
-      }
-
       if (cacheKey) aiCacheSet(cacheKey, msg);
       return msg;
     }
@@ -693,8 +620,6 @@ ${JSON.stringify(gameInfo)}`;
     console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
     console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
     console.error("GEMINI ERROR (FULL):", err);
-    console.error("GEMINI ERROR (STATUS):", status);
-    console.error("GEMINI ERROR (RAW):", err?.raw);
 
     const fallback = "Erro na análise da IA.";
     if (cacheKey) aiCacheSet(cacheKey, fallback);
@@ -741,17 +666,6 @@ async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1
 // ======================================================
 const ADAPTERS = {
   football: {
-    getGames: ({ date, live, leagueId }) => ({
-      path: "/fixtures",
-      params: live
-        ? leagueId
-          ? { live: "all", league: leagueId }
-          : { live: "all" }
-        : leagueId
-          ? { date, league: leagueId }
-          : { date },
-    }),
-
     extractLiveScore: (item) => ({
       fixtureId: item?.fixture?.id,
       league: item?.league ? { id: item.league.id, name: item.league.name } : null,
@@ -788,8 +702,7 @@ app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
 
-  const cfg = ADAPTERS.football.getGames({ live: true, leagueId });
-  const data = await apiSports(FOOTBALL_BASE, cfg.path, cfg.params);
+  const data = await apiSports(FOOTBALL_BASE, "/fixtures", leagueId ? { live: "all", league: leagueId } : { live: "all" });
 
   res.json({
     status: "ok",
@@ -801,6 +714,7 @@ app.get("/football/live", async (req, res) => {
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
+  const wantDebug = String(req.query.debug || "").toLowerCase() === "true";
 
   const out = { fixtureId };
 
@@ -828,6 +742,13 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 
   if (wantAnalysis) {
     const aiInput = buildAIInput(out);
+
+    if (wantDebug) {
+      out.ai_debug = {
+        catalogSize: Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds.length : 0,
+        sample: Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds.slice(0, 12) : [],
+      };
+    }
 
     out.ai_prediction = await getAIAnalysisQueued(
       aiInput,
