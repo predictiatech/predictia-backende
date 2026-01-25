@@ -393,14 +393,46 @@ function compactLiveOdds(live_odds = []) {
         const values = Array.isArray(bet?.values) ? bet.values : [];
         for (const v of values) {
           const odd = safeNumber(v?.odd, 0);
+
           if (odd >= 1.5 && odd <= 2.3) {
+
+            // ================================
+            // IMPLEMENTAÇÃO (SOMENTE)
+            // ================================
+            const marketName = String(bet?.name || "").toLowerCase();
+            const selection = String(v?.value || "").toLowerCase();
+
+            let side = "game";
+            let team = null;
+
+            if (marketName.includes("team") || selection.includes("home") || selection.includes("away")) {
+              if (selection.includes("home")) {
+                side = "home";
+                team = root?.teams?.home?.name || null;
+              } else if (selection.includes("away")) {
+                side = "away";
+                team = root?.teams?.away?.name || null;
+              }
+            }
+
+            let period = "FT";
+            if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
+            if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
+
+            // ================================
+
             out.push({
               bookmaker: bm?.name || null,
               market: name,
               selection: v?.value || null,
+              handicap: v?.handicap || null,     // ✅ linha real
+              side: side,                        // ✅ game | home | away
+              team: team,                        // ✅ nome do time quando aplicável
+              period: period,                    // ✅ FT | 1H | 2H
               odd: Number(odd.toFixed(2)),
             });
           }
+
           if (out.length >= 50) return out;
         }
       }
@@ -409,6 +441,7 @@ function compactLiveOdds(live_odds = []) {
 
   return out;
 }
+
 
 function buildAIInput(out) {
   const live_score = out?.live_score || {};
