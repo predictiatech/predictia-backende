@@ -129,6 +129,11 @@ function ensureAIFormat(text) {
 // ======================================================
 // ✅ IMPLEMENTAÇÃO (SOMENTE): VALIDADORES DE ODD REAL (CATÁLOGO)
 // ======================================================
+function safeNumber(v, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+
 function parseOddIdFromAI(text) {
   const m = String(text || "").match(/ODD_ID\s*=\s*(\d+)/i);
   return m ? Number(m[1]) : null;
@@ -151,6 +156,25 @@ function validateAIWithOdds(aiText, aiInput) {
   if (odd < 1.5 || odd > 2.3) return null;
 
   return row;
+}
+
+function validateAIWithOddsDetailed(aiText, aiInput) {
+  const t = String(aiText || "").trim();
+  const catalog = aiInput?.live?.odds || [];
+
+  if (!t) return { ok: false, reason: "AI_EMPTY" };
+  if (!Array.isArray(catalog) || catalog.length === 0) return { ok: false, reason: "CATALOG_EMPTY" };
+
+  const oddId = parseOddIdFromAI(t);
+  if (!oddId) return { ok: false, reason: "NO_ODD_ID" };
+
+  const row = catalog.find((x) => Number(x?.id) === Number(oddId));
+  if (!row) return { ok: false, reason: "ODD_ID_NOT_FOUND" };
+
+  const odd = safeNumber(row?.odd, 0);
+  if (odd < 1.5 || odd > 2.3) return { ok: false, reason: "ODD_OUT_OF_RANGE" };
+
+  return { ok: true, reason: "OK", row };
 }
 
 function patchOddLineWithRealOdd(aiText, realOdd) {
@@ -278,11 +302,6 @@ async function getAIAnalysisQueued(gameInfo, sportLabel = "Esporte", cacheKey = 
 // ======================================================
 // ✅ NOVO: COMPACTAÇÃO DO INPUT PARA IA (EVITA PROMPT GIGANTE)
 // ======================================================
-function safeNumber(v, d = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-
 function extractStatValue(statsTeamRow, type) {
   const s = statsTeamRow?.statistics || [];
   const it = s.find((x) => x?.type === type);
@@ -327,6 +346,7 @@ function extractXG(statsTeamRow) {
   ]);
 }
 
+// ✅ FIX: Red cards invertido (corrigido)
 function compactLiveStats(live_stats = []) {
   const home = live_stats?.[0] || null;
   const away = live_stats?.[1] || null;
@@ -377,8 +397,8 @@ function compactLiveStats(live_stats = []) {
       away: extractStatValue(away, "Yellow Cards"),
     },
     red: {
-      home: extractStatValue(away, "Red Cards"),
-      away: extractStatValue(home, "Red Cards"),
+      home: extractStatValue(home, "Red Cards"),
+      away: extractStatValue(away, "Red Cards"),
     },
   };
 }
@@ -400,7 +420,7 @@ function compactEvents(goals = [], cards = []) {
 
 // ======================================================
 // ✅ IMPLEMENTAÇÃO (SOMENTE): CATÁLOGO DE ODD REAL (COM ODD_ID)
-// ✅ FIX CRÍTICO: SUPORTA 2 FORMATOS:
+// ✅ SUPORTA 2 FORMATOS:
 //   (A) odds.live v3 (bookmakers -> bets -> values)
 //   (B) odds.live "antigo" (root.odds -> {id,name,values})
 // ======================================================
@@ -478,7 +498,6 @@ function compactLiveOdds(live_odds = [], live_score = null) {
     const oddsArr = Array.isArray(root?.odds) ? root.odds : [];
     if (oddsArr.length === 0) continue;
 
-    // esse formato muitas vezes NÃO tem bookmaker, então marca como "live"
     const bmName = "live";
 
     for (const bet of oddsArr) {
@@ -539,7 +558,47 @@ function buildAIInput(out) {
 }
 
 // ======================================================
-// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (LÓGICA MANTIDA)
+// ✅ DEBUG: resumo do input (odds/stats/elapsed)
+// ======================================================
+function summarizeAIInput(aiInput) {
+  const odds = Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds : [];
+  const stats = aiInput?.live?.stats || {};
+  const elapsed = safeNumber(aiInput?.match?.time?.elapsed, 0);
+
+  const markets = {};
+  for (const o of odds) {
+    const k = String(o?.market || "unknown");
+    markets[k] = (markets[k] || 0) + 1;
+  }
+
+  return {
+    elapsed,
+    oddsCount: odds.length,
+    oddsFirst10: odds.slice(0, 10),
+    marketsTop: Object.entries(markets)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([market, count]) => ({ market, count })),
+    statsSnapshot: stats,
+  };
+}
+
+function buildOddsHintList(aiInput, max = 25) {
+  const odds = Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds : [];
+  return odds.slice(0, max).map((o) => ({
+    id: o.id,
+    market: o.market,
+    selection: o.selection,
+    handicap: o.handicap ?? null,
+    period: o.period,
+    side: o.side,
+    team: o.team ?? null,
+    odd: o.odd,
+  }));
+}
+
+// ======================================================
+// ✅ FUNÇÃO ORIGINAL: getAIAnalysis (LÓGICA MANTIDA + RETRY FORÇADO)
 // ======================================================
 async function getAIAnalysis(gameInfo, sportLabel = "Esporte", cacheKey = "") {
   if (!genAI) return "IA não configurada.";
@@ -593,15 +652,41 @@ ${JSON.stringify(gameInfo)}`;
     const text = await generateGemini(prompt);
     const finalText = ensureAIFormat(text);
 
-    const picked = validateAIWithOdds(finalText, gameInfo);
-    if (!picked) {
-      const msg = "Sem oportunidades no range 1.50–2.30.";
-      if (cacheKey) aiCacheSet(cacheKey, msg);
-      return msg;
+    const v1 = validateAIWithOddsDetailed(finalText, gameInfo);
+    if (!v1.ok) {
+      const hintList = buildOddsHintList(gameInfo, 25);
+
+      const retryPrompt = `Você FALHOU em escolher um ODD_ID válido do catálogo.
+Agora escolha OBRIGATORIAMENTE um ODD_ID da lista abaixo (não invente IDs).
+
+LISTA_DE_ODDS_VALIDAS (use exatamente um ID daqui):
+${JSON.stringify(hintList)}
+
+Mantenha o mesmo FORMATO EXATO de resposta (máx 6 linhas) e regras:
+- Odd 1.50–2.30 (já está na lista)
+- Probabilidade >= 65%
+- EV = (P_decimal*odd)-1
+- Retorne com [ODD_ID=<N>] na primeira linha
+
+DADOS AO VIVO:
+${JSON.stringify(gameInfo)}`;
+
+      const text2 = await generateGemini(retryPrompt);
+      const finalText2 = ensureAIFormat(text2);
+
+      const v2 = validateAIWithOddsDetailed(finalText2, gameInfo);
+      if (!v2.ok) {
+        const msg = "Sem oportunidades no range 1.50–2.30.";
+        if (cacheKey) aiCacheSet(cacheKey, msg);
+        return msg;
+      }
+
+      const patched2 = patchOddLineWithRealOdd(finalText2, v2.row.odd);
+      if (cacheKey) aiCacheSet(cacheKey, patched2);
+      return patched2;
     }
 
-    const patched = patchOddLineWithRealOdd(finalText, picked.odd);
-
+    const patched = patchOddLineWithRealOdd(finalText, v1.row.odd);
     if (cacheKey) aiCacheSet(cacheKey, patched);
     return patched;
   } catch (err) {
@@ -702,7 +787,11 @@ app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
 
-  const data = await apiSports(FOOTBALL_BASE, "/fixtures", leagueId ? { live: "all", league: leagueId } : { live: "all" });
+  const data = await apiSports(
+    FOOTBALL_BASE,
+    "/fixtures",
+    leagueId ? { live: "all", league: leagueId } : { live: "all" }
+  );
 
   res.json({
     status: "ok",
@@ -747,14 +836,36 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       out.ai_debug = {
         catalogSize: Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds.length : 0,
         sample: Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds.slice(0, 12) : [],
+        inputSummary: summarizeAIInput(aiInput),
+        rawCounts: {
+          statsTeams: Array.isArray(out.live_stats) ? out.live_stats.length : 0,
+          eventsGoals: Array.isArray(out.goals) ? out.goals.length : 0,
+          eventsCards: Array.isArray(out.cards) ? out.cards.length : 0,
+          oddsRoots: Array.isArray(out.live_odds) ? out.live_odds.length : 0,
+        },
       };
+
+      console.log("[AI_DEBUG] fixture:", fixtureId, "elapsed:", aiInput?.match?.time?.elapsed);
+      console.log(
+        "[AI_DEBUG] oddsCatalog:",
+        Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds.length : 0
+      );
+      console.log(
+        "[AI_DEBUG] oddsSample:",
+        Array.isArray(aiInput?.live?.odds) ? aiInput.live.odds.slice(0, 5) : []
+      );
+      console.log("[AI_DEBUG] statsSnapshot:", aiInput?.live?.stats);
     }
 
-    out.ai_prediction = await getAIAnalysisQueued(
-      aiInput,
-      "Futebol",
-      `football:${fixtureId}`
-    );
+    const prediction = await getAIAnalysisQueued(aiInput, "Futebol", `football:${fixtureId}`);
+    out.ai_prediction = prediction;
+
+    if (wantDebug) {
+      const v = validateAIWithOddsDetailed(prediction, aiInput);
+      out.ai_debug = out.ai_debug || {};
+      out.ai_debug.validationReason = v?.reason || "UNKNOWN";
+      out.ai_debug.extractedOddId = parseOddIdFromAI(prediction);
+    }
   }
 
   res.json({ status: "ok", data: out });
