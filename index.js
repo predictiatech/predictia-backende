@@ -1,9 +1,9 @@
-// FILE: index.js (COMPLETO) — FUTEBOL + IA + ODDS/STATS AO VIVO (COM DEBUG)
-// FIX PRINCIPAL: NÃO cortar para 6 linhas antes de extrair ODD_ID (resolve NO_ODD_ID)
-// + mantém retry forçado com lista de odds válidas
-// + mantém fila/rate limit/cache
-// + mantém compactação stats/odds/events
-// + FIX: Red Cards invertido em compactLiveStats
+// FILE: index.js (COMPLETO) — FUTEBOL + IA + ODDS/STATS AO VIVO (SEM FALLBACK)
+// OBJETIVO DO FIX: garantir que as ODDS AO VIVO cheguem no catálogo (live.odds) antes da IA.
+// PRINCIPAIS AJUSTES:
+// 1) apiSports agora detecta json.errors (mesmo com HTTP 200) e devolve errors corretamente.
+// 2) /football/match/:fixtureId usa RETRY “inteligente” para /odds/live (não só response.length>0, mas odds internas).
+// 3) Debug detalhado: mostra errors/paging/results e sample do payload de odds/live quando ?debug=true.
 
 import "dotenv/config";
 import express from "express";
@@ -448,7 +448,6 @@ function compactLiveOdds(live_odds = [], live_score = null) {
   };
 
   // -------- FORMATO (B): root.odds -> {id,name,values} --------
-  // (seu print mostrou bookmaker="live", então este formato é o que está chegando)
   for (const root of arr) {
     const oddsArr = Array.isArray(root?.odds) ? root.odds : [];
     if (oddsArr.length === 0) continue;
@@ -469,7 +468,6 @@ function compactLiveOdds(live_odds = [], live_score = null) {
         if (odd < 1.5 || odd > 2.3) continue;
 
         pushCatalogRow(bmName, market, String(v?.value || ""), v?.handicap, period, odd);
-
         if (out.length >= 80) return out;
       }
     }
@@ -496,7 +494,6 @@ function compactLiveOdds(live_odds = [], live_score = null) {
           if (odd < 1.5 || odd > 2.3) continue;
 
           pushCatalogRow(bm?.name, market, String(v?.value || ""), v?.handicap, period, odd);
-
           if (out.length >= 80) return out;
         }
       }
@@ -636,7 +633,6 @@ ${JSON.stringify(gameInfo)}`;
   try {
     const raw1 = await generateGemini(prompt);
 
-    // ✅ VALIDAR NO RAW (sem cortar para 6 linhas)
     const v1 = validateAIWithOddsDetailed(raw1, gameInfo);
 
     if (!v1.ok) {
@@ -696,8 +692,16 @@ ${JSON.stringify(gameInfo)}`;
 }
 
 // ======================================================
-// ✅ API-SPORTS CORE
+// ✅ API-SPORTS CORE (FIX: detectar json.errors mesmo com HTTP 200)
 // ======================================================
+function hasApiErrors(json) {
+  const e = json?.errors;
+  if (!e) return false;
+  if (Array.isArray(e)) return e.length > 0;
+  if (typeof e === "object") return Object.keys(e).length > 0;
+  return Boolean(e);
+}
+
 async function apiSports(base, path, params = {}) {
   const url = new URL(base + path);
   Object.entries(params).forEach(([k, v]) => {
@@ -709,24 +713,97 @@ async function apiSports(base, path, params = {}) {
       headers: { "x-apisports-key": API_KEY },
     });
 
-    const json = await response.json();
-    if (!response.ok) return { response: [], errors: { http: response.status }, raw: json };
-    return json;
+    const json = await response.json().catch(() => ({}));
+
+    const apiErr = hasApiErrors(json);
+    const httpErr = !response.ok;
+
+    if (httpErr || apiErr) {
+      return {
+        response: Array.isArray(json?.response) ? json.response : [],
+        errors: {
+          http: httpErr ? response.status : undefined,
+          api: apiErr ? json?.errors : undefined,
+        },
+        paging: json?.paging,
+        results: json?.results,
+        raw: json,
+        _url: url.toString(),
+      };
+    }
+
+    return {
+      ...json,
+      _url: url.toString(),
+    };
   } catch (e) {
-    return { response: [], errors: { internal: e?.message || String(e) } };
+    return {
+      response: [],
+      errors: { internal: e?.message || String(e) },
+      _url: String(base + path),
+    };
   }
 }
 
-async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1200) {
+// retry genérico com predicado customizado
+async function apiSportsRetryWhere(
+  base,
+  path,
+  params,
+  predicateFn,
+  tries = 3,
+  delayMs = 1200
+) {
   let last = null;
   for (let i = 0; i < tries; i++) {
     last = await apiSports(base, path, params);
-    if (Array.isArray(last.response) && last.response.length > 0) {
-      return { ...last, _retry: { tries: i + 1, ok: true } };
-    }
+
+    const ok = (() => {
+      try {
+        return predicateFn(last);
+      } catch {
+        return false;
+      }
+    })();
+
+    if (ok) return { ...last, _retry: { tries: i + 1, ok: true } };
     if (i < tries - 1) await sleep(delayMs);
   }
+
   return { ...(last || { response: [] }), _retry: { tries, ok: false } };
+}
+
+async function apiSportsRetryNonEmpty(base, path, params, tries = 3, delayMs = 1200) {
+  return apiSportsRetryWhere(
+    base,
+    path,
+    params,
+    (j) => Array.isArray(j?.response) && j.response.length > 0,
+    tries,
+    delayMs
+  );
+}
+
+// ✅ predicate específico para odds/live: precisa ter odds internas
+function oddsLiveHasData(j) {
+  if (!j) return false;
+  if (j?.errors?.http || j?.errors?.api || j?.errors?.internal) return false;
+
+  const roots = Array.isArray(j?.response) ? j.response : [];
+  if (roots.length === 0) return false;
+
+  // Formato B: response[0].odds[]
+  const anyWithOdds = roots.some((r) => Array.isArray(r?.odds) && r.odds.length > 0);
+  if (anyWithOdds) return true;
+
+  // Formato A: response[0].bookmakers[].bets[]
+  const anyWithBookmakers =
+    roots.some((r) => Array.isArray(r?.bookmakers) && r.bookmakers.length > 0) &&
+    roots.some((r) =>
+      (r?.bookmakers || []).some((bm) => Array.isArray(bm?.bets) && bm.bets.length > 0)
+    );
+
+  return anyWithBookmakers;
 }
 
 // ======================================================
@@ -797,7 +874,9 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   const statsTry = await apiSportsRetryNonEmpty(
     FOOTBALL_BASE,
     "/fixtures/statistics",
-    { fixture: fixtureId }
+    { fixture: fixtureId },
+    3,
+    1200
   );
   out.live_stats = statsTry.response || [];
   out.corners = ADAPTERS.football.extractCornersFromStats(out.live_stats);
@@ -806,8 +885,54 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   out.goals = ADAPTERS.football.extractGoalsFromEvents(events.response || []);
   out.cards = ADAPTERS.football.extractCardsFromEvents(events.response || []);
 
-  const odds = await apiSports(FOOTBALL_BASE, "/odds/live", { fixture: fixtureId });
-  out.live_odds = odds.response || [];
+  // ✅ ODDS AO VIVO (SEM FALLBACK) + RETRY FORTE
+  const oddsLiveTry = await apiSportsRetryWhere(
+    FOOTBALL_BASE,
+    "/odds/live",
+    { fixture: fixtureId },
+    oddsLiveHasData,
+    Number(process.env.ODDS_TRIES || 4),
+    Number(process.env.ODDS_DELAY_MS || 1200)
+  );
+
+  out.live_odds = oddsLiveTry.response || [];
+
+  if (wantDebug) {
+    const roots = Array.isArray(oddsLiveTry?.response) ? oddsLiveTry.response : [];
+    const sampleRoot = roots[0] || null;
+
+    out.odds_live_debug = {
+      retry: oddsLiveTry?._retry,
+      url: oddsLiveTry?._url,
+      errors: oddsLiveTry?.errors || null,
+      results: oddsLiveTry?.results ?? null,
+      paging: oddsLiveTry?.paging ?? null,
+      rootsCount: roots.length,
+      sampleRootKeys: sampleRoot ? Object.keys(sampleRoot).slice(0, 30) : [],
+      sampleRootUpdate: sampleRoot?.update ?? null,
+      sampleHasOddsArray: Array.isArray(sampleRoot?.odds) ? sampleRoot.odds.length : 0,
+      sampleHasBookmakers: Array.isArray(sampleRoot?.bookmakers) ? sampleRoot.bookmakers.length : 0,
+      sampleRawPreview: sampleRoot
+        ? {
+            fixture: sampleRoot?.fixture,
+            league: sampleRoot?.league,
+            teams: sampleRoot?.teams,
+            status: sampleRoot?.status,
+            update: sampleRoot?.update,
+            oddsFirstBet: Array.isArray(sampleRoot?.odds) ? sampleRoot.odds[0] : null,
+          }
+        : null,
+    };
+
+    console.log("[ODDS_LIVE_DEBUG] fixture:", fixtureId);
+    console.log("[ODDS_LIVE_DEBUG] retry:", oddsLiveTry?._retry);
+    console.log("[ODDS_LIVE_DEBUG] errors:", oddsLiveTry?.errors || null);
+    console.log("[ODDS_LIVE_DEBUG] roots:", roots.length);
+    console.log(
+      "[ODDS_LIVE_DEBUG] sample.oddsLen:",
+      sampleRoot && Array.isArray(sampleRoot?.odds) ? sampleRoot.odds.length : 0
+    );
+  }
 
   if (wantAnalysis) {
     const aiInput = buildAIInput(out);
@@ -841,7 +966,6 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     out.ai_prediction = prediction;
 
     if (wantDebug) {
-      // valida usando o output final, mas o FIX principal foi no getAIAnalysis (validar no RAW)
       const v = validateAIWithOddsDetailed(prediction, aiInput);
       out.ai_debug = out.ai_debug || {};
       out.ai_debug.validationReason = v?.reason || "UNKNOWN";
