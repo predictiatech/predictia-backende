@@ -1,29 +1,4 @@
-// FILE: index.js (COMPLETO) — DATA ENGINE (SNAPSHOT) + AI ENGINE (GEMINI)
-// ✅ Tudo em 1 arquivo, separado por "-----------" como você pediu.
-//
-// PRIORIDADE DE COLETA (ordem):
-// 1) tempo/placar/status (/fixtures) ✅ essencial
-// 2) odds ao vivo (/odds/live) ✅ essencial
-// 3) eventos (/fixtures/events) ✅ essencial (gols, cartões, corners via events)
-// 4) statistics + xG (/fixtures/statistics) ✅ opcional (se não tiver, ok)
-//
-// REGRAS IMPORTANTES:
-// - "sem stats" ≠ "0": quando /fixtures/statistics vier vazio, marcamos stats_available=false e stats=null
-// - corners SEMPRE vem de events (essencial). Stats corners é apenas complemento.
-// - odds catálogo vai respeitar ODD_MIN..ODD_MAX (default 1.40..2.30)
-//
-// ROTAS:
-// - GET /football/live?leagueId=          -> lista jogos AO VIVO (fixtures)
-// - GET /football/snapshot/:fixtureId     -> retorna snapshot (só dados) (+debug=true pra meta)
-// - GET /football/match/:fixtureId?analysis=true&debug=true -> snapshot + IA + validação ODD_ID
-//
-// ENV:
-// - API_SPORTS_KEY ou FOOTBALL_API_KEY
-// - GEMINI_API_KEY
-// - GEMINI_MODEL (default gemini-2.5-flash)
-// - ODDS_TRIES / ODDS_DELAY_MS
-// - STATS_TRIES / STATS_DELAY_MS
-// - ODD_MIN / ODD_MAX (default 1.40 / 2.30)
+
 
 import "dotenv/config";
 import express from "express";
@@ -75,6 +50,17 @@ function hasApiErrors(json) {
   if (Array.isArray(e)) return e.length > 0;
   if (typeof e === "object") return Object.keys(e).length > 0;
   return Boolean(e);
+}
+
+// ✅ flags de disponibilidade (sem bloquear IA)
+function getStatsXGFlags(snapshot) {
+  const statsAvailable = Boolean(snapshot?.stats?.available) && Boolean(snapshot?.stats?.data);
+
+  const xgHome = snapshot?.stats?.data?.xg?.home ?? null;
+  const xgAway = snapshot?.stats?.data?.xg?.away ?? null;
+  const xgAvailable = statsAvailable && (xgHome !== null || xgAway !== null);
+
+  return { statsAvailable, xgAvailable };
 }
 
 // -----------------------------------------------------------
@@ -156,7 +142,7 @@ function extractStatAny(statsTeamRow, aliases = []) {
     return safeNumber(v, 0);
   }
 
-  return null; // ✅ importante: null quando não tem dado
+  return null; // ✅ null quando não tem dado
 }
 
 function extractStatValue(statsTeamRow, type) {
@@ -217,7 +203,6 @@ function compactLiveStats(live_stats = []) {
         extractStatValue(home, "Ball Possession"),
         extractStatValue(away, "Ball Possession")
       ),
-      // corners por stats são best-effort (varia o nome). corners ESSENCIAL = events.
       corners_stats: mk(
         extractStatAny(home, ["Corner Kicks", "Corners", "Total Corners"]),
         extractStatAny(away, ["Corner Kicks", "Corners", "Total Corners"])
@@ -403,12 +388,12 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
       retry: { odds_live: null, statistics: null },
       errors: {},
     },
-    match: null,     // ✅ essencial
-    events: null,    // ✅ essencial (contagem)
-    corners: null,   // ✅ essencial (via events)
-    stats: null,     // ✅ opcional
-    odds: null,      // ✅ essencial (catálogo filtrado por oddMin..oddMax)
-    rawCounts: null, // debug quick
+    match: null,
+    events: null,
+    corners: null,
+    stats: null,
+    odds: null,
+    rawCounts: null,
   };
 
   // 1) fixtures (essencial)
@@ -427,7 +412,9 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
   const status = item?.fixture?.status || {};
   snapshot.match = {
     fixtureId: item?.fixture?.id || Number(fixtureId),
-    league: item?.league ? { id: item.league.id, name: item.league.name, season: item.league.season } : null,
+    league: item?.league
+      ? { id: item.league.id, name: item.league.name, season: item.league.season }
+      : null,
     teams: {
       home: item?.teams?.home?.name || null,
       away: item?.teams?.away?.name || null,
@@ -477,7 +464,7 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
 
   snapshot.odds = compactLiveOdds(oddsRoots, { home: homeName, away: awayName }, oddMin, oddMax);
 
-  // 4) statistics (opcional)
+  // 4) statistics + xG (opcional)
   const statsTry = await apiSportsRetryWhere(
     FOOTBALL_BASE,
     "/fixtures/statistics",
@@ -505,6 +492,9 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
     oddsRoots: oddsRoots.length,
     statsTeams: statsRows.length,
   };
+
+  snapshot.meta.oddMin = oddMin;
+  snapshot.meta.oddMax = oddMax;
 
   return snapshot;
 }
@@ -538,9 +528,7 @@ async function listGeminiModels() {
 }
 
 function pickSupportedGenerateContent(models) {
-  return models.filter((m) =>
-    (m?.supportedGenerationMethods || []).includes("generateContent")
-  );
+  return models.filter((m) => (m?.supportedGenerationMethods || []).includes("generateContent"));
 }
 
 function resolveByHint(models, hintRaw) {
@@ -653,7 +641,7 @@ function buildOddsHintList(oddsCatalog, max = 25) {
   }));
 }
 
-// ---------- IA queue/rate limit (igual seu estilo) ----------
+// ---------- IA queue/rate limit ----------
 const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000);
 const _aiCache = new Map();
 
@@ -740,30 +728,30 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
   const match = snapshot?.match || {};
   const events = snapshot?.events || {};
   const corners = snapshot?.corners || {};
-  const statsAvailable = Boolean(snapshot?.stats?.available);
+
+  const { statsAvailable, xgAvailable } = getStatsXGFlags(snapshot);
   const stats = statsAvailable ? snapshot?.stats?.data : null;
 
-  // ✅ payload que a IA recebe (dados ricos e claros)
   const aiData = {
     match,
     live: {
       odds: oddsCatalog,
       events,
-      corners_events: corners, // ✅ essencial real
-      statistics: stats,       // ✅ opcional
+      corners_events: corners,
+      statistics: stats,
       statistics_available: statsAvailable,
+      xg_available: xgAvailable,
     },
     meta: {
       snapshot_ts: snapshot?.meta?.snapshot_ts,
       sources: snapshot?.meta?.sources,
       availability: snapshot?.meta?.availability,
-      note:
-        "corners_events é a fonte essencial. statistics pode estar indisponível; não conclua posse/chutes/xG se statistics_available=false.",
     },
   };
 
   const prompt = `Você é um analista profissional de apostas esportivas (futebol) para o app PredictIA.
 Contexto: jogo AO VIVO, com dados em tempo real. Cada requisição é independente.
+
 OBJETIVO:
 Selecionar UM ÚNICO palpite com o melhor Valor Esperado (EV) PARA O MOMENTO ATUAL DO JOGO.
 
@@ -788,9 +776,15 @@ REGRAS OBRIGATÓRIAS:
 8) SELEÇÃO:
    - Você DEVE escolher 1 item do catálogo live.odds e usar o ID dele.
 
-IMPORTANTE SOBRE DADOS:
-- corners_events é confiável e essencial.
-- Se statistics_available=false, NÃO conclua nada sobre posse/chutes/xG (só use odds + eventos + tempo).
+REGRAS DE USO DE DADOS (MUITO IMPORTANTE):
+- corners_events é confiável e essencial (use como fonte principal de escanteios).
+- Se statistics_available=false E xg_available=false:
+  -> NÃO analise posse/chutes/xG/faltas/cartões por statistics.
+  -> Baseie a decisão somente em match + odds + events + corners_events.
+- Se statistics_available=true:
+  -> Você pode usar os campos presentes em statistics, MAS qualquer campo null deve ser ignorado.
+- Se xg_available=false:
+  -> NÃO cite xG nem expected goals.
 
 FORMATO EXATO:
 Recomendação: <mercado + linha + período> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
@@ -882,7 +876,7 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// ✅ Snapshot: SÓ DADOS (profissional pra validar dados antes da IA)
+// ✅ Snapshot: SÓ DADOS
 app.get("/football/snapshot/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantDebug = String(req.query.debug || "").toLowerCase() === "true";
@@ -892,9 +886,7 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
 
   const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
 
-  // guardar no meta pra AI Engine usar range correto
-  snap.meta.oddMin = oddMin;
-  snap.meta.oddMax = oddMax;
+  const flags = getStatsXGFlags(snap);
 
   if (!wantDebug) {
     return res.json({
@@ -904,17 +896,18 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
         events: snap.events,
         corners_events: snap.corners,
         oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
-        statsAvailable: Boolean(snap?.stats?.available),
-        stats: snap?.stats?.available ? snap.stats.data : null,
+        statsAvailable: flags.statsAvailable,
+        xgAvailable: flags.xgAvailable,
+        stats: flags.statsAvailable ? snap.stats.data : null,
         rawCounts: snap.rawCounts,
       },
     });
   }
 
-  return res.json({ status: "ok", data: snap });
+  return res.json({ status: "ok", data: { ...snap, flags } });
 });
 
-// ✅ Snapshot + IA (o mesmo que você já usa, mas agora com data engine separado)
+// ✅ Snapshot + IA (sem bloquear)
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
@@ -924,8 +917,8 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   const oddMax = req.query.oddMax ? Number(req.query.oddMax) : ODD_MAX;
 
   const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
-  snap.meta.oddMin = oddMin;
-  snap.meta.oddMax = oddMax;
+
+  const flags = getStatsXGFlags(snap);
 
   const out = {
     fixtureId,
@@ -934,8 +927,9 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       match: snap.match,
       events: snap.events,
       corners_events: snap.corners,
-      statsAvailable: Boolean(snap?.stats?.available),
-      stats: snap?.stats?.available ? snap.stats.data : null,
+      statsAvailable: flags.statsAvailable,
+      xgAvailable: flags.xgAvailable,
+      stats: flags.statsAvailable ? snap.stats.data : null,
       oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
       rawCounts: snap.rawCounts,
     },
@@ -957,7 +951,8 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       oddsCatalogSize: Array.isArray(snap.odds) ? snap.odds.length : 0,
       statsTeams: snap?.rawCounts?.statsTeams ?? 0,
       corners_events: snap.corners,
-      stats_available: Boolean(snap?.stats?.available),
+      stats_available: flags.statsAvailable,
+      xg_available: flags.xgAvailable,
     };
   }
 
