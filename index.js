@@ -122,6 +122,108 @@ function pickCornersForAI(snapshot) {
 }
 
 // -----------------------------------------------------------
+// ✅ FORMATADOR PARA UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
+// Saída desejada:
+// Recomendação: ...
+// Odd: ...
+// Probabilidade de Green: ...
+// Risco: ...
+// Justificativa: ...
+// -----------------------------------------------------------
+function toTitleCaseRisk(x) {
+  const t = String(x || "").trim().toLowerCase();
+  if (!t) return "";
+  if (t === "baixo") return "Baixo";
+  if (t === "médio" || t === "medio") return "Médio";
+  if (t === "alto") return "Alto";
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+function simplifyRecommendationLine(line) {
+  let s = String(line || "").trim();
+
+  // remove ODD_ID e ALVO (se vier na mesma linha)
+  s = s.replace(/\[ODD_ID=\d+\]/gi, "").trim();
+  s = s.replace(/\(ALVO:\s*(JOGO|CASA|FORA)\)/gi, "").trim();
+  s = s.replace(/\s{2,}/g, " ");
+
+  // tenta simplificar alguns padrões comuns (sem quebrar outros)
+  // Ex: "Recomendação: GOLS: Home Team Score a Goal (2nd Half) Yes"
+  if (/^Recomendação\s*:/i.test(s)) {
+    const lower = s.toLowerCase();
+
+    // inferir alvo por texto
+    let alvo = "";
+    if (lower.includes("home") || lower.includes("casa")) alvo = "Time da Casa";
+    else if (lower.includes("away") || lower.includes("fora")) alvo = "Time de Fora";
+
+    // mercados comuns
+    if (lower.includes("score a goal") || lower.includes("to score") || lower.includes("marcar")) {
+      if (alvo) return `Recomendação: GOL - ${alvo}`;
+      return "Recomendação: GOL";
+    }
+
+    // se vier "GOLS:" no começo, pelo menos limpa
+    s = s.replace(/Recomendação:\s*GOLS?\s*:\s*/i, "Recomendação: ").trim();
+
+    // troca termos soltos
+    s = s.replace(/\bHome Team\b/gi, "Time da Casa");
+    s = s.replace(/\bAway Team\b/gi, "Time de Fora");
+  }
+
+  return s.trim();
+}
+
+function formatForUI(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "Erro na análise da IA.";
+
+  const lines = raw
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  let rec = "";
+  let odd = "";
+  let prob = "";
+  let risk = "";
+  let just = "";
+
+  for (const ln of lines) {
+    if (!rec && /^Recomendação\s*:/i.test(ln)) rec = simplifyRecommendationLine(ln);
+    if (!odd && /^Odd\s*:/i.test(ln)) odd = ln.replace(/\s{2,}/g, " ").trim();
+    if (!prob && /^Probabilidade/i.test(ln)) {
+      prob = ln
+        .replace(/^Probabilidade\s+de\s+GREEN\s*:/i, "Probabilidade de Green:")
+        .replace(/^Probabilidade\s+de\s+Green\s*:/i, "Probabilidade de Green:")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+    }
+    if (!risk && /^Risco\s*:/i.test(ln)) {
+      const v = ln.replace(/^Risco\s*:\s*/i, "").trim();
+      risk = `Risco: ${toTitleCaseRisk(v)}`;
+    }
+    if (!just && /^Justificativa\s*:/i.test(ln)) just = ln.replace(/\s{2,}/g, " ").trim();
+  }
+
+  // remove EV/ALVO/ODD_ID se aparecerem em outras linhas
+  const out = [rec, odd, prob, risk, just]
+    .filter(Boolean)
+    .map((x) =>
+      String(x)
+        .replace(/\[ODD_ID=\d+\]/gi, "")
+        .replace(/EV:\s*[+-]?\d+(?:[.,]\d+)?/gi, "")
+        .replace(/\(ALVO:\s*(JOGO|CASA|FORA)\)/gi, "")
+        .replace(/\s{2,}/g, " ")
+        .trim()
+    )
+    .filter(Boolean);
+
+  // garante no máximo 5 linhas
+  return out.slice(0, 5).join("\n");
+}
+
+// -----------------------------------------------------------
 // API-SPORTS CLIENT (com detecção de errors mesmo em HTTP 200)
 // -----------------------------------------------------------
 async function apiSports(base, path, params = {}) {
@@ -797,13 +899,17 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
     live: {
       odds: oddsCatalog,
       events,
-      // mantém ambos pra debug (opcional)
+
       corners_events: snapshot?.corners || null,
       corners_stats: statsAvailable ? snapshot?.stats?.data?.corners_stats || null : null,
 
-      // ✅ campo PRINCIPAL para IA (já com fallback aplicado)
       corners: cornersPick.available
-        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
+        ? {
+            source: cornersPick.source,
+            total: cornersPick.total,
+            home: cornersPick.home,
+            away: cornersPick.away,
+          }
         : null,
       corners_available: Boolean(cornersPick.available),
 
@@ -830,7 +936,7 @@ REGRAS OBRIGATÓRIAS:
 3) Escolha somente 1 mercado (sempre especificar período quando aplicável):
    - GOLS: Over/Under (FT quando não especificar)
    - VITÓRIA: 1X2 ou Dupla Chance (1X, X2, 12)
-   - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT) -> use SOMENTE live.corners (já tem fallback events/stats)
+   - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT) -> use SOMENTE live.corners
    - CARTÕES: Over/Under (Período: 1ºT | 2ºT | FT)
    - HANDICAP: Asiático ou 3-Way Handicap (informar linha/handicap)
 4) A ODD do palpite DEVE estar entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)} (inclusive).
@@ -847,8 +953,8 @@ REGRAS OBRIGATÓRIAS:
 
 REGRAS DE USO DE DADOS (MUITO IMPORTANTE):
 - ESCANTEIOS:
-  - Se live.corners_available=false => é PROIBIDO recomendar mercado de ESCANTEIOS (pule para GOLS/CARTÕES/HANDICAP/VITÓRIA).
-  - Se live.corners_available=true => use live.corners como verdade (fonte já escolhida automaticamente).
+  - Se live.corners_available=false => é PROIBIDO recomendar mercado de ESCANTEIOS.
+  - Se live.corners_available=true => use live.corners como verdade.
 - Se statistics_available=false E xg_available=false:
   -> NÃO analise posse/chutes/xG/faltas/cartões por statistics.
   -> Baseie a decisão somente em match + odds + events + live.corners (se disponível).
@@ -896,14 +1002,22 @@ ${JSON.stringify(aiData)}`;
 
         const formatted2 = ensureAIFormat(raw2);
         const patched2 = patchOddLineWithRealOdd(formatted2, v2.row.odd);
-        if (cacheKey) aiCacheSet(cacheKey, patched2);
-        return patched2;
+
+        // ✅ AQUI: limpa para UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
+        const ui2 = formatForUI(patched2);
+
+        if (cacheKey) aiCacheSet(cacheKey, ui2);
+        return ui2;
       }
 
       const formatted1 = ensureAIFormat(raw1);
       const patched1 = patchOddLineWithRealOdd(formatted1, v1.row.odd);
-      if (cacheKey) aiCacheSet(cacheKey, patched1);
-      return patched1;
+
+      // ✅ AQUI: limpa para UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
+      const ui1 = formatForUI(patched1);
+
+      if (cacheKey) aiCacheSet(cacheKey, ui1);
+      return ui1;
     } catch (err) {
       console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
       console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
@@ -967,7 +1081,12 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
         match: snap.match,
         events: snap.events,
         corners: cornersPick.available
-          ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
+          ? {
+              source: cornersPick.source,
+              total: cornersPick.total,
+              home: cornersPick.home,
+              away: cornersPick.away,
+            }
           : null,
         cornersAvailable: Boolean(cornersPick.available),
         oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
@@ -1010,7 +1129,12 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       match: snap.match,
       events: snap.events,
       corners: cornersPick.available
-        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
+        ? {
+            source: cornersPick.source,
+            total: cornersPick.total,
+            home: cornersPick.home,
+            away: cornersPick.away,
+          }
         : null,
       cornersAvailable: Boolean(cornersPick.available),
       statsAvailable: flags.statsAvailable,
@@ -1028,12 +1152,9 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   const prediction = await getAIAnalysisFromSnapshot(snap, `football:${fixtureId}`);
   out.ai_prediction = prediction;
 
+  // obs: agora ai_prediction vem "limpo" (sem ODD_ID/EV/ALVO)
   if (wantDebug) {
-    const oddId = parseOddIdFromAI(prediction);
-    const v = validateAIWithOddsDetailed(prediction, snap.odds, oddMin, oddMax);
     out.ai_debug = {
-      validationReason: v?.reason || "UNKNOWN",
-      extractedOddId: oddId,
       oddsCatalogSize: Array.isArray(snap.odds) ? snap.odds.length : 0,
       statsTeams: snap?.rawCounts?.statsTeams ?? 0,
       corners_pick: cornersPick,
