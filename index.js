@@ -1084,6 +1084,12 @@ Contexto: jogo AO VIVO, com dados em tempo real. Cada requisição é independen
 OBJETIVO:
 Selecionar UM ÚNICO palpite com o melhor Valor Esperado (EV) PARA O MOMENTO ATUAL DO JOGO.
 
+REGRA DE TEMPO (OBRIGATÓRIA):
+- Se o minuto do jogo (match.elapsed ou equivalente) for MENOR que 10:
+  -> Você DEVE responder exatamente:
+  "INSUFFICIENT DATA — match too early for analysis."
+  -> Não pode gerar palpite, EV, probabilidade ou justificativa.
+
 REGRAS OBRIGATÓRIAS:
 1) Responda em PT-BR, APENAS texto simples (sem Markdown).
 2) Máximo 6 linhas.
@@ -1095,9 +1101,9 @@ REGRAS OBRIGATÓRIAS:
    - HANDICAP: Asiático ou 3-Way Handicap (informar linha/handicap)
 4) A ODD do palpite DEVE estar entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)} (inclusive).
    - A ODD DEVE ser REAL e EXISTIR em live.odds (catálogo).
-   - NUNCA use odd estimada. Se não existir odd real no range, responda exatamente: Sem oportunidades no range ${oddMin.toFixed(
-     2
-   )}–${oddMax.toFixed(2)}.
+   - NUNCA use odd estimada.
+   - Se não existir odd real no range, responda exatamente:
+     Sem oportunidades no range ${oddMin.toFixed(2)}–${oddMax.toFixed(2)}.
 5) Probabilidade de GREEN (P) deve estar entre 65% e 100% (inclusive).
 6) EV = (P_decimal * odd) - 1, mostrar EV com 2 casas e sinal.
 7) CONSISTÊNCIA:
@@ -1105,10 +1111,19 @@ REGRAS OBRIGATÓRIAS:
 8) SELEÇÃO:
    - Você DEVE escolher 1 item do catálogo live.odds e usar o ID dele.
 
+REGRAS DE INTELIGÊNCIA (EV REAL):
+- Você DEVE confrontar:
+  -> Odds
+  -> Estatísticas ao vivo
+  -> Pressão (chutes, ataques, posse, corners, eventos)
+  -> Momento do jogo (minuto, placar, ritmo)
+- Só pode recomendar se existir VANTAGEM estatística real sobre a odd.
+- Se a odd estiver justa ou ruim, você deve recusar.
+
 REGRAS DE USO DE DADOS (MUITO IMPORTANTE):
 - ESCANTEIOS:
   - Se live.corners_available=false => é PROIBIDO recomendar mercado de ESCANTEIOS.
-  - Se live.corners_available=true => use live.corners como verdade.
+  - Se live.corners_available=true => use live.corners como verdade absoluta.
 - Se statistics_available=false E xg_available=false:
   -> NÃO analise posse/chutes/xG/faltas/cartões por statistics.
   -> Baseie a decisão somente em match + odds + events + live.corners (se disponível).
@@ -1127,6 +1142,7 @@ Justificativa: <1 frase objetiva baseada nos dados ao vivo e odds>
 
 DADOS AO VIVO (use somente isto):
 ${JSON.stringify(aiData)}`;
+
 
   const run = async () => {
     try {
