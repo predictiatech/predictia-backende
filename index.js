@@ -1,5 +1,3 @@
-
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -61,6 +59,66 @@ function getStatsXGFlags(snapshot) {
   const xgAvailable = statsAvailable && (xgHome !== null || xgAway !== null);
 
   return { statsAvailable, xgAvailable };
+}
+
+// -----------------------------------------------------------
+// ✅ CORNERS FALLBACK (events vs stats)
+// Regra:
+// - Se corners_events.total > 0 => usar events
+// - Se corners_events.total == 0 e corners_stats.total > 0 => usar stats
+// - Se ambos 0 => corners indisponível (IA não recomenda mercado de escanteios)
+// -----------------------------------------------------------
+function pickCornersForAI(snapshot) {
+  const cornersEvents = snapshot?.corners || null; // {total,home,away}
+  const cornersStats = snapshot?.stats?.data?.corners_stats || null; // {home,away} pode ter null
+
+  const evHome = safeNumber(cornersEvents?.home, 0);
+  const evAway = safeNumber(cornersEvents?.away, 0);
+  const evTotal = safeNumber(cornersEvents?.total, evHome + evAway);
+
+  const stHomeRaw = cornersStats?.home ?? null;
+  const stAwayRaw = cornersStats?.away ?? null;
+
+  const stHome = stHomeRaw === null ? null : safeNumber(stHomeRaw, 0);
+  const stAway = stAwayRaw === null ? null : safeNumber(stAwayRaw, 0);
+
+  const stHomeN = safeNumber(stHome, 0);
+  const stAwayN = safeNumber(stAway, 0);
+  const stTotal = stHomeN + stAwayN;
+
+  const hasEvents = evTotal > 0;
+  const hasStats = stTotal > 0;
+
+  if (hasEvents) {
+    return {
+      available: true,
+      source: "events",
+      total: evTotal,
+      home: evHome,
+      away: evAway,
+      raw: { corners_events: cornersEvents, corners_stats: cornersStats },
+    };
+  }
+
+  if (!hasEvents && hasStats) {
+    return {
+      available: true,
+      source: "stats",
+      total: stTotal,
+      home: stHomeN,
+      away: stAwayN,
+      raw: { corners_events: cornersEvents, corners_stats: cornersStats },
+    };
+  }
+
+  return {
+    available: false,
+    source: "none",
+    total: 0,
+    home: 0,
+    away: 0,
+    raw: { corners_events: cornersEvents, corners_stats: cornersStats },
+  };
 }
 
 // -----------------------------------------------------------
@@ -727,17 +785,28 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
   const oddsCatalog = Array.isArray(snapshot?.odds) ? snapshot.odds : [];
   const match = snapshot?.match || {};
   const events = snapshot?.events || {};
-  const corners = snapshot?.corners || {};
 
   const { statsAvailable, xgAvailable } = getStatsXGFlags(snapshot);
   const stats = statsAvailable ? snapshot?.stats?.data : null;
+
+  // ✅ aplica regra corners (events vs stats)
+  const cornersPick = pickCornersForAI(snapshot);
 
   const aiData = {
     match,
     live: {
       odds: oddsCatalog,
       events,
-      corners_events: corners,
+      // mantém ambos pra debug (opcional)
+      corners_events: snapshot?.corners || null,
+      corners_stats: statsAvailable ? snapshot?.stats?.data?.corners_stats || null : null,
+
+      // ✅ campo PRINCIPAL para IA (já com fallback aplicado)
+      corners: cornersPick.available
+        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
+        : null,
+      corners_available: Boolean(cornersPick.available),
+
       statistics: stats,
       statistics_available: statsAvailable,
       xg_available: xgAvailable,
@@ -761,7 +830,7 @@ REGRAS OBRIGATÓRIAS:
 3) Escolha somente 1 mercado (sempre especificar período quando aplicável):
    - GOLS: Over/Under (FT quando não especificar)
    - VITÓRIA: 1X2 ou Dupla Chance (1X, X2, 12)
-   - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT) -> use corners_events como verdade
+   - ESCANTEIOS: Over/Under (Período: 1ºT | 2ºT | FT) -> use SOMENTE live.corners (já tem fallback events/stats)
    - CARTÕES: Over/Under (Período: 1ºT | 2ºT | FT)
    - HANDICAP: Asiático ou 3-Way Handicap (informar linha/handicap)
 4) A ODD do palpite DEVE estar entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)} (inclusive).
@@ -777,10 +846,12 @@ REGRAS OBRIGATÓRIAS:
    - Você DEVE escolher 1 item do catálogo live.odds e usar o ID dele.
 
 REGRAS DE USO DE DADOS (MUITO IMPORTANTE):
-- corners_events é confiável e essencial (use como fonte principal de escanteios).
+- ESCANTEIOS:
+  - Se live.corners_available=false => é PROIBIDO recomendar mercado de ESCANTEIOS (pule para GOLS/CARTÕES/HANDICAP/VITÓRIA).
+  - Se live.corners_available=true => use live.corners como verdade (fonte já escolhida automaticamente).
 - Se statistics_available=false E xg_available=false:
   -> NÃO analise posse/chutes/xG/faltas/cartões por statistics.
-  -> Baseie a decisão somente em match + odds + events + corners_events.
+  -> Baseie a decisão somente em match + odds + events + live.corners (se disponível).
 - Se statistics_available=true:
   -> Você pode usar os campos presentes em statistics, MAS qualquer campo null deve ser ignorado.
 - Se xg_available=false:
@@ -887,6 +958,7 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
   const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
 
   const flags = getStatsXGFlags(snap);
+  const cornersPick = pickCornersForAI(snap);
 
   if (!wantDebug) {
     return res.json({
@@ -894,7 +966,10 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
       data: {
         match: snap.match,
         events: snap.events,
-        corners_events: snap.corners,
+        corners: cornersPick.available
+          ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
+          : null,
+        cornersAvailable: Boolean(cornersPick.available),
         oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
         statsAvailable: flags.statsAvailable,
         xgAvailable: flags.xgAvailable,
@@ -904,7 +979,14 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
     });
   }
 
-  return res.json({ status: "ok", data: { ...snap, flags } });
+  return res.json({
+    status: "ok",
+    data: {
+      ...snap,
+      flags,
+      corners_pick: cornersPick,
+    },
+  });
 });
 
 // ✅ Snapshot + IA (sem bloquear)
@@ -919,6 +1001,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
 
   const flags = getStatsXGFlags(snap);
+  const cornersPick = pickCornersForAI(snap);
 
   const out = {
     fixtureId,
@@ -926,7 +1009,10 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     data: {
       match: snap.match,
       events: snap.events,
-      corners_events: snap.corners,
+      corners: cornersPick.available
+        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
+        : null,
+      cornersAvailable: Boolean(cornersPick.available),
       statsAvailable: flags.statsAvailable,
       xgAvailable: flags.xgAvailable,
       stats: flags.statsAvailable ? snap.stats.data : null,
@@ -950,7 +1036,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       extractedOddId: oddId,
       oddsCatalogSize: Array.isArray(snap.odds) ? snap.odds.length : 0,
       statsTeams: snap?.rawCounts?.statsTeams ?? 0,
-      corners_events: snap.corners,
+      corners_pick: cornersPick,
       stats_available: flags.statsAvailable,
       xg_available: flags.xgAvailable,
     };
