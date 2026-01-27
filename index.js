@@ -62,6 +62,160 @@ function getStatsXGFlags(snapshot) {
 }
 
 // -----------------------------------------------------------
+// ✅ NOVO: CONSISTÊNCIA (anti flip-flop) — GOLS Over/Under 0.5
+// - Não altera seu fluxo, só intercepta o texto FINAL da IA (já com odd real)
+// - Se tentar inverter OVER<->UNDER 0.5 sem mudança de gols, mantém o último texto aceito
+// -----------------------------------------------------------
+const PICK_MEMORY_TTL_MS = Number(process.env.PICK_MEMORY_TTL_MS || 1000 * 60 * 180); // 3h
+const pickMemory = new Map(); // fixtureId -> marketKey -> { pick, line, goalsAtPick, ts, confidence, aiTextPatched }
+
+function _nowMs() {
+  return Date.now();
+}
+
+function _purgeOldPicks() {
+  const t = _nowMs();
+  for (const [fixtureId, markets] of pickMemory.entries()) {
+    for (const [mk, rec] of markets.entries()) {
+      if (!rec || t - rec.ts > PICK_MEMORY_TTL_MS) markets.delete(mk);
+    }
+    if (markets.size === 0) pickMemory.delete(fixtureId);
+  }
+}
+
+function _getTotalGoalsFromSnapshot(snapshot) {
+  const h = safeNumber(snapshot?.match?.score?.home, 0);
+  const a = safeNumber(snapshot?.match?.score?.away, 0);
+  return h + a;
+}
+
+function _marketKeyGoalsFT(line) {
+  return `FT_GOALS_${Number(line).toFixed(2)}`;
+}
+
+function _parseConfidence01(aiText) {
+  const m = String(aiText || "").match(/Probabilidade\s+de\s+GREEN\s*:\s*(\d{1,3})\s*%/i);
+  if (!m) return 0;
+  const p = safeNumber(m[1], 0);
+  const v = Math.max(0, Math.min(100, p));
+  return v / 100;
+}
+
+function _extractRecommendationLine(aiText) {
+  const lines = String(aiText || "")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const rec = lines.find((ln) => /^Recomendação\s*:/i.test(ln));
+  return rec || "";
+}
+
+function _normalizeGoalsOU05FromAIText(aiText) {
+  const rec = _extractRecommendationLine(aiText);
+  if (!rec) return { ok: false };
+
+  const low = rec.toLowerCase();
+
+  // deve ser mercado de gols
+  const isGoals =
+    low.includes("gols") ||
+    low.includes("gol") ||
+    low.includes("goals") ||
+    low.includes("total goals");
+
+  if (!isGoals) return { ok: false };
+
+  // detectar over/under
+  const isOver = low.includes("over") || low.includes("mais de") || low.includes("acima de");
+  const isUnder = low.includes("under") || low.includes("menos de") || low.includes("abaixo de");
+  if (!isOver && !isUnder) return { ok: false };
+
+  // detectar linha numérica (pega o primeiro número com decimal)
+  let line = null;
+  const m = low.match(/(\d+(?:[.,]\d+)?)/);
+  if (m) line = safeNumber(String(m[1]).replace(",", "."), null);
+  if (line === null) return { ok: false };
+
+  // só regra do 0.5 (do seu exemplo)
+  if (Number(line) !== 0.5) return { ok: false };
+
+  return { ok: true, dir: isOver ? "OVER" : "UNDER", line: 0.5 };
+}
+
+function _getLastPick(fixtureId, marketKey) {
+  _purgeOldPicks();
+  const markets = pickMemory.get(Number(fixtureId));
+  if (!markets) return null;
+  return markets.get(marketKey) || null;
+}
+
+function _setLastPick(fixtureId, marketKey, payload) {
+  _purgeOldPicks();
+  const id = Number(fixtureId);
+  if (!pickMemory.has(id)) pickMemory.set(id, new Map());
+  pickMemory.get(id).set(marketKey, payload);
+}
+
+function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
+  // tenta reconhecer se é "GOLS Over/Under 0.5"
+  const norm = _normalizeGoalsOU05FromAIText(aiTextPatched);
+  if (!norm.ok) return aiTextPatched;
+
+  const goalsNow = _getTotalGoalsFromSnapshot(snapshot);
+  const mk = _marketKeyGoalsFT(norm.line);
+
+  const last = _getLastPick(fixtureId, mk);
+
+  // valida impossível: UNDER 0.5 com gol já ocorrido
+  if (norm.dir === "UNDER" && goalsNow >= 1) {
+    // mantém último se existir, senão devolve como está (não muda seu fluxo)
+    return last?.aiTextPatched || aiTextPatched;
+  }
+
+  if (!last) {
+    _setLastPick(fixtureId, mk, {
+      pick: norm.dir,
+      line: norm.line,
+      goalsAtPick: goalsNow,
+      ts: _nowMs(),
+      confidence: _parseConfidence01(aiTextPatched),
+      aiTextPatched,
+    });
+    return aiTextPatched;
+  }
+
+  // se placar mudou, libera e atualiza
+  if (Number(goalsNow) !== Number(last.goalsAtPick)) {
+    _setLastPick(fixtureId, mk, {
+      pick: norm.dir,
+      line: norm.line,
+      goalsAtPick: goalsNow,
+      ts: _nowMs(),
+      confidence: _parseConfidence01(aiTextPatched),
+      aiTextPatched,
+    });
+    return aiTextPatched;
+  }
+
+  // se não mudou o placar e a IA tentou inverter, mantém último texto aceito
+  if (String(last.pick) !== String(norm.dir)) {
+    return last.aiTextPatched || aiTextPatched;
+  }
+
+  // mesma direção: atualiza timestamp e texto (mantém consistência)
+  _setLastPick(fixtureId, mk, {
+    pick: norm.dir,
+    line: norm.line,
+    goalsAtPick: goalsNow,
+    ts: _nowMs(),
+    confidence: _parseConfidence01(aiTextPatched),
+    aiTextPatched,
+  });
+
+  return aiTextPatched;
+}
+
+// -----------------------------------------------------------
 // ✅ CORNERS FALLBACK (events vs stats)
 // Regra:
 // - Se corners_events.total > 0 => usar events
@@ -833,7 +987,7 @@ function _aiRunNext() {
   if (_aiQueue.length === 0) return;
 
   const now = Date.now();
-  const wait = Math.max(0, (_aiLastStartAt + AI_MIN_INTERVAL_MS) - now);
+  const wait = Math.max(0, _aiLastStartAt + AI_MIN_INTERVAL_MS - now);
 
   const job = _aiQueue.shift();
   _aiActive++;
@@ -1003,8 +1157,15 @@ ${JSON.stringify(aiData)}`;
         const formatted2 = ensureAIFormat(raw2);
         const patched2 = patchOddLineWithRealOdd(formatted2, v2.row.odd);
 
+        // ✅ NOVO: consistência anti flip-flop (GOLS O/U 0.5)
+        const patched2Consistent = applyConsistencyGoalsOU05(
+          snapshot,
+          snapshot?.match?.fixtureId || snapshot?.meta?.fixtureId,
+          patched2
+        );
+
         // ✅ AQUI: limpa para UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
-        const ui2 = formatForUI(patched2);
+        const ui2 = formatForUI(patched2Consistent);
 
         if (cacheKey) aiCacheSet(cacheKey, ui2);
         return ui2;
@@ -1013,8 +1174,15 @@ ${JSON.stringify(aiData)}`;
       const formatted1 = ensureAIFormat(raw1);
       const patched1 = patchOddLineWithRealOdd(formatted1, v1.row.odd);
 
+      // ✅ NOVO: consistência anti flip-flop (GOLS O/U 0.5)
+      const patched1Consistent = applyConsistencyGoalsOU05(
+        snapshot,
+        snapshot?.match?.fixtureId || snapshot?.meta?.fixtureId,
+        patched1
+      );
+
       // ✅ AQUI: limpa para UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
-      const ui1 = formatForUI(patched1);
+      const ui1 = formatForUI(patched1Consistent);
 
       if (cacheKey) aiCacheSet(cacheKey, ui1);
       return ui1;
