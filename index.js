@@ -1099,7 +1099,7 @@ REGRAS OBRIGATÓRIAS (SAÍDA):
 5) A ODD do palpite DEVE estar entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)} (inclusive).
    - Se não existir odd real no range, responda exatamente:
      Sem oportunidades no range ${oddMin.toFixed(2)}–${oddMax.toFixed(2)}.
-6) Probabilidade de GREEN (P) deve estar entre 65% e 100% (inclusive).
+6) Probabilidade de GREEN (P) deve estar entre 60% e 100% (inclusive).
 7) EV = (P_decimal * odd) - 1, mostrar EV com 2 casas e sinal.
 8) CONSISTÊNCIA: Sempre informar ALVO: JOGO | CASA | FORA.
 9) NUNCA recomende algo “forçado”. Se odd estiver justa/ruim, recuse (sem inventar).
@@ -1158,7 +1158,7 @@ GAME STATE (CONTEXTO DE PLACAR) — OBRIGATÓRIO:
 
 FILTRO DE VALOR ESPERADO (EV+):
 - Só prossiga se houver edge matemático real:
-  - (P_decimal * odd) > 1.10
+  - (P_decimal * odd) > 1.08
   - E EV final deve ser positivo e mostrado com 2 casas.
 - Se a odd estiver “derretendo” (queda forte/rápida conforme timestamps/updates disponíveis) e a ineficiência sumiu:
   -> Considere “Odd Justa” e recuse (não gere palpite).
@@ -1182,8 +1182,6 @@ Justificativa: <1 frase objetiva e quantitativa: DAPM/momentum pós-eventos + ef
 
 DADOS AO VIVO (use somente isto):
 ${JSON.stringify(aiData)}`;
-
-
 
   const run = async () => {
     try {
