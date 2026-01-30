@@ -1339,17 +1339,43 @@ REGRAS DE SAÍDA (FORMATO ESTRITO)
 - Máximo 6 linhas.
 
 FORMATO OBRIGATÓRIO:
-Recomendação: <mercado + linha + período> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
+Recomendação: <palpite em português claro e humano> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
 Odd: <X.XX>
 Probabilidade de Green: <XX%>
 EV: <+0.00>
 Risco: baixo|médio|alto
-Justificativa: <1 frase ligando EV matemático + DAPM/SOT + game state>
+Justificativa: <1 frase objetiva>
+
+REGRAS DE LINGUAGEM (OBRIGATÓRIAS):
+- Proibido usar termos técnicos ou em inglês.
+- Proibido usar nomes de mercados como:
+  Fulltime Result, Over/Under, Asian Handicap, Draw, Both Teams To Score.
+
+MAPEAMENTO OBRIGATÓRIO:
+- Draw → Empate
+- Home Win → Vitória Casa
+- Away Win → Vitória Fora
+- Over X.5 Goals → Mais de X.5 gols
+- Under X.5 Goals → Menos de X.5 gols
+- Over X.5 Corners → Mais de X.5 escanteios
+- Under X.5 Corners → Menos de X.5 escanteios
+- Over X.5 Cards → Mais de X.5 cartões
+- Under X.5 Cards → Menos de X.5 cartões
+- Asian Handicap -1 Home → Casa -1
+- Asian Handicap +1 Away → Fora +1
+
+EXEMPLOS CORRETOS DE SAÍDA:
+Recomendação: Empate
+Recomendação: Mais de 1.5 gols
+Recomendação: Menos de 4.5 escanteios
+Recomendação: Casa -1
+Recomendação: Fora +0.5
 
 ════════════════════════════════════
 DADOS PARA PROCESSAMENTO
 ════════════════════════════════════
 ${JSON.stringify(aiData)}`;
+
 
 
   const run = async () => {
