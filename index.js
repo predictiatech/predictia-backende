@@ -499,24 +499,12 @@ function compactLiveStats(live_stats = []) {
       home: home?.team?.name || null,
       away: away?.team?.name || null,
       xg: mk(xgHome, xgAway),
-      shots_on_goal: mk(
-        extractStatValue(home, "Shots on Goal"),
-        extractStatValue(away, "Shots on Goal")
-      ),
-      shots_off_goal: mk(
-        extractStatValue(home, "Shots off Goal"),
-        extractStatValue(away, "Shots off Goal")
-      ),
+      shots_on_goal: mk(extractStatValue(home, "Shots on Goal"), extractStatValue(away, "Shots on Goal")),
+      shots_off_goal: mk(extractStatValue(home, "Shots off Goal"), extractStatValue(away, "Shots off Goal")),
       total_shots: mk(extractStatValue(home, "Total Shots"), extractStatValue(away, "Total Shots")),
-      dangerous_attacks: mk(
-        extractStatValue(home, "Dangerous Attacks"),
-        extractStatValue(away, "Dangerous Attacks")
-      ),
+      dangerous_attacks: mk(extractStatValue(home, "Dangerous Attacks"), extractStatValue(away, "Dangerous Attacks")),
       attacks: mk(extractStatValue(home, "Attacks"), extractStatValue(away, "Attacks")),
-      possession: mk(
-        extractStatValue(home, "Ball Possession"),
-        extractStatValue(away, "Ball Possession")
-      ),
+      possession: mk(extractStatValue(home, "Ball Possession"), extractStatValue(away, "Ball Possession")),
       corners_stats: mk(
         extractStatAny(home, ["Corner Kicks", "Corners", "Total Corners"]),
         extractStatAny(away, ["Corner Kicks", "Corners", "Total Corners"])
@@ -568,9 +556,7 @@ function oddsLiveHasData(j) {
 
   const anyBookmakers =
     roots.some((r) => Array.isArray(r?.bookmakers) && r.bookmakers.length > 0) &&
-    roots.some((r) =>
-      (r?.bookmakers || []).some((bm) => Array.isArray(bm?.bets) && bm.bets.length > 0)
-    );
+    roots.some((r) => (r?.bookmakers || []).some((bm) => Array.isArray(bm?.bets) && bm.bets.length > 0));
 
   return anyBookmakers;
 }
@@ -726,9 +712,7 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
   const status = item?.fixture?.status || {};
   snapshot.match = {
     fixtureId: item?.fixture?.id || Number(fixtureId),
-    league: item?.league
-      ? { id: item.league.id, name: item.league.name, season: item.league.season }
-      : null,
+    league: item?.league ? { id: item.league.id, name: item.league.name, season: item.league.season } : null,
     teams: {
       home: item?.teams?.home?.name || null,
       away: item?.teams?.away?.name || null,
@@ -826,9 +810,7 @@ function normalizeModelName(x) {
 }
 
 async function listGeminiModels() {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
-    GENAI_KEY
-  )}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(GENAI_KEY)}`;
   const r = await fetch(url);
   const j = await r.json();
 
@@ -857,9 +839,7 @@ function resolveByHint(models, hintRaw) {
   if (prefix) return prefix;
 
   if (hint.includes("2.5") && hint.includes("flash")) {
-    const flash25 = names.find(
-      (n) => n.toLowerCase().includes("2.5") && n.toLowerCase().includes("flash")
-    );
+    const flash25 = names.find((n) => n.toLowerCase().includes("2.5") && n.toLowerCase().includes("flash"));
     if (flash25) return flash25;
   }
 
@@ -973,33 +953,56 @@ function aiCacheSet(key, value) {
   _aiCache.set(key, { value, exp: Date.now() + AI_CACHE_TTL_MS });
 }
 
-const AI_MAX_CONCURRENCY = Number(process.env.AI_MAX_CONCURRENCY || 1);
-const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 1200);
+// -----------------------------------------------------------
+// ✅ CONTROLE DE TRÁFEGO (SERIAL + THROTTLE + RESPONSE PADRÃO)
+// - Mantém compatibilidade: mesmas rotas, mesma lógica de dados/IA.
+// - Reforça cache + in-flight por cacheKey.
+// - Força processamento 1 por vez.
+// - Impõe intervalo mínimo APÓS o término da chamada anterior.
+// - Se estiver esperando/fila cheia: retorna mensagem padronizada.
+// -----------------------------------------------------------
+const AI_QUEUE_WAIT_MSG = String(process.env.AI_QUEUE_WAIT_MSG || "IA processando análise...");
+const AI_QUEUE_FULL_MSG = String(process.env.AI_QUEUE_FULL_MSG || "IA em fila cheia. Tente novamente.");
+
+const _envConcurrency = Number(process.env.AI_MAX_CONCURRENCY || 1);
+// ✅ garante fila serial (1 por vez), independente do env
+const AI_MAX_CONCURRENCY = Math.min(1, Number.isFinite(_envConcurrency) ? _envConcurrency : 1);
+
+const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 2000); // ✅ default 2s (respiro)
 const AI_QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 300);
 
 let _aiActive = 0;
-let _aiLastStartAt = 0;
+// ✅ agora o intervalo é contado a partir do FIM da chamada anterior
+let _aiLastFinishAt = 0;
+
 const _aiQueue = [];
 const _aiInFlight = new Map();
+
+function _aiCanStartNow() {
+  if (_aiActive >= AI_MAX_CONCURRENCY) return false;
+  if (_aiQueue.length > 0) return false; // se já tem fila, não "fura"
+  const now = Date.now();
+  return now >= (_aiLastFinishAt + AI_MIN_INTERVAL_MS);
+}
 
 function _aiRunNext() {
   if (_aiActive >= AI_MAX_CONCURRENCY) return;
   if (_aiQueue.length === 0) return;
 
   const now = Date.now();
-  const wait = Math.max(0, _aiLastStartAt + AI_MIN_INTERVAL_MS - now);
+  const wait = Math.max(0, _aiLastFinishAt + AI_MIN_INTERVAL_MS - now);
 
   const job = _aiQueue.shift();
   _aiActive++;
 
   setTimeout(async () => {
-    _aiLastStartAt = Date.now();
     try {
       const result = await job.fn();
       job.resolve(result);
     } catch (e) {
       job.reject(e);
     } finally {
+      _aiLastFinishAt = Date.now(); // ✅ throttle após término
       _aiActive--;
       _aiRunNext();
     }
@@ -1007,22 +1010,42 @@ function _aiRunNext() {
 }
 
 function enqueueAI(cacheKey, fn) {
-  if (cacheKey && _aiInFlight.has(cacheKey)) return _aiInFlight.get(cacheKey);
-
-  if (_aiQueue.length >= AI_QUEUE_MAX) {
-    return Promise.resolve("IA em fila cheia. Tente novamente.");
+  // ✅ 1) dedupe imediato: se já tem job do mesmo cacheKey rodando/na fila
+  if (cacheKey && _aiInFlight.has(cacheKey)) {
+    // ✅ se o usuário chegou "no meio", não bloqueia: devolve padrão pro app tratar
+    return Promise.resolve(AI_QUEUE_WAIT_MSG);
   }
 
+  // ✅ 2) fila cheia
+  if (_aiQueue.length >= AI_QUEUE_MAX) {
+    return Promise.resolve(AI_QUEUE_FULL_MSG);
+  }
+
+  // ✅ 3) cria job
+  let resolveRef, rejectRef;
   const p = new Promise((resolve, reject) => {
-    _aiQueue.push({ fn, resolve, reject });
-    _aiRunNext();
+    resolveRef = resolve;
+    rejectRef = reject;
   });
 
+  // ✅ marca inflight ANTES de enfileirar (dedupe)
   if (cacheKey) {
     _aiInFlight.set(cacheKey, p);
     p.finally(() => _aiInFlight.delete(cacheKey));
   }
 
+  const job = { fn, resolve: resolveRef, reject: rejectRef };
+  const willWait = !(_aiActive < AI_MAX_CONCURRENCY && _aiQueue.length === 0 && Date.now() >= (_aiLastFinishAt + AI_MIN_INTERVAL_MS));
+
+  _aiQueue.push(job);
+  _aiRunNext();
+
+  // ✅ 4) response padronizado quando houver espera
+  if (willWait) {
+    return Promise.resolve(AI_QUEUE_WAIT_MSG);
+  }
+
+  // ✅ se conseguir rodar "agora" (sem espera), permite retornar o resultado (compatível)
   return p;
 }
 
@@ -1030,9 +1053,13 @@ function enqueueAI(cacheKey, fn) {
 async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
   if (!genAI) return "IA não configurada.";
 
+  // ✅ Cache curto (live): se 10 usuários pedirem o mesmo fixtureId no mesmo minuto => 1 IA
   if (cacheKey) {
     const cached = aiCacheGet(cacheKey);
     if (cached) return cached;
+
+    // ✅ Se já tem análise desse cacheKey em andamento, devolve padrão sem bloquear
+    if (_aiInFlight.has(cacheKey)) return AI_QUEUE_WAIT_MSG;
   }
 
   const oddMin = Number(snapshot?.meta?.oddMin ?? ODD_MIN);
@@ -1154,7 +1181,7 @@ GAME STATE (CONTEXTO DE PLACAR) — OBRIGATÓRIO:
   - Favorito perdendo em casa => urgência alta (pressão tende a aumentar, mas precisa confirmar com DAPM/momentum pós-eventos).
   - Time vencendo por 2+ gols => urgência baixa (tende a desacelerar, controlar posse, reduzir volume).
   - Time perdendo fora => urgência moderada (pode buscar contra-ataque; risco maior de leitura falsa).
-- Nunca aplique “multiplicador de urgência” sem confirmar sinais reais (DAPM, chutes, events, corners, odds).
+- Nunca aplique “multiplicador de urgência” sem confirmar sinais reais (DAPM, chutes, events, corners, odds). 
 
 FILTRO DE VALOR ESPERADO (EV+):
 - Só prossiga se houver edge matemático real:
@@ -1252,6 +1279,10 @@ ${JSON.stringify(aiData)}`;
     }
   };
 
+  // ✅ enqueueAI agora pode retornar:
+  // - resultado (se não houver espera)
+  // - "IA processando análise..." (se estiver aguardando)
+  // - "IA em fila cheia. Tente novamente." (se fila cheia)
   return enqueueAI(cacheKey || "", run);
 }
 
