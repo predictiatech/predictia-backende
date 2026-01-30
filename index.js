@@ -1,6 +1,6 @@
 // ✅ index.js (SUBSTITUA COMPLETO)
 // ✅ Correção: REMOVER node-fetch (Node 18+ já tem fetch global)
-// ✅ Isso elimina o erro: Cannot find package 'node-fetch'
+// ✅ Implementado: DEBUG REAL do erro do Gemini (sem mudar rotas/fluxo)
 
 import "dotenv/config";
 import express from "express";
@@ -52,6 +52,21 @@ function hasApiErrors(json) {
   if (Array.isArray(e)) return e.length > 0;
   if (typeof e === "object") return Object.keys(e).length > 0;
   return Boolean(e);
+}
+
+// ✅ IMPLEMENTADO: debug real do erro Gemini
+function _errToPlain(e) {
+  const out = {
+    name: e?.name || null,
+    message: e?.message || String(e),
+    status: e?.status || null,
+    code: e?.code || null,
+  };
+  if (e?.response) out.response = e.response;
+  if (e?.error) out.error = e.error;
+  if (e?.raw) out.raw = e.raw;
+  if (e?.stack) out.stack = String(e.stack).split("\n").slice(0, 6).join("\n");
+  return out;
 }
 
 // ✅ flags de disponibilidade (sem bloquear IA)
@@ -121,12 +136,7 @@ function _normalizeGoalsOU05FromAIText(aiText) {
   const low = rec.toLowerCase();
 
   // deve ser mercado de gols
-  const isGoals =
-    low.includes("gols") ||
-    low.includes("gol") ||
-    low.includes("goals") ||
-    low.includes("total goals");
-
+  const isGoals = low.includes("gols") || low.includes("gol") || low.includes("goals") || low.includes("total goals");
   if (!isGoals) return { ok: false };
 
   // detectar over/under
@@ -161,7 +171,6 @@ function _setLastPick(fixtureId, marketKey, payload) {
 }
 
 function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
-  // tenta reconhecer se é "GOLS Over/Under 0.5"
   const norm = _normalizeGoalsOU05FromAIText(aiTextPatched);
   if (!norm.ok) return aiTextPatched;
 
@@ -170,7 +179,6 @@ function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
 
   const last = _getLastPick(fixtureId, mk);
 
-  // valida impossível: UNDER 0.5 com gol já ocorrido
   if (norm.dir === "UNDER" && goalsNow >= 1) {
     return last?.aiTextPatched || aiTextPatched;
   }
@@ -187,7 +195,6 @@ function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
     return aiTextPatched;
   }
 
-  // se placar mudou, libera e atualiza
   if (Number(goalsNow) !== Number(last.goalsAtPick)) {
     _setLastPick(fixtureId, mk, {
       pick: norm.dir,
@@ -200,7 +207,6 @@ function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
     return aiTextPatched;
   }
 
-  // se não mudou o placar e a IA tentou inverter, mantém último texto aceito
   if (String(last.pick) !== String(norm.dir)) {
     return last.aiTextPatched || aiTextPatched;
   }
@@ -985,7 +991,11 @@ function enqueueAI(cacheKey, fn) {
   }
 
   const job = { fn, resolve: resolveRef, reject: rejectRef };
-  const willWait = !(_aiActive < AI_MAX_CONCURRENCY && _aiQueue.length === 0 && Date.now() >= (_aiLastFinishAt + AI_MIN_INTERVAL_MS));
+  const willWait = !(
+    _aiActive < AI_MAX_CONCURRENCY &&
+    _aiQueue.length === 0 &&
+    Date.now() >= _aiLastFinishAt + AI_MIN_INTERVAL_MS
+  );
 
   _aiQueue.push(job);
   _aiRunNext();
@@ -1151,9 +1161,16 @@ ${JSON.stringify(aiData)}`;
       if (cacheKey) aiCacheSet(cacheKey, ui1);
       return ui1;
     } catch (err) {
+      const plain = _errToPlain(err);
+
+      console.error("==================================================");
       console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
       console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
-      console.error("GEMINI ERROR:", err);
+      console.error("GEMINI_KEY_SET:", Boolean(GENAI_KEY));
+      console.error("PROMPT_CHARS:", String(prompt || "").length);
+      console.error("AI_CACHE_KEY:", cacheKey || "");
+      console.error("GEMINI_ERROR_PLAIN:", JSON.stringify(plain, null, 2));
+      console.error("==================================================");
 
       const fallback = "Erro na análise da IA.";
       if (cacheKey) aiCacheSet(cacheKey, fallback);
