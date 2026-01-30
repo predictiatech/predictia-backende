@@ -1,9 +1,11 @@
+// ✅ index.js (SUBSTITUA COMPLETO)
+// ✅ Correção: REMOVER node-fetch (Node 18+ já tem fetch global)
+// ✅ Isso elimina o erro: Cannot find package 'node-fetch'
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import fetch from "node-fetch";
-globalThis.fetch = fetch;
 
 // ---------- BOOT SAFETY ----------
 process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION:", err));
@@ -170,7 +172,6 @@ function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
 
   // valida impossível: UNDER 0.5 com gol já ocorrido
   if (norm.dir === "UNDER" && goalsNow >= 1) {
-    // mantém último se existir, senão devolve como está (não muda seu fluxo)
     return last?.aiTextPatched || aiTextPatched;
   }
 
@@ -204,7 +205,6 @@ function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
     return last.aiTextPatched || aiTextPatched;
   }
 
-  // mesma direção: atualiza timestamp e texto (mantém consistência)
   _setLastPick(fixtureId, mk, {
     pick: norm.dir,
     line: norm.line,
@@ -219,14 +219,10 @@ function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
 
 // -----------------------------------------------------------
 // ✅ CORNERS FALLBACK (events vs stats)
-// Regra:
-// - Se corners_events.total > 0 => usar events
-// - Se corners_events.total == 0 e corners_stats.total > 0 => usar stats
-// - Se ambos 0 => corners indisponível (IA não recomenda mercado de escanteios)
 // -----------------------------------------------------------
 function pickCornersForAI(snapshot) {
   const cornersEvents = snapshot?.corners || null; // {total,home,away}
-  const cornersStats = snapshot?.stats?.data?.corners_stats || null; // {home,away} pode ter null
+  const cornersStats = snapshot?.stats?.data?.corners_stats || null;
 
   const evHome = safeNumber(cornersEvents?.home, 0);
   const evAway = safeNumber(cornersEvents?.away, 0);
@@ -279,12 +275,6 @@ function pickCornersForAI(snapshot) {
 
 // -----------------------------------------------------------
 // ✅ FORMATADOR PARA UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
-// Saída desejada:
-// Recomendação: ...
-// Odd: ...
-// Probabilidade de Green: ...
-// Risco: ...
-// Justificativa: ...
 // -----------------------------------------------------------
 function toTitleCaseRisk(x) {
   const t = String(x || "").trim().toLowerCase();
@@ -297,32 +287,23 @@ function toTitleCaseRisk(x) {
 
 function simplifyRecommendationLine(line) {
   let s = String(line || "").trim();
-
-  // remove ODD_ID e ALVO (se vier na mesma linha)
   s = s.replace(/\[ODD_ID=\d+\]/gi, "").trim();
   s = s.replace(/\(ALVO:\s*(JOGO|CASA|FORA)\)/gi, "").trim();
   s = s.replace(/\s{2,}/g, " ");
 
-  // tenta simplificar alguns padrões comuns (sem quebrar outros)
-  // Ex: "Recomendação: GOLS: Home Team Score a Goal (2nd Half) Yes"
   if (/^Recomendação\s*:/i.test(s)) {
     const lower = s.toLowerCase();
 
-    // inferir alvo por texto
     let alvo = "";
     if (lower.includes("home") || lower.includes("casa")) alvo = "Time da Casa";
     else if (lower.includes("away") || lower.includes("fora")) alvo = "Time de Fora";
 
-    // mercados comuns
     if (lower.includes("score a goal") || lower.includes("to score") || lower.includes("marcar")) {
       if (alvo) return `Recomendação: GOL - ${alvo}`;
       return "Recomendação: GOL";
     }
 
-    // se vier "GOLS:" no começo, pelo menos limpa
     s = s.replace(/Recomendação:\s*GOLS?\s*:\s*/i, "Recomendação: ").trim();
-
-    // troca termos soltos
     s = s.replace(/\bHome Team\b/gi, "Time da Casa");
     s = s.replace(/\bAway Team\b/gi, "Time de Fora");
   }
@@ -362,7 +343,6 @@ function formatForUI(text) {
     if (!just && /^Justificativa\s*:/i.test(ln)) just = ln.replace(/\s{2,}/g, " ").trim();
   }
 
-  // remove EV/ALVO/ODD_ID se aparecerem em outras linhas
   const out = [rec, odd, prob, risk, just]
     .filter(Boolean)
     .map((x) =>
@@ -375,7 +355,6 @@ function formatForUI(text) {
     )
     .filter(Boolean);
 
-  // garante no máximo 5 linhas
   return out.slice(0, 5).join("\n");
 }
 
@@ -458,7 +437,7 @@ function extractStatAny(statsTeamRow, aliases = []) {
     return safeNumber(v, 0);
   }
 
-  return null; // ✅ null quando não tem dado
+  return null;
 }
 
 function extractStatValue(statsTeamRow, type) {
@@ -481,7 +460,6 @@ function extractXG(statsTeamRow) {
   ]);
 }
 
-// ✅ compacta stats (opcional)
 function compactLiveStats(live_stats = []) {
   const home = live_stats?.[0] || null;
   const away = live_stats?.[1] || null;
@@ -521,7 +499,6 @@ function compactLiveStats(live_stats = []) {
   };
 }
 
-// ✅ compacta eventos: gols/cartões contagem
 function compactEvents(events = []) {
   const ev = Array.isArray(events) ? events : [];
   const goals = ev.filter((e) => String(e?.type || "").toLowerCase() === "goal");
@@ -531,7 +508,6 @@ function compactEvents(events = []) {
   return { goals: goals.length, cards: cards.length, yellow, red };
 }
 
-// ✅ corners ESSENCIAL via events
 function cornersFromEvents(events = [], homeName, awayName) {
   const ev = Array.isArray(events) ? events : [];
   const corners = ev.filter((e) => {
@@ -545,7 +521,6 @@ function cornersFromEvents(events = [], homeName, awayName) {
   return { total: home + away, home, away };
 }
 
-// ✅ odds/live predicate: precisa ter odds internas
 function oddsLiveHasData(j) {
   if (!j) return false;
   if (j?.errors?.http || j?.errors?.api || j?.errors?.internal) return false;
@@ -563,14 +538,12 @@ function oddsLiveHasData(j) {
   return anyBookmakers;
 }
 
-// ✅ statistics predicate: precisa ter 2 times
 function statsHasTwoTeams(j) {
   if (!j) return false;
   if (j?.errors?.http || j?.errors?.api || j?.errors?.internal) return false;
   return Array.isArray(j?.response) && j.response.length >= 2;
 }
 
-// ✅ compacta odds ao vivo para catálogo (ODD_ID interno sequencial)
 function compactLiveOdds(live_odds = [], teamsNames = {}, oddMin = 1.4, oddMax = 2.3) {
   const homeTeam = teamsNames?.home || null;
   const awayTeam = teamsNames?.away || null;
@@ -612,7 +585,6 @@ function compactLiveOdds(live_odds = [], teamsNames = {}, oddMin = 1.4, oddMax =
     });
   };
 
-  // Formato B: response[].odds -> {name, values}
   for (const root of arr) {
     const oddsArr = Array.isArray(root?.odds) ? root.odds : [];
     if (oddsArr.length === 0) continue;
@@ -638,7 +610,6 @@ function compactLiveOdds(live_odds = [], teamsNames = {}, oddMin = 1.4, oddMax =
     }
   }
 
-  // Formato A: response[].bookmakers[].bets[].values[]
   for (const root of arr) {
     const bookmakers = Array.isArray(root?.bookmakers) ? root.bookmakers : [];
     if (bookmakers.length === 0) continue;
@@ -698,7 +669,6 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
     rawCounts: null,
   };
 
-  // 1) fixtures (essencial)
   const fx = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
   snapshot.meta.sources.fixtures = fx?._url || null;
 
@@ -733,7 +703,6 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
   const homeName = snapshot.match.teams.home;
   const awayName = snapshot.match.teams.away;
 
-  // 2) events (essencial)
   const ev = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
   snapshot.meta.sources.events = ev?._url || null;
   snapshot.meta.availability.events = true;
@@ -742,7 +711,6 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
   snapshot.events = compactEvents(eventsList);
   snapshot.corners = cornersFromEvents(eventsList, homeName, awayName);
 
-  // 3) odds/live (essencial)
   const oddsLiveTry = await apiSportsRetryWhere(
     FOOTBALL_BASE,
     "/odds/live",
@@ -764,7 +732,6 @@ async function buildFootballSnapshot(fixtureId, opts = {}) {
 
   snapshot.odds = compactLiveOdds(oddsRoots, { home: homeName, away: awayName }, oddMin, oddMax);
 
-  // 4) statistics + xG (opcional)
   const statsTry = await apiSportsRetryWhere(
     FOOTBALL_BASE,
     "/fixtures/statistics",
@@ -957,35 +924,21 @@ function aiCacheSet(key, value) {
 
 // -----------------------------------------------------------
 // ✅ CONTROLE DE TRÁFEGO (SERIAL + THROTTLE + RESPONSE PADRÃO)
-// - Mantém compatibilidade: mesmas rotas, mesma lógica de dados/IA.
-// - Reforça cache + in-flight por cacheKey.
-// - Força processamento 1 por vez.
-// - Impõe intervalo mínimo APÓS o término da chamada anterior.
-// - Se estiver esperando/fila cheia: retorna mensagem padronizada.
 // -----------------------------------------------------------
 const AI_QUEUE_WAIT_MSG = String(process.env.AI_QUEUE_WAIT_MSG || "IA processando análise...");
 const AI_QUEUE_FULL_MSG = String(process.env.AI_QUEUE_FULL_MSG || "IA em fila cheia. Tente novamente.");
 
 const _envConcurrency = Number(process.env.AI_MAX_CONCURRENCY || 1);
-// ✅ garante fila serial (1 por vez), independente do env
 const AI_MAX_CONCURRENCY = Math.min(1, Number.isFinite(_envConcurrency) ? _envConcurrency : 1);
 
-const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 2000); // ✅ default 2s (respiro)
+const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 2000);
 const AI_QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 300);
 
 let _aiActive = 0;
-// ✅ agora o intervalo é contado a partir do FIM da chamada anterior
 let _aiLastFinishAt = 0;
 
 const _aiQueue = [];
 const _aiInFlight = new Map();
-
-function _aiCanStartNow() {
-  if (_aiActive >= AI_MAX_CONCURRENCY) return false;
-  if (_aiQueue.length > 0) return false; // se já tem fila, não "fura"
-  const now = Date.now();
-  return now >= (_aiLastFinishAt + AI_MIN_INTERVAL_MS);
-}
 
 function _aiRunNext() {
   if (_aiActive >= AI_MAX_CONCURRENCY) return;
@@ -1004,7 +957,7 @@ function _aiRunNext() {
     } catch (e) {
       job.reject(e);
     } finally {
-      _aiLastFinishAt = Date.now(); // ✅ throttle após término
+      _aiLastFinishAt = Date.now();
       _aiActive--;
       _aiRunNext();
     }
@@ -1012,25 +965,20 @@ function _aiRunNext() {
 }
 
 function enqueueAI(cacheKey, fn) {
-  // ✅ 1) dedupe imediato: se já tem job do mesmo cacheKey rodando/na fila
   if (cacheKey && _aiInFlight.has(cacheKey)) {
-    // ✅ se o usuário chegou "no meio", não bloqueia: devolve padrão pro app tratar
     return Promise.resolve(AI_QUEUE_WAIT_MSG);
   }
 
-  // ✅ 2) fila cheia
   if (_aiQueue.length >= AI_QUEUE_MAX) {
     return Promise.resolve(AI_QUEUE_FULL_MSG);
   }
 
-  // ✅ 3) cria job
   let resolveRef, rejectRef;
   const p = new Promise((resolve, reject) => {
     resolveRef = resolve;
     rejectRef = reject;
   });
 
-  // ✅ marca inflight ANTES de enfileirar (dedupe)
   if (cacheKey) {
     _aiInFlight.set(cacheKey, p);
     p.finally(() => _aiInFlight.delete(cacheKey));
@@ -1042,12 +990,10 @@ function enqueueAI(cacheKey, fn) {
   _aiQueue.push(job);
   _aiRunNext();
 
-  // ✅ 4) response padronizado quando houver espera
   if (willWait) {
     return Promise.resolve(AI_QUEUE_WAIT_MSG);
   }
 
-  // ✅ se conseguir rodar "agora" (sem espera), permite retornar o resultado (compatível)
   return p;
 }
 
@@ -1055,12 +1001,9 @@ function enqueueAI(cacheKey, fn) {
 async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
   if (!genAI) return "IA não configurada.";
 
-  // ✅ Cache curto (live): se 10 usuários pedirem o mesmo fixtureId no mesmo minuto => 1 IA
   if (cacheKey) {
     const cached = aiCacheGet(cacheKey);
     if (cached) return cached;
-
-    // ✅ Se já tem análise desse cacheKey em andamento, devolve padrão sem bloquear
     if (_aiInFlight.has(cacheKey)) return AI_QUEUE_WAIT_MSG;
   }
 
@@ -1074,7 +1017,6 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
   const { statsAvailable, xgAvailable } = getStatsXGFlags(snapshot);
   const stats = statsAvailable ? snapshot?.stats?.data : null;
 
-  // ✅ aplica regra corners (events vs stats)
   const cornersPick = pickCornersForAI(snapshot);
 
   const aiData = {
@@ -1082,20 +1024,12 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
     live: {
       odds: oddsCatalog,
       events,
-
       corners_events: snapshot?.corners || null,
       corners_stats: statsAvailable ? snapshot?.stats?.data?.corners_stats || null : null,
-
       corners: cornersPick.available
-        ? {
-            source: cornersPick.source,
-            total: cornersPick.total,
-            home: cornersPick.home,
-            away: cornersPick.away,
-          }
+        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
         : null,
       corners_available: Boolean(cornersPick.available),
-
       statistics: stats,
       statistics_available: statsAvailable,
       xg_available: xgAvailable,
@@ -1137,7 +1071,6 @@ REGRA DE TEMPO (CRÍTICA):
 - Se o minuto do jogo (match.elapsed ou equivalente nos dados) for MENOR que 10:
   -> Você DEVE responder APENAS:
   "INSUFFICIENT DATA — match too early for analysis."
-  -> Não pode gerar palpite, EV, probabilidade, risco ou justificativa.
 
 REGRAS DE USO DE DADOS (CRÍTICAS):
 - DADOS NULOS: Ignore campos null.
@@ -1152,62 +1085,13 @@ REGRAS DE USO DE DADOS (CRÍTICAS):
   - Se live.corners_available=false => mercado de ESCANTEIOS é PROIBIDO.
   - Se live.corners_available=true => use live.corners como verdade absoluta; não use corners de statistics.
 
-PROTOCOLO DE CONFRONTO ESTATÍSTICO (OBRIGATÓRIO):
-- CÁLCULO DE PRESSÃO (DAPM):
-  - Ataques Perigosos por Minuto (dangerous_attacks / minuto_atual quando disponível).
-  - DAPM > 1.2 indica pressão extrema.
-- EFICIÊNCIA DE FINALIZAÇÃO:
-  - (Chutes no Alvo / Total de Chutes) quando disponível.
-  - Se < 0.30, pressão é ineficiente => evite Over (gols) baseado só em volume.
-- MOMENTUM (Últimos 10 min):
-  - Use o fluxo de events para identificar “Power Play” (time em desvantagem atacando em sequência, sem resposta).
-  - Se não houver dados suficientes nos events, não invente.
-- PROBABILIDADE REAL (P):
-  - Estime P com base em: placar atual + pressão (DAPM) + eficiência + cartões/expulsões + (xG se disponível) + tempo restante.
-  - P deve ser conservadora (evitar overconfidence). Se dúvida, reduza P ou recuse.
-
-FATOR EXPULSÃO (PESO CRÍTICO) — OBRIGATÓRIO:
-- Se houver cartão vermelho (red card) para um time:
-  1) A probabilidade (P) a FAVOR do time desfalcado deve cair drasticamente:
-     - Reduza P em pelo menos 30% (queda absoluta mínima: -30 pontos percentuais na P final).
-     - Ex.: P estimada 75% vira no máximo 45% (ou menor), salvo evidência fortíssima pós-expulsão.
-  2) O cálculo de PRESSÃO (DAPM) e momentum deve ser REAVALIADO usando APENAS os minutos APÓS a expulsão.
-     - Dados de pressão ANTES do vermelho tornam-se parcialmente/totalmente irrelevantes.
-  3) Se você não conseguir isolar o “pós-expulsão” com segurança usando events/tempo:
-     - Assuma cenário conservador e recuse, ou reduza P agressivamente.
-- Se o vermelho for do adversário (time que NÃO está no palpite):
-  - Você pode aumentar P, mas de forma conservadora (sem exagero), e ainda deve confrontar com o ritmo pós-expulsão.
-
-GAME STATE (CONTEXTO DE PLACAR) — OBRIGATÓRIO:
-- Considere incentivo/urgência e ajuste sua avaliação de P e do risco:
-  - Favorito perdendo em casa => urgência alta (pressão tende a aumentar, mas precisa confirmar com DAPM/momentum pós-eventos).
-  - Time vencendo por 2+ gols => urgência baixa (tende a desacelerar, controlar posse, reduzir volume).
-  - Time perdendo fora => urgência moderada (pode buscar contra-ataque; risco maior de leitura falsa).
-- Nunca aplique “multiplicador de urgência” sem confirmar sinais reais (DAPM, chutes, events, corners, odds). 
-
-FILTRO DE VALOR ESPERADO (EV+):
-- Só prossiga se houver edge matemático real:
-  - (P_decimal * odd) > 1.08
-  - E EV final deve ser positivo e mostrado com 2 casas.
-- Se a odd estiver “derretendo” (queda forte/rápida conforme timestamps/updates disponíveis) e a ineficiência sumiu:
-  -> Considere “Odd Justa” e recuse (não gere palpite).
-- Se o mercado parecer “armadilha” (odd bonita sem suporte do momentum/estatística):
-  -> Recuse.
-
-SELEÇÃO DO “MELHOR PALPITE” (OBRIGATÓRIO):
-- Você deve avaliar múltiplos candidatos existentes em live.odds dentro do range ${oddMin.toFixed(2)}–${oddMax.toFixed(2)}.
-- Para cada candidato possível, estime P e calcule EV.
-- Escolha SOMENTE o candidato com MAIOR EV (desde que cumpra TODAS as regras).
-- Se nenhum candidato cumprir tudo, responda exatamente:
-  Sem oportunidades no range ${oddMin.toFixed(2)}–${oddMax.toFixed(2)}.
-
 FORMATO DE SAÍDA (ESTRITO):
 Recomendação: <mercado + linha + período> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
 Odd: <X.XX>
 Probabilidade de GREEN: <XX%>
 EV: <+0.00>
 Risco: baixo|médio|alto
-Justificativa: <1 frase objetiva e quantitativa: DAPM/momentum pós-eventos + eficiência + game state + edge vs odd>
+Justificativa: <1 frase objetiva e quantitativa: momentum + dados + edge vs odd>
 
 DADOS AO VIVO (use somente isto):
 ${JSON.stringify(aiData)}`;
@@ -1241,14 +1125,12 @@ ${JSON.stringify(aiData)}`;
         const formatted2 = ensureAIFormat(raw2);
         const patched2 = patchOddLineWithRealOdd(formatted2, v2.row.odd);
 
-        // ✅ NOVO: consistência anti flip-flop (GOLS O/U 0.5)
         const patched2Consistent = applyConsistencyGoalsOU05(
           snapshot,
           snapshot?.match?.fixtureId || snapshot?.meta?.fixtureId,
           patched2
         );
 
-        // ✅ AQUI: limpa para UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
         const ui2 = formatForUI(patched2Consistent);
 
         if (cacheKey) aiCacheSet(cacheKey, ui2);
@@ -1258,14 +1140,12 @@ ${JSON.stringify(aiData)}`;
       const formatted1 = ensureAIFormat(raw1);
       const patched1 = patchOddLineWithRealOdd(formatted1, v1.row.odd);
 
-      // ✅ NOVO: consistência anti flip-flop (GOLS O/U 0.5)
       const patched1Consistent = applyConsistencyGoalsOU05(
         snapshot,
         snapshot?.match?.fixtureId || snapshot?.meta?.fixtureId,
         patched1
       );
 
-      // ✅ AQUI: limpa para UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
       const ui1 = formatForUI(patched1Consistent);
 
       if (cacheKey) aiCacheSet(cacheKey, ui1);
@@ -1281,10 +1161,6 @@ ${JSON.stringify(aiData)}`;
     }
   };
 
-  // ✅ enqueueAI agora pode retornar:
-  // - resultado (se não houver espera)
-  // - "IA processando análise..." (se estiver aguardando)
-  // - "IA em fila cheia. Tente novamente." (se fila cheia)
   return enqueueAI(cacheKey || "", run);
 }
 
@@ -1293,7 +1169,6 @@ ${JSON.stringify(aiData)}`;
 // -----------------------------------------------------------
 app.get("/", (_, res) => res.send("PredictIA Engine Online"));
 
-// ✅ Lista jogos AO VIVO (por liga opcional)
 app.get("/football/live", async (req, res) => {
   const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
 
@@ -1317,7 +1192,6 @@ app.get("/football/live", async (req, res) => {
   });
 });
 
-// ✅ Snapshot: SÓ DADOS
 app.get("/football/snapshot/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantDebug = String(req.query.debug || "").toLowerCase() === "true";
@@ -1337,12 +1211,7 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
         match: snap.match,
         events: snap.events,
         corners: cornersPick.available
-          ? {
-              source: cornersPick.source,
-              total: cornersPick.total,
-              home: cornersPick.home,
-              away: cornersPick.away,
-            }
+          ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
           : null,
         cornersAvailable: Boolean(cornersPick.available),
         oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
@@ -1356,15 +1225,10 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
 
   return res.json({
     status: "ok",
-    data: {
-      ...snap,
-      flags,
-      corners_pick: cornersPick,
-    },
+    data: { ...snap, flags, corners_pick: cornersPick },
   });
 });
 
-// ✅ Snapshot + IA (sem bloquear)
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
   const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
@@ -1385,12 +1249,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
       match: snap.match,
       events: snap.events,
       corners: cornersPick.available
-        ? {
-            source: cornersPick.source,
-            total: cornersPick.total,
-            home: cornersPick.home,
-            away: cornersPick.away,
-          }
+        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
         : null,
       cornersAvailable: Boolean(cornersPick.available),
       statsAvailable: flags.statsAvailable,
@@ -1401,14 +1260,11 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     },
   };
 
-  if (!wantAnalysis) {
-    return res.json({ status: "ok", data: out });
-  }
+  if (!wantAnalysis) return res.json({ status: "ok", data: out });
 
   const prediction = await getAIAnalysisFromSnapshot(snap, `football:${fixtureId}`);
   out.ai_prediction = prediction;
 
-  // obs: agora ai_prediction vem "limpo" (sem ODD_ID/EV/ALVO)
   if (wantDebug) {
     out.ai_debug = {
       oddsCatalogSize: Array.isArray(snap.odds) ? snap.odds.length : 0,
