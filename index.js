@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import fetch from "node-fetch";
+globalThis.fetch = fetch;
 
 // ---------- BOOT SAFETY ----------
 process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION:", err));
