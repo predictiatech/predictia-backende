@@ -1,4 +1,4 @@
-// FILE: index.js (COMPLETO E FUNCIONAL)
+// FILE: index.js (COMPLETO) — AJUSTADO (VALIDAÇÕES + CORREÇÕES DE BORDA)
 
 import "dotenv/config";
 import express from "express";
@@ -10,36 +10,47 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ---------------- ENV ----------------
 const API_KEY = process.env.API_SPORTS_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
-const GENAI_MODEL_RAW = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
+
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const ODD_MIN = Number(process.env.ODD_MIN || 1.4);
 const ODD_MAX = Number(process.env.ODD_MAX || 2.3);
 
-// ---------------- CACHES PROFISSIONAIS ----------------
+if (!API_KEY) console.error("FALTA API_SPORTS_KEY");
+if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
+
+// ---------------- CACHES ----------------
 const snapshotCache = new LRUCache({ max: 500, ttl: 1000 * 60 });
 const aiCache = new LRUCache({ max: 500, ttl: 1000 * 60 });
 
-// Anti race condition
+// Anti race condition (dedup por fixtureId)
 const snapshotInFlight = new Map();
 const aiInFlight = new Map();
 
 // ---------------- HELPERS ----------------
-const safeNumber = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+const safeNumber = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+
+const isValidFixtureId = (n) =>
+  Number.isFinite(n) && Number.isInteger(n) && n > 0;
 
 // ---------------- API CLIENT ----------------
 async function apiSports(path, params = {}) {
-  try {
-    const url = new URL(FOOTBALL_BASE + path);
-    Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-    const r = await fetch(url, { headers: { "x-apisports-key": API_KEY } });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } catch (e) {
-    console.error("[API-SPORTS ERROR]", path, e.message);
-    throw e;
+  if (!API_KEY) throw new Error("MISSING_API_SPORTS_KEY");
+
+  const url = new URL(FOOTBALL_BASE + path);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
+
+  const r = await fetch(url, { headers: { "x-apisports-key": API_KEY } });
+  if (!r.ok) throw new Error(`API_SPORTS_HTTP_${r.status}`);
+  return await r.json();
 }
 
 // ---------------- SNAPSHOT ENGINE ----------------
@@ -54,42 +65,42 @@ async function buildSnapshot(fixtureId) {
     match: {
       fixtureId,
       teams: {
-        home: item.teams.home.name,
-        away: item.teams.away.name,
+        home: item?.teams?.home?.name ?? "Home",
+        away: item?.teams?.away?.name ?? "Away",
       },
-      time: { elapsed: safeNumber(item.fixture.status.elapsed) },
+      time: { elapsed: safeNumber(item?.fixture?.status?.elapsed) },
       score: {
-        home: safeNumber(item.goals.home),
-        away: safeNumber(item.goals.away),
+        home: safeNumber(item?.goals?.home),
+        away: safeNumber(item?.goals?.away),
       },
     },
-    events: {},
+    events: { goals: 0, redcards: 0 },
     odds: [],
     stats: { available: false, data: null },
   };
 
   // EVENTS
   const ev = await apiSports("/fixtures/events", { fixture: fixtureId });
-  const events = ev.response || [];
+  const events = ev?.response || [];
   snapshot.events = {
-    goals: events.filter((e) => e.type === "Goal").length,
+    goals: events.filter((e) => e?.type === "Goal").length,
     redcards: events.filter((e) =>
-      String(e.detail).toLowerCase().includes("red")
+      String(e?.detail || "").toLowerCase().includes("red")
     ).length,
   };
 
-  // ODDS
+  // ODDS (CATÁLOGO PARA ODD_ID)
   const odds = await apiSports("/odds/live", { fixture: fixtureId });
-  for (const root of odds.response || []) {
-    for (const bm of root.bookmakers || []) {
-      for (const bet of bm.bets || []) {
-        for (const v of bet.values || []) {
-          const odd = safeNumber(v.odd);
+  for (const root of odds?.response || []) {
+    for (const bm of root?.bookmakers || []) {
+      for (const bet of bm?.bets || []) {
+        for (const v of bet?.values || []) {
+          const odd = safeNumber(v?.odd);
           if (odd >= ODD_MIN && odd <= ODD_MAX) {
             snapshot.odds.push({
-              id: snapshot.odds.length + 1,
-              market: bet.name,
-              selection: v.value,
+              id: snapshot.odds.length + 1, // ODD_ID do seu catálogo (por snapshot)
+              market: String(bet?.name || ""),
+              selection: String(v?.value || ""),
               odd,
             });
           }
@@ -100,10 +111,8 @@ async function buildSnapshot(fixtureId) {
 
   // STATS só se existir odd válida
   if (snapshot.odds.length > 0) {
-    const stats = await apiSports("/fixtures/statistics", {
-      fixture: fixtureId,
-    });
-    if ((stats.response || []).length >= 2) {
+    const stats = await apiSports("/fixtures/statistics", { fixture: fixtureId });
+    if ((stats?.response || []).length >= 2) {
       snapshot.stats = { available: true, data: stats.response };
     }
   }
@@ -113,14 +122,13 @@ async function buildSnapshot(fixtureId) {
 
 // ---------------- SNAPSHOT WRAPPER (LRU + DEDUP) ----------------
 async function getSnapshot(fixtureId) {
-  if (snapshotCache.has(fixtureId))
-    return snapshotCache.get(fixtureId);
-  if (snapshotInFlight.has(fixtureId))
-    return snapshotInFlight.get(fixtureId);
+  if (snapshotCache.has(fixtureId)) return snapshotCache.get(fixtureId);
+  if (snapshotInFlight.has(fixtureId)) return snapshotInFlight.get(fixtureId);
 
   const p = buildSnapshot(fixtureId)
     .then((snap) => {
-      snapshotCache.set(fixtureId, snap);
+      // evita cache de null (não encontrado)
+      if (snap) snapshotCache.set(fixtureId, snap);
       snapshotInFlight.delete(fixtureId);
       return snap;
     })
@@ -134,9 +142,11 @@ async function getSnapshot(fixtureId) {
 }
 
 // ---------------- IA ENGINE ----------------
-const genAI = new GoogleGenerativeAI(GENAI_KEY);
+const genAI = new GoogleGenerativeAI(GENAI_KEY || ""); // erro tratado em getAI
 
 async function getAI(snapshot, fixtureId) {
+  if (!GENAI_KEY) throw new Error("MISSING_GEMINI_API_KEY");
+
   if (aiCache.has(fixtureId)) return aiCache.get(fixtureId);
   if (aiInFlight.has(fixtureId)) return aiInFlight.get(fixtureId);
 
@@ -253,6 +263,10 @@ ${JSON.stringify(aiData)}`;
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
 
+  if (!isValidFixtureId(fixtureId)) {
+    return res.status(400).json({ error: "fixtureId inválido" });
+  }
+
   try {
     const snap = await getSnapshot(fixtureId);
     if (!snap) return res.status(404).json({ error: "Jogo não encontrado" });
@@ -266,7 +280,7 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 });
 
 // ---------------- SERVER ----------------
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT || 10000);
 app.listen(PORT, () => {
   console.log("PredictIA Engine PRO rodando na porta", PORT);
 });
