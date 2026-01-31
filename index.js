@@ -193,7 +193,7 @@ PROTOCOLO DE DECISÃO (ORDEM DE PESO)
     - Reduza P em no mínimo 30 pontos percentuais ou recuse.
     - Reavalie usando apenas dados pós-expulsão.
 - ODDS:
-  * Odd deve estar obrigatoriamente entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}.
+  * Odd deve estar obrigatoriamente entre ${ODD_MIN.toFixed(2)} e ${ODD_MAX.toFixed(2)}.
 - CONSISTÊNCIA:
   * Use ODD_ID real do catálogo live.odds. Proibido inventar IDs.
 
