@@ -163,28 +163,72 @@ Você deve escolher 1 (um) único palpite que represente o maior "Edge" (vantage
 PROTOCOLO DE DECISÃO (ORDEM DE PESO)
 ════════════════════════════════════
 
-1. FILTRO DE EV:
-- Use live.top_evs se existir, senão seja conservador.
+1. FILTRO DE EV (EXPECTED VALUE):
+- Se live.top_evs_available = true:
+  * O palpite DEVE ser extraído obrigatoriamente da lista live.top_evs (já ordenada por EV% desc).
+  * Analise o item #1. Se o cenário de jogo (momentum) for contrário, descarte como "VALUE TRAP" e avalie o item #2, sucessivamente.
+  * Se nenhum item da lista sobreviver ao filtro de momentum, RECUSE a análise.
 
-2. MOMENTUM:
-- DAPM, SOT e Game State.
+- Se live.top_evs_available = false:
+  * Não há consenso multi-book. Seja EXTREMAMENTE conservador.
+  * Só recomende se houver distorção óbvia baseada em estatísticas fortes (ex: DAPM > 1.2).
 
-3. REGRAS:
-- match < 10 → sem análise
-- odd entre ${ODD_MIN} e ${ODD_MAX}
+2. VALIDAÇÃO DE MOMENTUM (FILTRO DE CAMPO):
+- DAPM (Ataques Perigosos/Min):
+  * Se o palpite é a favor de um time (Vitória, Handicap, Over Gols dele),
+    o DAPM desse time nos últimos 10–15 min deve ser > 0.7.
+- CONVERSÃO:
+  * Use SOT (Chutes no Gol). Se volume alto e SOT baixo, reduza P.
+- GAME STATE:
+  * Favorito perdendo em casa = urgência alta.
+  * Time vencendo por 2+ = tendência de desaceleração.
+  * Nunca aplique urgência sem confirmar em DAPM/momentum.
 
-FILTRO ANTI-UNDER:
-- Sem under antes de 25 min.
+3. REGRAS DE SEGURANÇA (HARD RULES):
+- Se match.elapsed < 10:
+  -> Responda APENAS:
+  "INSUFFICIENT DATA — match too early for analysis."
+- EXPULSÕES:
+  * Se o time do palpite tiver vermelho:
+    - Reduza P em no mínimo 30 pontos percentuais ou recuse.
+    - Reavalie usando apenas dados pós-expulsão.
+- ODDS:
+  * Odd deve estar obrigatoriamente entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}.
+- CONSISTÊNCIA:
+  * Use ODD_ID real do catálogo live.odds. Proibido inventar IDs.
 
-SAÍDA:
-Recomendação:
+════════════════════════════════════
+FILTRO ANTI-UNDER-CEDO (OBRIGATÓRIO)
+════════════════════════════════════
+- Proibido recomendar qualquer mercado de "Menos de X gols" se match.elapsed < 25.
+- Exceção (raríssima): só permitir UNDER antes de 25 se TODAS as condições abaixo forem verdade:
+  1) Placar 0-0
+  2) SOT_total <= 1
+  3) DAPM_total < 0.9
+  4) Probabilidade de Green >= 70%
+  5) EV >= +0.06
+  6) redcards = 0
+  7) Não é favorito perdendo em casa
+- Se o filtro bloquear:
+  -> Retorne SEM OPORTUNIDADE
+  -> Justificativa obrigatória: "Minuto cedo para Under; risco alto de mudança de ritmo."
+
+4. FILTRO DE EDGE FINAL:
+- Só prossiga se:
+  (P_decimal * odd) > 1.08
+  e EV positivo.
+
+════════════════════════════════════
+REGRAS DE SAÍDA (FORMATO ESTRITO)
+════════════════════════════════════
+Recomendação: <palpite> [ODD_ID=<N>]
 Odd:
 Probabilidade de Green:
 EV:
 Risco:
 Justificativa:
 
-DADOS:
+DADOS PARA PROCESSAMENTO
 ${JSON.stringify(aiData)}`;
 
       const model = genAI.getGenerativeModel({ model: GENAI_MODEL_RAW });
