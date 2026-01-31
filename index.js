@@ -1,4 +1,4 @@
-// FILE: index.js (COMPLETO) — AJUSTADO (VALIDAÇÕES + CORREÇÕES DE BORDA)
+// FILE: index.js (COMPLETO E FUNCIONAL) — COM LIVE + FALLBACK DA CHAVE
 
 import "dotenv/config";
 import express from "express";
@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 // ---------------- ENV ----------------
-const API_KEY = process.env.API_SPORTS_KEY;
+const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY; // ✅ fallback corrigido
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
@@ -19,12 +19,16 @@ const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const ODD_MIN = Number(process.env.ODD_MIN || 1.4);
 const ODD_MAX = Number(process.env.ODD_MAX || 2.3);
 
-if (!API_KEY) console.error("FALTA API_SPORTS_KEY");
+if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
 
 // ---------------- CACHES ----------------
 const snapshotCache = new LRUCache({ max: 500, ttl: 1000 * 60 });
 const aiCache = new LRUCache({ max: 500, ttl: 1000 * 60 });
+
+// Cache live list (curto, p/ não spammar live=all)
+const liveCache = new LRUCache({ max: 50, ttl: 1000 * 10 }); // 10s
+const liveInFlight = new Map();
 
 // Anti race condition (dedup por fixtureId)
 const snapshotInFlight = new Map();
@@ -41,16 +45,43 @@ const isValidFixtureId = (n) =>
 
 // ---------------- API CLIENT ----------------
 async function apiSports(path, params = {}) {
-  if (!API_KEY) throw new Error("MISSING_API_SPORTS_KEY");
+  try {
+    if (!API_KEY) throw new Error("MISSING_API_SPORTS_KEY");
 
-  const url = new URL(FOOTBALL_BASE + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+    const url = new URL(FOOTBALL_BASE + path);
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+    }
+
+    const r = await fetch(url, { headers: { "x-apisports-key": API_KEY } });
+    if (!r.ok) throw new Error(`API_SPORTS_HTTP_${r.status}`);
+    return await r.json();
+  } catch (e) {
+    console.error("[API-SPORTS ERROR]", path, e.message);
+    throw e;
   }
+}
 
-  const r = await fetch(url, { headers: { "x-apisports-key": API_KEY } });
-  if (!r.ok) throw new Error(`API_SPORTS_HTTP_${r.status}`);
-  return await r.json();
+// ---------------- LIVE (JOGOS AO VIVO) ----------------
+async function fetchLiveFixtures() {
+  const cacheKey = "live_all";
+  if (liveCache.has(cacheKey)) return liveCache.get(cacheKey);
+  if (liveInFlight.has(cacheKey)) return liveInFlight.get(cacheKey);
+
+  const p = apiSports("/fixtures", { live: "all" })
+    .then((data) => {
+      const list = data?.response || [];
+      liveCache.set(cacheKey, list);
+      liveInFlight.delete(cacheKey);
+      return list;
+    })
+    .catch((e) => {
+      liveInFlight.delete(cacheKey);
+      throw e;
+    });
+
+  liveInFlight.set(cacheKey, p);
+  return p;
 }
 
 // ---------------- SNAPSHOT ENGINE ----------------
@@ -127,8 +158,7 @@ async function getSnapshot(fixtureId) {
 
   const p = buildSnapshot(fixtureId)
     .then((snap) => {
-      // evita cache de null (não encontrado)
-      if (snap) snapshotCache.set(fixtureId, snap);
+      if (snap) snapshotCache.set(fixtureId, snap); // evita cachear null
       snapshotInFlight.delete(fixtureId);
       return snap;
     })
@@ -259,7 +289,38 @@ ${JSON.stringify(aiData)}`;
   return p;
 }
 
-// ---------------- ROUTE ----------------
+// ---------------- ROUTES ----------------
+
+// ✅ LISTA DE JOGOS AO VIVO (para sua tela de seleção)
+app.get("/football/live", async (req, res) => {
+  try {
+    const liveList = await fetchLiveFixtures();
+
+    // resposta enxuta (mantém info essencial)
+    const games = liveList.map((it) => ({
+      fixtureId: safeNumber(it?.fixture?.id),
+      league: it?.league?.name ?? "",
+      country: it?.league?.country ?? "",
+      teams: {
+        home: it?.teams?.home?.name ?? "",
+        away: it?.teams?.away?.name ?? "",
+      },
+      elapsed: safeNumber(it?.fixture?.status?.elapsed),
+      status: it?.fixture?.status?.short ?? "",
+      score: {
+        home: safeNumber(it?.goals?.home),
+        away: safeNumber(it?.goals?.away),
+      },
+    })).filter((g) => isValidFixtureId(g.fixtureId));
+
+    res.json({ status: "ok", games });
+  } catch (e) {
+    console.error("[LIVE ERROR]", e.message);
+    res.status(500).json({ error: "Erro ao buscar jogos ao vivo" });
+  }
+});
+
+// ✅ SNAPSHOT + IA POR FIXTURE
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
 
