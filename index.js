@@ -1324,6 +1324,26 @@ PROTOCOLO DE DECISÃO (ORDEM DE PESO)
 - CONSISTÊNCIA:
   * Use ODD_ID real do catálogo live.odds. Proibido inventar IDs.
 
+════════════════════════════════════
+FILTRO ANTI-UNDER-CEDO (OBRIGATÓRIO)
+════════════════════════════════════
+- Proibido recomendar qualquer mercado de "Menos de X gols" se match.elapsed < 25.
+- Exceção (raríssima): só permitir UNDER antes de 25 se TODAS as condições abaixo forem verdade:
+  1) Placar 0-0
+  2) SOT_total <= 1
+  3) DAPM_total < 0.9
+  4) Probabilidade de Green >= 70%
+  5) EV >= +0.06
+  6) redcards = 0
+  7) Não é favorito perdendo em casa
+- Se o filtro bloquear:
+  -> Retorne SEM OPORTUNIDADE
+  -> Justificativa obrigatória: "Minuto cedo para Under; risco alto de mudança de ritmo."
+
+- Sinônimos como:
+  "jogo para poucos gols", "sem mais gols", "tende a under"
+  são considerados UNDER e seguem esta mesma regra.
+
 4. FILTRO DE EDGE FINAL:
 - Só prossiga se:
   (P_decimal * odd) > 1.08
@@ -1363,13 +1383,6 @@ MAPEAMENTO OBRIGATÓRIO:
 - Under X.5 Cards → Menos de X.5 cartões
 - Asian Handicap -1 Home → Casa -1
 - Asian Handicap +1 Away → Fora +1
-
-EXEMPLOS CORRETOS DE SAÍDA:
-Recomendação: Empate
-Recomendação: Mais de 1.5 gols
-Recomendação: Menos de 4.5 escanteios
-Recomendação: Casa -1
-Recomendação: Fora +0.5
 
 ════════════════════════════════════
 DADOS PARA PROCESSAMENTO
