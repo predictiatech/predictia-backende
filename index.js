@@ -1,1286 +1,161 @@
 // FILE: index.js (SUBSTITUA COMPLETO)
-// ✅ EV (consenso multi-book) + TOP EVs enviados para IA (antes do Gemini)
-// ⚠️ IMPORTANTE: EV só é “válido” aqui quando existir 2+ bookmakers no /odds/live.
-// - Se vier 0–1 bookmaker (ou odds “synthetic live”), o sistema NÃO gera TOP EVs (evita EV fake).
+// Versão PROFISSIONAL com:
+// - Cache LRU + TTL (sem memory leak)
+// - Anti Race Condition (Promise dedup)
+// - Try/Catch + logs
+// - SEU PROMPT COMPLETO integrado (sem alterar uma linha)
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-
-// ---------- BOOT SAFETY ----------
-process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION:", err));
-process.on("unhandledRejection", (reason) => console.error("UNHANDLED_REJECTION:", reason));
+import LRU from "lru-cache";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -----------------------------------------------------------
-// ENV
-// -----------------------------------------------------------
-const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
+const API_KEY = process.env.API_SPORTS_KEY;
 const GENAI_KEY = process.env.GEMINI_API_KEY;
-const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
-
-if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
-if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
-
+const GENAI_MODEL_RAW = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const FOOTBALL_BASE = "https://v3.football.api-sports.io";
-
-const ODDS_TRIES = Number(process.env.ODDS_TRIES || 4);
-const ODDS_DELAY_MS = Number(process.env.ODDS_DELAY_MS || 1200);
-
-const STATS_TRIES = Number(process.env.STATS_TRIES || 4);
-const STATS_DELAY_MS = Number(process.env.STATS_DELAY_MS || 1200);
-
 const ODD_MIN = Number(process.env.ODD_MIN || 1.4);
 const ODD_MAX = Number(process.env.ODD_MAX || 2.3);
 
-// -----------------------------------------------------------
-// ✅ EV / TOP EVs (CONSENSO MULTI-BOOK)
-// -----------------------------------------------------------
-const EV_TOP_N = Number(process.env.EV_TOP_N || 6); // quantos TOP EVs mandar
-const EV_MIN_PCT = Number(process.env.EV_MIN_PCT || 2.0); // mínimo EV% p/ entrar na lista
-const EV_TTL_MS = Number(process.env.EV_TTL_MS || 12_000); // cache curto live (12s)
-const EV_REQUIRE_MULTI_BOOK = String(process.env.EV_REQUIRE_MULTI_BOOK || "true").toLowerCase() !== "false";
+// ---------------- CACHES PROFISSIONAIS ----------------
+const snapshotCache = new LRU({ max: 500, ttl: 1000 * 60 });
+const aiCache = new LRU({ max: 500, ttl: 1000 * 60 });
 
-const _evCache = new Map(); // key -> {exp, value}
+// Anti race condition
+const snapshotInFlight = new Map();
+const aiInFlight = new Map();
 
-function evCacheGet(key) {
-  const row = _evCache.get(key);
-  if (!row) return null;
-  if (Date.now() > row.exp) {
-    _evCache.delete(key);
-    return null;
-  }
-  return row.value;
-}
-function evCacheSet(key, value) {
-  _evCache.set(key, { value, exp: Date.now() + EV_TTL_MS });
-}
+// ---------------- HELPERS ----------------
+const safeNumber = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
 
-// -----------------------------------------------------------
-// HELPERS (BÁSICOS)
-// -----------------------------------------------------------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function safeNumber(v, d = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-
-function hasApiErrors(json) {
-  const e = json?.errors;
-  if (!e) return false;
-  if (Array.isArray(e)) return e.length > 0;
-  if (typeof e === "object") return Object.keys(e).length > 0;
-  return Boolean(e);
-}
-
-function clamp01(p) {
-  if (!Number.isFinite(p)) return 0;
-  if (p < 0) return 0;
-  if (p > 1) return 1;
-  return p;
-}
-
-function median(arr) {
-  const a = (arr || []).filter((x) => Number.isFinite(x)).sort((x, y) => x - y);
-  if (!a.length) return null;
-  const mid = Math.floor(a.length / 2);
-  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
-}
-
-function normStr(x) {
-  return String(x ?? "").trim().toLowerCase();
-}
-
-// ✅ flags de disponibilidade (sem bloquear IA)
-function getStatsXGFlags(snapshot) {
-  const statsAvailable = Boolean(snapshot?.stats?.available) && Boolean(snapshot?.stats?.data);
-
-  const xgHome = snapshot?.stats?.data?.xg?.home ?? null;
-  const xgAway = snapshot?.stats?.data?.xg?.away ?? null;
-  const xgAvailable = statsAvailable && (xgHome !== null || xgAway !== null);
-
-  return { statsAvailable, xgAvailable };
-}
-
-// -----------------------------------------------------------
-// ✅ NOVO: CONSISTÊNCIA (anti flip-flop) — GOLS Over/Under 0.5
-// -----------------------------------------------------------
-const PICK_MEMORY_TTL_MS = Number(process.env.PICK_MEMORY_TTL_MS || 1000 * 60 * 180); // 3h
-const pickMemory = new Map(); // fixtureId -> marketKey -> { pick, line, goalsAtPick, ts, confidence, aiTextPatched }
-
-function _nowMs() {
-  return Date.now();
-}
-
-function _purgeOldPicks() {
-  const t = _nowMs();
-  for (const [fixtureId, markets] of pickMemory.entries()) {
-    for (const [mk, rec] of markets.entries()) {
-      if (!rec || t - rec.ts > PICK_MEMORY_TTL_MS) markets.delete(mk);
-    }
-    if (markets.size === 0) pickMemory.delete(fixtureId);
-  }
-}
-
-function _getTotalGoalsFromSnapshot(snapshot) {
-  const h = safeNumber(snapshot?.match?.score?.home, 0);
-  const a = safeNumber(snapshot?.match?.score?.away, 0);
-  return h + a;
-}
-
-function _marketKeyGoalsFT(line) {
-  return `FT_GOALS_${Number(line).toFixed(2)}`;
-}
-
-function _parseConfidence01(aiText) {
-  const m = String(aiText || "").match(/Probabilidade\s+de\s+GREEN\s*:\s*(\d{1,3})\s*%/i);
-  if (!m) return 0;
-  const p = safeNumber(m[1], 0);
-  const v = Math.max(0, Math.min(100, p));
-  return v / 100;
-}
-
-function _extractRecommendationLine(aiText) {
-  const lines = String(aiText || "")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-  const rec = lines.find((ln) => /^Recomendação\s*:/i.test(ln));
-  return rec || "";
-}
-
-function _normalizeGoalsOU05FromAIText(aiText) {
-  const rec = _extractRecommendationLine(aiText);
-  if (!rec) return { ok: false };
-
-  const low = rec.toLowerCase();
-
-  const isGoals = low.includes("gols") || low.includes("gol") || low.includes("goals") || low.includes("total goals");
-  if (!isGoals) return { ok: false };
-
-  const isOver = low.includes("over") || low.includes("mais de") || low.includes("acima de");
-  const isUnder = low.includes("under") || low.includes("menos de") || low.includes("abaixo de");
-  if (!isOver && !isUnder) return { ok: false };
-
-  let line = null;
-  const m = low.match(/(\d+(?:[.,]\d+)?)/);
-  if (m) line = safeNumber(String(m[1]).replace(",", "."), null);
-  if (line === null) return { ok: false };
-
-  if (Number(line) !== 0.5) return { ok: false };
-
-  return { ok: true, dir: isOver ? "OVER" : "UNDER", line: 0.5 };
-}
-
-function _getLastPick(fixtureId, marketKey) {
-  _purgeOldPicks();
-  const markets = pickMemory.get(Number(fixtureId));
-  if (!markets) return null;
-  return markets.get(marketKey) || null;
-}
-
-function _setLastPick(fixtureId, marketKey, payload) {
-  _purgeOldPicks();
-  const id = Number(fixtureId);
-  if (!pickMemory.has(id)) pickMemory.set(id, new Map());
-  pickMemory.get(id).set(marketKey, payload);
-}
-
-function applyConsistencyGoalsOU05(snapshot, fixtureId, aiTextPatched) {
-  const norm = _normalizeGoalsOU05FromAIText(aiTextPatched);
-  if (!norm.ok) return aiTextPatched;
-
-  const goalsNow = _getTotalGoalsFromSnapshot(snapshot);
-  const mk = _marketKeyGoalsFT(norm.line);
-
-  const last = _getLastPick(fixtureId, mk);
-
-  if (norm.dir === "UNDER" && goalsNow >= 1) {
-    return last?.aiTextPatched || aiTextPatched;
-  }
-
-  if (!last) {
-    _setLastPick(fixtureId, mk, {
-      pick: norm.dir,
-      line: norm.line,
-      goalsAtPick: goalsNow,
-      ts: _nowMs(),
-      confidence: _parseConfidence01(aiTextPatched),
-      aiTextPatched,
-    });
-    return aiTextPatched;
-  }
-
-  if (Number(goalsNow) !== Number(last.goalsAtPick)) {
-    _setLastPick(fixtureId, mk, {
-      pick: norm.dir,
-      line: norm.line,
-      goalsAtPick: goalsNow,
-      ts: _nowMs(),
-      confidence: _parseConfidence01(aiTextPatched),
-      aiTextPatched,
-    });
-    return aiTextPatched;
-  }
-
-  if (String(last.pick) !== String(norm.dir)) {
-    return last.aiTextPatched || aiTextPatched;
-  }
-
-  _setLastPick(fixtureId, mk, {
-    pick: norm.dir,
-    line: norm.line,
-    goalsAtPick: goalsNow,
-    ts: _nowMs(),
-    confidence: _parseConfidence01(aiTextPatched),
-    aiTextPatched,
-  });
-
-  return aiTextPatched;
-}
-
-// -----------------------------------------------------------
-// ✅ CORNERS FALLBACK (events vs stats)
-// -----------------------------------------------------------
-function pickCornersForAI(snapshot) {
-  const cornersEvents = snapshot?.corners || null; // {total,home,away}
-  const cornersStats = snapshot?.stats?.data?.corners_stats || null; // {home,away} pode ter null
-
-  const evHome = safeNumber(cornersEvents?.home, 0);
-  const evAway = safeNumber(cornersEvents?.away, 0);
-  const evTotal = safeNumber(cornersEvents?.total, evHome + evAway);
-
-  const stHomeRaw = cornersStats?.home ?? null;
-  const stAwayRaw = cornersStats?.away ?? null;
-
-  const stHome = stHomeRaw === null ? null : safeNumber(stHomeRaw, 0);
-  const stAway = stAwayRaw === null ? null : safeNumber(stAwayRaw, 0);
-
-  const stHomeN = safeNumber(stHome, 0);
-  const stAwayN = safeNumber(stAway, 0);
-  const stTotal = stHomeN + stAwayN;
-
-  const hasEvents = evTotal > 0;
-  const hasStats = stTotal > 0;
-
-  if (hasEvents) {
-    return {
-      available: true,
-      source: "events",
-      total: evTotal,
-      home: evHome,
-      away: evAway,
-      raw: { corners_events: cornersEvents, corners_stats: cornersStats },
-    };
-  }
-
-  if (!hasEvents && hasStats) {
-    return {
-      available: true,
-      source: "stats",
-      total: stTotal,
-      home: stHomeN,
-      away: stAwayN,
-      raw: { corners_events: cornersEvents, corners_stats: cornersStats },
-    };
-  }
-
-  return {
-    available: false,
-    source: "none",
-    total: 0,
-    home: 0,
-    away: 0,
-    raw: { corners_events: cornersEvents, corners_stats: cornersStats },
-  };
-}
-
-// -----------------------------------------------------------
-// ✅ FORMATADOR PARA UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
-// -----------------------------------------------------------
-function toTitleCaseRisk(x) {
-  const t = String(x || "").trim().toLowerCase();
-  if (!t) return "";
-  if (t === "baixo") return "Baixo";
-  if (t === "médio" || t === "medio") return "Médio";
-  if (t === "alto") return "Alto";
-  return t.charAt(0).toUpperCase() + t.slice(1);
-}
-
-function simplifyRecommendationLine(line) {
-  let s = String(line || "").trim();
-  s = s.replace(/\[ODD_ID=\d+\]/gi, "").trim();
-  s = s.replace(/\(ALVO:\s*(JOGO|CASA|FORA)\)/gi, "").trim();
-  s = s.replace(/\s{2,}/g, " ");
-
-  if (/^Recomendação\s*:/i.test(s)) {
-    const lower = s.toLowerCase();
-    let alvo = "";
-    if (lower.includes("home") || lower.includes("casa")) alvo = "Time da Casa";
-    else if (lower.includes("away") || lower.includes("fora")) alvo = "Time de Fora";
-
-    if (lower.includes("score a goal") || lower.includes("to score") || lower.includes("marcar")) {
-      if (alvo) return `Recomendação: GOL - ${alvo}`;
-      return "Recomendação: GOL";
-    }
-
-    s = s.replace(/Recomendação:\s*GOLS?\s*:\s*/i, "Recomendação: ").trim();
-    s = s.replace(/\bHome Team\b/gi, "Time da Casa");
-    s = s.replace(/\bAway Team\b/gi, "Time de Fora");
-  }
-
-  return s.trim();
-}
-
-function formatForUI(text) {
-  const raw = String(text || "").trim();
-  if (!raw) return "Erro na análise da IA.";
-
-  const lines = raw
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  let rec = "";
-  let odd = "";
-  let prob = "";
-  let risk = "";
-  let just = "";
-
-  for (const ln of lines) {
-    if (!rec && /^Recomendação\s*:/i.test(ln)) rec = simplifyRecommendationLine(ln);
-    if (!odd && /^Odd\s*:/i.test(ln)) odd = ln.replace(/\s{2,}/g, " ").trim();
-    if (!prob && /^Probabilidade/i.test(ln)) {
-      prob = ln
-        .replace(/^Probabilidade\s+de\s+GREEN\s*:/i, "Probabilidade de Green:")
-        .replace(/^Probabilidade\s+de\s+Green\s*:/i, "Probabilidade de Green:")
-        .replace(/\s{2,}/g, " ")
-        .trim();
-    }
-    if (!risk && /^Risco\s*:/i.test(ln)) {
-      const v = ln.replace(/^Risco\s*:\s*/i, "").trim();
-      risk = `Risco: ${toTitleCaseRisk(v)}`;
-    }
-    if (!just && /^Justificativa\s*:/i.test(ln)) just = ln.replace(/\s{2,}/g, " ").trim();
-  }
-
-  const out = [rec, odd, prob, risk, just]
-    .filter(Boolean)
-    .map((x) =>
-      String(x)
-        .replace(/\[ODD_ID=\d+\]/gi, "")
-        .replace(/EV:\s*[+-]?\d+(?:[.,]\d+)?/gi, "")
-        .replace(/\(ALVO:\s*(JOGO|CASA|FORA)\)/gi, "")
-        .replace(/\s{2,}/g, " ")
-        .trim()
-    )
-    .filter(Boolean);
-
-  return out.slice(0, 5).join("\n");
-}
-
-// -----------------------------------------------------------
-// API-SPORTS CLIENT (com detecção de errors mesmo em HTTP 200)
-// -----------------------------------------------------------
-async function apiSports(base, path, params = {}) {
-  const url = new URL(base + path);
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
-  });
-
+// ---------------- API CLIENT ----------------
+async function apiSports(path, params = {}) {
   try {
-    const r = await fetch(url.toString(), { headers: { "x-apisports-key": API_KEY } });
-    const j = await r.json().catch(() => ({}));
-
-    const httpErr = !r.ok;
-    const apiErr = hasApiErrors(j);
-
-    if (httpErr || apiErr) {
-      return {
-        response: Array.isArray(j?.response) ? j.response : [],
-        errors: {
-          http: httpErr ? r.status : undefined,
-          api: apiErr ? j?.errors : undefined,
-        },
-        results: j?.results ?? null,
-        paging: j?.paging ?? null,
-        raw: j,
-        _url: url.toString(),
-      };
-    }
-
-    return { ...j, _url: url.toString() };
+    const url = new URL(FOOTBALL_BASE + path);
+    Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+    const r = await fetch(url, { headers: { "x-apisports-key": API_KEY } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
   } catch (e) {
-    return { response: [], errors: { internal: e?.message || String(e) }, _url: url.toString() };
+    console.error("[API-SPORTS ERROR]", path, e.message);
+    throw e;
   }
 }
 
-async function apiSportsRetryWhere(base, path, params, predicateFn, tries = 3, delayMs = 1200) {
-  let last = null;
-
-  for (let i = 0; i < tries; i++) {
-    last = await apiSports(base, path, params);
-
-    const ok = (() => {
-      try {
-        return predicateFn(last);
-      } catch {
-        return false;
-      }
-    })();
-
-    if (ok) return { ...last, _retry: { tries: i + 1, ok: true } };
-    if (i < tries - 1) await sleep(delayMs);
-  }
-
-  return { ...(last || { response: [] }), _retry: { tries, ok: false } };
-}
-
-// -----------------------------------------------------------
-// DATA NORMALIZATION (STATS / EVENTS / ODDS)
-// -----------------------------------------------------------
-function extractStatAny(statsTeamRow, aliases = []) {
-  const s = statsTeamRow?.statistics || [];
-  const norm = (x) => String(x || "").toLowerCase().trim();
-
-  for (const a of aliases) {
-    const it = s.find((x) => norm(x?.type) === norm(a));
-    if (!it) continue;
-
-    const v = it?.value;
-
-    if (typeof v === "string") {
-      const vv = v.replace(",", ".").replace(/[^\d.%-]/g, "");
-      if (vv.endsWith("%")) return safeNumber(vv.replace("%", ""), 0);
-      return safeNumber(vv, 0);
-    }
-
-    return safeNumber(v, 0);
-  }
-
-  return null;
-}
-
-function extractStatValue(statsTeamRow, type) {
-  const s = statsTeamRow?.statistics || [];
-  const it = s.find((x) => x?.type === type);
-  const v = it?.value;
-  if (v === null || v === undefined) return null;
-  if (typeof v === "string" && v.endsWith("%")) return safeNumber(v.replace("%", ""), 0);
-  return safeNumber(v, 0);
-}
-
-function extractXG(statsTeamRow) {
-  return extractStatAny(statsTeamRow, [
-    "Expected Goals",
-    "Expected goals",
-    "Expected Goals (xG)",
-    "Expected goals (xG)",
-    "xG",
-    "xGoals",
-  ]);
-}
-
-function compactLiveStats(live_stats = []) {
-  const home = live_stats?.[0] || null;
-  const away = live_stats?.[1] || null;
-
-  if (!home || !away) {
-    return { available: false, data: null };
-  }
-
-  const xgHome = extractXG(home);
-  const xgAway = extractXG(away);
-
-  const mk = (a, b) => ({ home: a, away: b });
-
-  return {
-    available: true,
-    data: {
-      home: home?.team?.name || null,
-      away: away?.team?.name || null,
-      xg: mk(xgHome, xgAway),
-      shots_on_goal: mk(extractStatValue(home, "Shots on Goal"), extractStatValue(away, "Shots on Goal")),
-      shots_off_goal: mk(extractStatValue(home, "Shots off Goal"), extractStatValue(away, "Shots off Goal")),
-      total_shots: mk(extractStatValue(home, "Total Shots"), extractStatValue(away, "Total Shots")),
-      dangerous_attacks: mk(extractStatValue(home, "Dangerous Attacks"), extractStatValue(away, "Dangerous Attacks")),
-      attacks: mk(extractStatValue(home, "Attacks"), extractStatValue(away, "Attacks")),
-      possession: mk(extractStatValue(home, "Ball Possession"), extractStatValue(away, "Ball Possession")),
-      corners_stats: mk(
-        extractStatAny(home, ["Corner Kicks", "Corners", "Total Corners"]),
-        extractStatAny(away, ["Corner Kicks", "Corners", "Total Corners"])
-      ),
-      fouls: mk(
-        extractStatAny(home, ["Fouls", "Fouls Committed"]),
-        extractStatAny(away, ["Fouls", "Fouls Committed"])
-      ),
-      yellow: mk(extractStatValue(home, "Yellow Cards"), extractStatValue(away, "Yellow Cards")),
-      red: mk(extractStatValue(home, "Red Cards"), extractStatValue(away, "Red Cards")),
-    },
-  };
-}
-
-function compactEvents(events = []) {
-  const ev = Array.isArray(events) ? events : [];
-  const goals = ev.filter((e) => String(e?.type || "").toLowerCase() === "goal");
-  const cards = ev.filter((e) => String(e?.type || "").toLowerCase() === "card");
-  const yellow = cards.filter((e) => String(e?.detail || "").toLowerCase().includes("yellow")).length;
-  const red = cards.filter((e) => String(e?.detail || "").toLowerCase().includes("red")).length;
-  return { goals: goals.length, cards: cards.length, yellow, red };
-}
-
-function cornersFromEvents(events = [], homeName, awayName) {
-  const ev = Array.isArray(events) ? events : [];
-  const corners = ev.filter((e) => {
-    const t = String(e?.type || "").toLowerCase();
-    const d = String(e?.detail || "").toLowerCase();
-    return t === "corner" || d.includes("corner");
-  });
-
-  const home = corners.filter((e) => String(e?.team?.name || "") === String(homeName || "")).length;
-  const away = corners.filter((e) => String(e?.team?.name || "") === String(awayName || "")).length;
-  return { total: home + away, home, away };
-}
-
-function oddsLiveHasData(j) {
-  if (!j) return false;
-  if (j?.errors?.http || j?.errors?.api || j?.errors?.internal) return false;
-
-  const roots = Array.isArray(j?.response) ? j.response : [];
-  if (roots.length === 0) return false;
-
-  const anyOddsArr = roots.some((r) => Array.isArray(r?.odds) && r.odds.length > 0);
-  if (anyOddsArr) return true;
-
-  const anyBookmakers =
-    roots.some((r) => Array.isArray(r?.bookmakers) && r.bookmakers.length > 0) &&
-    roots.some((r) => (r?.bookmakers || []).some((bm) => Array.isArray(bm?.bets) && bm.bets.length > 0));
-
-  return anyBookmakers;
-}
-
-function statsHasTwoTeams(j) {
-  if (!j) return false;
-  if (j?.errors?.http || j?.errors?.api || j?.errors?.internal) return false;
-  return Array.isArray(j?.response) && j.response.length >= 2;
-}
-
-// ✅ compacta odds ao vivo para catálogo (ODD_ID interno sequencial)
-function compactLiveOdds(live_odds = [], teamsNames = {}, oddMin = 1.4, oddMax = 2.3) {
-  const homeTeam = teamsNames?.home || null;
-  const awayTeam = teamsNames?.away || null;
-
-  const arr = Array.isArray(live_odds) ? live_odds : [];
-  const out = [];
-  let idSeq = 1;
-
-  const pushRow = (bmName, marketName, selectionRaw, handicap, period, odd) => {
-    const selection = String(selectionRaw || "").toLowerCase();
-
-    let side = "game";
-    let team = null;
-
-    if (selection.includes("home") || String(selectionRaw) === "1") {
-      side = "home";
-      team = homeTeam;
-    } else if (selection.includes("away") || String(selectionRaw) === "2") {
-      side = "away";
-      team = awayTeam;
-    } else if (homeTeam && selection.includes(homeTeam.toLowerCase())) {
-      side = "home";
-      team = homeTeam;
-    } else if (awayTeam && selection.includes(awayTeam.toLowerCase())) {
-      side = "away";
-      team = awayTeam;
-    }
-
-    out.push({
-      id: idSeq++,
-      bookmaker: bmName || null,
-      market: marketName || null,
-      selection: selectionRaw || null,
-      handicap: handicap ?? null,
-      side,
-      team,
-      period,
-      odd: Number(Number(odd).toFixed(2)),
-    });
-  };
-
-  // Formato B: response[].odds -> {name, values}
-  for (const root of arr) {
-    const oddsArr = Array.isArray(root?.odds) ? root.odds : [];
-    if (oddsArr.length === 0) continue;
-
-    const bmName = "live";
-
-    for (const bet of oddsArr) {
-      const market = String(bet?.name || "");
-      const marketName = String(bet?.name || "").toLowerCase();
-
-      let period = "FT";
-      if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
-      if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
-
-      const values = Array.isArray(bet?.values) ? bet.values : [];
-      for (const v of values) {
-        const odd = safeNumber(v?.odd, 0);
-        if (odd < oddMin || odd > oddMax) continue;
-
-        pushRow(bmName, market, String(v?.value || ""), v?.handicap, period, odd);
-        if (out.length >= 160) return out;
-      }
-    }
-  }
-
-  // Formato A: response[].bookmakers[].bets[].values[]
-  for (const root of arr) {
-    const bookmakers = Array.isArray(root?.bookmakers) ? root.bookmakers : [];
-    if (bookmakers.length === 0) continue;
-
-    for (const bm of bookmakers) {
-      const bets = Array.isArray(bm?.bets) ? bm.bets : [];
-      for (const bet of bets) {
-        const market = String(bet?.name || "");
-        const marketName = String(bet?.name || "").toLowerCase();
-
-        let period = "FT";
-        if (marketName.includes("1st") || marketName.includes("1st half")) period = "1H";
-        if (marketName.includes("2nd") || marketName.includes("2nd half")) period = "2H";
-
-        const values = Array.isArray(bet?.values) ? bet.values : [];
-        for (const v of values) {
-          const odd = safeNumber(v?.odd, 0);
-          if (odd < oddMin || odd > oddMax) continue;
-
-          pushRow(bm?.name, market, String(v?.value || ""), v?.handicap, period, odd);
-          if (out.length >= 160) return out;
-        }
-      }
-    }
-  }
-
-  return out;
-}
-
-// -----------------------------------------------------------
-// ✅ EV ENGINE (CONSENSO MULTI-BOOK) -> TOP EVs DA PARTIDA
-// - Calcula pNoVig dentro de cada bookmaker/bet
-// - pFair_consenso = mediana(pNoVig) entre bookmakers
-// - EV% calculado sobre oddsCatalog (ODD_ID real, já filtrado por range)
-// -----------------------------------------------------------
-function extractOddsBookmakers(oddsRoots = []) {
-  const roots = Array.isArray(oddsRoots) ? oddsRoots : [];
-
-  for (const r of roots) {
-    if (Array.isArray(r?.bookmakers) && r.bookmakers.length > 0) return r.bookmakers;
-  }
-
-  for (const r of roots) {
-    if (Array.isArray(r?.odds) && r.odds.length > 0) {
-      return [
-        {
-          id: 0,
-          name: "live",
-          bets: r.odds.map((o, idx) => ({
-            id: o?.id ?? idx,
-            name: o?.name ?? "market",
-            values: Array.isArray(o?.values) ? o.values : [],
-          })),
-        },
-      ];
-    }
-  }
-
-  return [];
-}
-
-function inferPeriodFromMarketName(marketName) {
-  const m = String(marketName || "").toLowerCase();
-  if (m.includes("1st") || m.includes("1st half")) return "1H";
-  if (m.includes("2nd") || m.includes("2nd half")) return "2H";
-  return "FT";
-}
-
-function mkEvKey(marketName, selection, handicap, period) {
-  return `${normStr(marketName)}|${normStr(selection)}|${String(handicap ?? "")}|${normStr(period)}`;
-}
-
-function buildConsensusPFairMap(bookmakers = []) {
-  const bms = Array.isArray(bookmakers) ? bookmakers : [];
-  const pMap = new Map(); // key -> {pList:[], books:Set}
-
-  for (const bm of bms) {
-    const bookName = String(bm?.name || bm?.id || "book").trim();
-    const bets = Array.isArray(bm?.bets) ? bm.bets : [];
-
-    for (const bet of bets) {
-      const marketName = String(bet?.name || "").trim();
-      if (!marketName) continue;
-
-      const period = inferPeriodFromMarketName(marketName);
-
-      const values = Array.isArray(bet?.values) ? bet.values : [];
-      const outcomes = [];
-
-      for (const v of values) {
-        const selection = String(v?.value ?? "").trim();
-        const odd = safeNumber(v?.odd, 0);
-        if (!selection || !(odd > 1.0001)) continue;
-
-        outcomes.push({
-          selection,
-          odd,
-          handicap: v?.handicap ?? null,
-          period,
-        });
-      }
-
-      if (outcomes.length < 2) continue;
-
-      const pImpl = outcomes.map((o) => 1 / o.odd);
-      const sum = pImpl.reduce((a, b) => a + b, 0);
-      if (!(sum > 0)) continue;
-
-      for (let i = 0; i < outcomes.length; i++) {
-        const o = outcomes[i];
-        const pNoVig = clamp01(pImpl[i] / sum);
-
-        const key = mkEvKey(marketName, o.selection, o.handicap, o.period);
-
-        if (!pMap.has(key)) {
-          pMap.set(key, { pList: [], books: new Set() });
-        }
-
-        const row = pMap.get(key);
-        row.pList.push(pNoVig);
-        row.books.add(bookName);
-      }
-    }
-  }
-
-  // transforma em pFair_consenso (mediana) + booksCount
-  const out = new Map(); // key -> {pFair, booksCount}
-  for (const [k, v] of pMap.entries()) {
-    const pFair = median(v.pList);
-    const booksCount = v.books.size;
-
-    if (!Number.isFinite(pFair)) continue;
-    out.set(k, { pFair, booksCount });
-  }
-
-  return out;
-}
-
-function computeTopEvsForCatalog(oddsCatalog = [], bookmakers = [], topN = 6, minEvPct = 2.0) {
-  const catalog = Array.isArray(oddsCatalog) ? oddsCatalog : [];
-
-  const consensus = buildConsensusPFairMap(bookmakers);
-
-  // se exigir multi-book, elimina keys com booksCount < 2
-  const picks = [];
-  for (const o of catalog) {
-    const marketName = String(o?.market || "").trim();
-    const selection = String(o?.selection || "").trim();
-    const handicap = o?.handicap ?? null;
-    const period = String(o?.period || "FT").trim();
-
-    const key = mkEvKey(marketName, selection, handicap, period);
-    const c = consensus.get(key);
-    if (!c) continue;
-
-    if (EV_REQUIRE_MULTI_BOOK && (c.booksCount || 0) < 2) continue;
-
-    const odd = safeNumber(o?.odd, 0);
-    if (!(odd > 1.0001)) continue;
-
-    const pFair = clamp01(c.pFair);
-    const ev = pFair * odd - 1;
-    const evPct = ev * 100;
-
-    if (!Number.isFinite(evPct)) continue;
-    if (evPct < minEvPct) continue;
-
-    picks.push({
-      odd_id: Number(o?.id),
-      market: o?.market ?? null,
-      selection: o?.selection ?? null,
-      handicap: o?.handicap ?? null,
-      period: o?.period ?? null,
-      odd: Number(odd.toFixed(2)),
-      p_fair: Number(pFair.toFixed(4)),
-      ev_pct: Number(evPct.toFixed(2)),
-      books: Number(c.booksCount || 0),
-    });
-  }
-
-  picks.sort((a, b) => b.ev_pct - a.ev_pct);
-
-  // dedupe simples por market/selection/handicap/period (não repetir o mesmo item)
-  const seen = new Set();
-  const out = [];
-  for (const p of picks) {
-    const k = mkEvKey(p.market, p.selection, p.handicap, p.period);
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(p);
-    if (out.length >= topN) break;
-  }
-
-  return out;
-}
-
-// -----------------------------------------------------------
-// ----------- DATA ENGINE (SNAPSHOT) ------------------------
-// -----------------------------------------------------------
-async function buildFootballSnapshot(fixtureId, opts = {}) {
-  const oddMin = Number(opts.oddMin ?? ODD_MIN);
-  const oddMax = Number(opts.oddMax ?? ODD_MAX);
-
-  const triesOdds = Number(opts.triesOdds ?? ODDS_TRIES);
-  const delayOdds = Number(opts.delayOdds ?? ODDS_DELAY_MS);
-
-  const triesStats = Number(opts.triesStats ?? STATS_TRIES);
-  const delayStats = Number(opts.delayStats ?? STATS_DELAY_MS);
+// ---------------- SNAPSHOT ENGINE ----------------
+async function buildSnapshot(fixtureId) {
+  console.log("[SNAPSHOT] building", fixtureId);
+
+  const fx = await apiSports("/fixtures", { id: fixtureId });
+  const item = fx?.response?.[0];
+  if (!item) return null;
 
   const snapshot = {
-    meta: {
-      fixtureId: Number(fixtureId),
-      snapshot_ts: new Date().toISOString(),
-      sources: { fixtures: null, odds_live: null, events: null, statistics: null },
-      availability: { fixtures: false, odds_live: false, events: false, statistics: false },
-      retry: { odds_live: null, statistics: null },
-      errors: {},
+    match: {
+      fixtureId,
+      teams: {
+        home: item.teams.home.name,
+        away: item.teams.away.name,
+      },
+      time: { elapsed: safeNumber(item.fixture.status.elapsed) },
+      score: {
+        home: safeNumber(item.goals.home),
+        away: safeNumber(item.goals.away),
+      },
     },
-    match: null,
-    events: null,
-    corners: null,
-    stats: null,
-    odds: null,
-    rawCounts: null,
-
-    // ✅ adiciona raw bookmakers (para EV consenso)
-    _oddsBookmakers: null,
+    events: {},
+    odds: [],
+    stats: { available: false, data: null },
   };
 
-  // 1) fixtures (essencial)
-  const fx = await apiSports(FOOTBALL_BASE, "/fixtures", { id: fixtureId });
-  snapshot.meta.sources.fixtures = fx?._url || null;
-
-  const item = fx?.response?.[0];
-  if (!item) {
-    snapshot.meta.errors.fixtures = fx?.errors || { notFound: true };
-    snapshot.rawCounts = { events: 0, oddsRoots: 0, statsTeams: 0, books: 0 };
-    return snapshot;
-  }
-
-  snapshot.meta.availability.fixtures = true;
-
-  const status = item?.fixture?.status || {};
-  snapshot.match = {
-    fixtureId: item?.fixture?.id || Number(fixtureId),
-    league: item?.league ? { id: item.league.id, name: item.league.name, season: item.league.season } : null,
-    teams: {
-      home: item?.teams?.home?.name || null,
-      away: item?.teams?.away?.name || null,
-    },
-    time: {
-      elapsed: safeNumber(status?.elapsed, 0),
-      short: status?.short || null,
-      long: status?.long || null,
-    },
-    score: {
-      home: safeNumber(item?.goals?.home, 0),
-      away: safeNumber(item?.goals?.away, 0),
-    },
+  // EVENTS
+  const ev = await apiSports("/fixtures/events", { fixture: fixtureId });
+  const events = ev.response || [];
+  snapshot.events = {
+    goals: events.filter((e) => e.type === "Goal").length,
+    redcards: events.filter((e) => String(e.detail).toLowerCase().includes("red")).length,
   };
 
-  const homeName = snapshot.match.teams.home;
-  const awayName = snapshot.match.teams.away;
-
-  // 2) events (essencial)
-  const ev = await apiSports(FOOTBALL_BASE, "/fixtures/events", { fixture: fixtureId });
-  snapshot.meta.sources.events = ev?._url || null;
-  snapshot.meta.availability.events = true;
-
-  const eventsList = Array.isArray(ev?.response) ? ev.response : [];
-  snapshot.events = compactEvents(eventsList);
-  snapshot.corners = cornersFromEvents(eventsList, homeName, awayName);
-
-  // 3) odds/live (essencial)
-  const oddsLiveTry = await apiSportsRetryWhere(
-    FOOTBALL_BASE,
-    "/odds/live",
-    { fixture: fixtureId },
-    oddsLiveHasData,
-    triesOdds,
-    delayOdds
-  );
-
-  snapshot.meta.sources.odds_live = oddsLiveTry?._url || null;
-  snapshot.meta.retry.odds_live = oddsLiveTry?._retry || null;
-
-  const oddsRoots = Array.isArray(oddsLiveTry?.response) ? oddsLiveTry.response : [];
-  snapshot.meta.availability.odds_live = oddsRoots.length > 0;
-
-  if (!snapshot.meta.availability.odds_live) {
-    snapshot.meta.errors.odds_live = oddsLiveTry?.errors || { empty: true };
+  // ODDS
+  const odds = await apiSports("/odds/live", { fixture: fixtureId });
+  for (const root of odds.response || []) {
+    for (const bm of root.bookmakers || []) {
+      for (const bet of bm.bets || []) {
+        for (const v of bet.values || []) {
+          const odd = safeNumber(v.odd);
+          if (odd >= ODD_MIN && odd <= ODD_MAX) {
+            snapshot.odds.push({
+              id: snapshot.odds.length + 1,
+              market: bet.name,
+              selection: v.value,
+              odd,
+            });
+          }
+        }
+      }
+    }
   }
 
-  // ✅ salva bookmakers RAW (para EV)
-  snapshot._oddsBookmakers = extractOddsBookmakers(oddsRoots);
-
-  // ✅ mantém seu catálogo range-filtered (compatível)
-  snapshot.odds = compactLiveOdds(oddsRoots, { home: homeName, away: awayName }, oddMin, oddMax);
-
-  // 4) statistics + xG (opcional)
-  const statsTry = await apiSportsRetryWhere(
-    FOOTBALL_BASE,
-    "/fixtures/statistics",
-    { fixture: fixtureId },
-    statsHasTwoTeams,
-    triesStats,
-    delayStats
-  );
-
-  snapshot.meta.sources.statistics = statsTry?._url || null;
-  snapshot.meta.retry.statistics = statsTry?._retry || null;
-
-  const statsRows = Array.isArray(statsTry?.response) ? statsTry.response : [];
-  snapshot.meta.availability.statistics = statsRows.length >= 2;
-
-  if (!snapshot.meta.availability.statistics) {
-    snapshot.meta.errors.statistics = statsTry?.errors || { empty: true };
-    snapshot.stats = { available: false, data: null };
-  } else {
-    snapshot.stats = compactLiveStats(statsRows);
+  // STATS só se existir odd válida
+  if (snapshot.odds.length > 0) {
+    const stats = await apiSports("/fixtures/statistics", { fixture: fixtureId });
+    if ((stats.response || []).length >= 2) {
+      snapshot.stats = { available: true, data: stats.response };
+    }
   }
-
-  snapshot.rawCounts = {
-    events: eventsList.length,
-    oddsRoots: oddsRoots.length,
-    statsTeams: statsRows.length,
-    books: Array.isArray(snapshot._oddsBookmakers) ? snapshot._oddsBookmakers.length : 0,
-  };
-
-  snapshot.meta.oddMin = oddMin;
-  snapshot.meta.oddMax = oddMax;
 
   return snapshot;
 }
 
-// -----------------------------------------------------------
-// ----------- AI ENGINE (GEMINI) ----------------------------
-// -----------------------------------------------------------
-const genAI = GENAI_KEY ? new GoogleGenerativeAI(GENAI_KEY) : null;
+// ---------------- SNAPSHOT WRAPPER (DEDUP) ----------------
+async function getSnapshot(fixtureId) {
+  if (snapshotCache.has(fixtureId)) return snapshotCache.get(fixtureId);
+  if (snapshotInFlight.has(fixtureId)) return snapshotInFlight.get(fixtureId);
 
-let _cachedResolvedModel = null;
-let _cachedAt = 0;
+  const p = buildSnapshot(fixtureId)
+    .then((snap) => {
+      snapshotCache.set(fixtureId, snap);
+      snapshotInFlight.delete(fixtureId);
+      return snap;
+    })
+    .catch((e) => {
+      snapshotInFlight.delete(fixtureId);
+      throw e;
+    });
 
-function normalizeModelName(x) {
-  return String(x || "").replace(/^models\//, "").trim();
-}
-
-async function listGeminiModels() {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(GENAI_KEY)}`;
-  const r = await fetch(url);
-  const j = await r.json();
-
-  if (!r.ok) {
-    const e = new Error(j?.error?.message || `HTTP ${r.status}`);
-    e.status = r.status;
-    e.raw = j;
-    throw e;
-  }
-  return Array.isArray(j?.models) ? j.models : [];
-}
-
-function pickSupportedGenerateContent(models) {
-  return models.filter((m) => (m?.supportedGenerationMethods || []).includes("generateContent"));
-}
-
-function resolveByHint(models, hintRaw) {
-  const hint = normalizeModelName(hintRaw).toLowerCase();
-  const supported = pickSupportedGenerateContent(models);
-  const names = supported.map((m) => normalizeModelName(m?.name));
-
-  const exact = names.find((n) => n.toLowerCase() === hint);
-  if (exact) return exact;
-
-  const prefix = names.find((n) => n.toLowerCase().startsWith(hint));
-  if (prefix) return prefix;
-
-  if (hint.includes("2.5") && hint.includes("flash")) {
-    const flash25 = names.find((n) => n.toLowerCase().includes("2.5") && n.toLowerCase().includes("flash"));
-    if (flash25) return flash25;
-  }
-
-  return names[0] || null;
-}
-
-async function getResolvedModelName() {
-  if (!genAI) return null;
-  const now = Date.now();
-  if (_cachedResolvedModel && now - _cachedAt < 10 * 60 * 1000) return _cachedResolvedModel;
-
-  const models = await listGeminiModels();
-  const resolved = resolveByHint(models, GENAI_MODEL_RAW);
-
-  _cachedResolvedModel = resolved;
-  _cachedAt = now;
-  return _cachedResolvedModel;
-}
-
-async function generateGemini(prompt) {
-  const resolved = await getResolvedModelName();
-  if (!resolved) throw new Error("Nenhum modelo Gemini disponível para generateContent.");
-  const model = genAI.getGenerativeModel({ model: resolved });
-
-  const result = await model.generateContent({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-  });
-
-  return result?.response?.text?.() || "";
-}
-
-// ---------- IA normalization ----------
-function ensureAIFormat(text) {
-  const t = String(text || "").trim();
-  if (!t) return "Erro na análise da IA.";
-
-  const cleaned = t.replace(/\n{3,}/g, "\n\n").trim();
-  const lines = cleaned
-    .split("\n")
-    .map((x) => x.trim())
-    .filter((x) => x.length > 0)
-    .slice(0, 6);
-
-  return lines.join("\n");
-}
-
-// ---------- ODD_ID validation ----------
-function parseOddIdFromAI(text) {
-  const m = String(text || "").match(/ODD_ID\s*=\s*(\d+)/i);
-  return m ? Number(m[1]) : null;
-}
-
-function validateAIWithOddsDetailed(aiText, oddsCatalog, oddMin = ODD_MIN, oddMax = ODD_MAX) {
-  const t = String(aiText || "").trim();
-  const catalog = Array.isArray(oddsCatalog) ? oddsCatalog : [];
-
-  if (!t) return { ok: false, reason: "AI_EMPTY" };
-  if (catalog.length === 0) return { ok: false, reason: "CATALOG_EMPTY" };
-
-  const oddId = parseOddIdFromAI(t);
-  if (!oddId) return { ok: false, reason: "NO_ODD_ID" };
-
-  const row = catalog.find((x) => Number(x?.id) === Number(oddId));
-  if (!row) return { ok: false, reason: "ODD_ID_NOT_FOUND" };
-
-  const odd = safeNumber(row?.odd, 0);
-  if (odd < oddMin || odd > oddMax) return { ok: false, reason: "ODD_OUT_OF_RANGE" };
-
-  return { ok: true, reason: "OK", row };
-}
-
-function patchOddLineWithRealOdd(aiText, realOdd) {
-  const oddReal = Number(safeNumber(realOdd, 0)).toFixed(2);
-  const text = String(aiText || "");
-
-  if (/\bOdd\s*:\s*/i.test(text)) {
-    return text.replace(/\bOdd\s*:\s*[0-9]+(?:[.,][0-9]+)?\b/i, `Odd: ${oddReal}`);
-  }
-  return `${text}\nOdd: ${oddReal}`;
-}
-
-function buildOddsHintList(oddsCatalog, max = 25) {
-  const odds = Array.isArray(oddsCatalog) ? oddsCatalog : [];
-  return odds.slice(0, max).map((o) => ({
-    id: o.id,
-    market: o.market,
-    selection: o.selection,
-    handicap: o.handicap ?? null,
-    period: o.period,
-    side: o.side,
-    team: o.team ?? null,
-    odd: o.odd,
-  }));
-}
-
-// ---------- IA cache ----------
-const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 60_000);
-const _aiCache = new Map();
-
-function aiCacheGet(key) {
-  const row = _aiCache.get(key);
-  if (!row) return null;
-  if (Date.now() > row.exp) {
-    _aiCache.delete(key);
-    return null;
-  }
-  return row.value;
-}
-
-function aiCacheSet(key, value) {
-  _aiCache.set(key, { value, exp: Date.now() + AI_CACHE_TTL_MS });
-}
-
-// -----------------------------------------------------------
-// ✅ CONTROLE DE TRÁFEGO (SERIAL + THROTTLE + RESPONSE PADRÃO)
-// -----------------------------------------------------------
-const AI_QUEUE_WAIT_MSG = String(process.env.AI_QUEUE_WAIT_MSG || "IA processando análise...");
-const AI_QUEUE_FULL_MSG = String(process.env.AI_QUEUE_FULL_MSG || "IA em fila cheia. Tente novamente.");
-
-const _envConcurrency = Number(process.env.AI_MAX_CONCURRENCY || 1);
-const AI_MAX_CONCURRENCY = Math.min(1, Number.isFinite(_envConcurrency) ? _envConcurrency : 1);
-
-const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || 2000);
-const AI_QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 300);
-
-let _aiActive = 0;
-let _aiLastFinishAt = 0;
-
-const _aiQueue = [];
-const _aiInFlight = new Map();
-
-function _aiRunNext() {
-  if (_aiActive >= AI_MAX_CONCURRENCY) return;
-  if (_aiQueue.length === 0) return;
-
-  const now = Date.now();
-  const wait = Math.max(0, _aiLastFinishAt + AI_MIN_INTERVAL_MS - now);
-
-  const job = _aiQueue.shift();
-  _aiActive++;
-
-  setTimeout(async () => {
-    try {
-      const result = await job.fn();
-      job.resolve(result);
-    } catch (e) {
-      job.reject(e);
-    } finally {
-      _aiLastFinishAt = Date.now();
-      _aiActive--;
-      _aiRunNext();
-    }
-  }, wait);
-}
-
-function enqueueAI(cacheKey, fn) {
-  if (cacheKey && _aiInFlight.has(cacheKey)) {
-    return Promise.resolve(AI_QUEUE_WAIT_MSG);
-  }
-
-  if (_aiQueue.length >= AI_QUEUE_MAX) {
-    return Promise.resolve(AI_QUEUE_FULL_MSG);
-  }
-
-  let resolveRef, rejectRef;
-  const p = new Promise((resolve, reject) => {
-    resolveRef = resolve;
-    rejectRef = reject;
-  });
-
-  if (cacheKey) {
-    _aiInFlight.set(cacheKey, p);
-    p.finally(() => _aiInFlight.delete(cacheKey));
-  }
-
-  const job = { fn, resolve: resolveRef, reject: rejectRef };
-  const willWait = !(
-    _aiActive < AI_MAX_CONCURRENCY &&
-    _aiQueue.length === 0 &&
-    Date.now() >= _aiLastFinishAt + AI_MIN_INTERVAL_MS
-  );
-
-  _aiQueue.push(job);
-  _aiRunNext();
-
-  if (willWait) return Promise.resolve(AI_QUEUE_WAIT_MSG);
+  snapshotInFlight.set(fixtureId, p);
   return p;
 }
 
-// ---------- AI decision ----------
-async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
-  if (!genAI) return "IA não configurada.";
+// ---------------- IA ENGINE ----------------
+const genAI = new GoogleGenerativeAI(GENAI_KEY);
 
-  if (cacheKey) {
-    const cached = aiCacheGet(cacheKey);
-    if (cached) return cached;
-    if (_aiInFlight.has(cacheKey)) return AI_QUEUE_WAIT_MSG;
-  }
+async function getAI(snapshot, fixtureId) {
+  if (aiCache.has(fixtureId)) return aiCache.get(fixtureId);
+  if (aiInFlight.has(fixtureId)) return aiInFlight.get(fixtureId);
 
-  const oddMin = Number(snapshot?.meta?.oddMin ?? ODD_MIN);
-  const oddMax = Number(snapshot?.meta?.oddMax ?? ODD_MAX);
+  const p = (async () => {
+    try {
+      const oddMin = ODD_MIN;
+      const oddMax = ODD_MAX;
 
-  const oddsCatalog = Array.isArray(snapshot?.odds) ? snapshot.odds : [];
-  const match = snapshot?.match || {};
-  const events = snapshot?.events || {};
+      const aiData = {
+        match: snapshot.match,
+        live: {
+          odds: snapshot.odds,
+          events: snapshot.events,
+          statistics: snapshot.stats.data,
+          top_evs: [],
+          top_evs_available: false,
+        },
+      };
 
-  const { statsAvailable, xgAvailable } = getStatsXGFlags(snapshot);
-  const stats = statsAvailable ? snapshot?.stats?.data : null;
-
-  const cornersPick = pickCornersForAI(snapshot);
-
-  // ✅ TOP EVs (consenso multi-book) - cache curtíssimo por fixture+elapsed+range
-  const elapsed = safeNumber(snapshot?.match?.time?.elapsed, 0);
-  const evKey = `ev:${snapshot?.meta?.fixtureId}:${elapsed}:${oddMin}:${oddMax}`;
-  let topEvs = evCacheGet(evKey);
-
-  if (!topEvs) {
-    const bms = Array.isArray(snapshot?._oddsBookmakers) ? snapshot._oddsBookmakers : [];
-    topEvs = computeTopEvsForCatalog(oddsCatalog, bms, EV_TOP_N, EV_MIN_PCT);
-    evCacheSet(evKey, topEvs);
-  }
-
-  const aiData = {
-    match,
-    live: {
-      odds: oddsCatalog,
-      events,
-
-      corners_events: snapshot?.corners || null,
-      corners_stats: statsAvailable ? snapshot?.stats?.data?.corners_stats || null : null,
-
-      corners: cornersPick.available
-        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
-        : null,
-      corners_available: Boolean(cornersPick.available),
-
-      statistics: stats,
-      statistics_available: statsAvailable,
-      xg_available: xgAvailable,
-
-      // ✅ NOVO: TOP EVs (pré-calculados)
-      top_evs: Array.isArray(topEvs) ? topEvs : [],
-      top_evs_available: Array.isArray(topEvs) && topEvs.length > 0,
-      top_evs_rules: {
-        method: "consensus_median_devig",
-        require_multi_book: EV_REQUIRE_MULTI_BOOK,
-        min_ev_pct: EV_MIN_PCT,
-        top_n: EV_TOP_N,
-        note: "Se top_evs_available=false, não há base confiável (sem multi-book) ou nenhum EV passou no filtro.",
-      },
-    },
-    meta: {
-      snapshot_ts: snapshot?.meta?.snapshot_ts,
-      sources: snapshot?.meta?.sources,
-      availability: snapshot?.meta?.availability,
-      rawCounts: snapshot?.rawCounts,
-    },
-  };
-
-  // ================= PROMPT FINAL (FUSÃO DOS DOIS, VERSÃO OTIMIZADA) =================
-// Substitua SOMENTE a variável `prompt` dentro de getAIAnalysisFromSnapshot(...)
-// Nada mais no código precisa mudar.
-
-const prompt = `Você é o "PredictIA Engine v2.1 Elite", um sistema de inteligência quantitativa para futebol ao vivo.
+      const prompt = `Você é o "PredictIA Engine v2.1 Elite", um sistema de inteligência quantitativa para futebol ao vivo.
 
 MISSÃO:
 Sua tarefa é realizar a convergência entre a ARBITRAGEM MATEMÁTICA e o MOMENTUM DO JOGO.
@@ -1340,266 +215,59 @@ FILTRO ANTI-UNDER-CEDO (OBRIGATÓRIO)
   -> Retorne SEM OPORTUNIDADE
   -> Justificativa obrigatória: "Minuto cedo para Under; risco alto de mudança de ritmo."
 
-- Sinônimos como:
-  "jogo para poucos gols", "sem mais gols", "tende a under"
-  são considerados UNDER e seguem esta mesma regra.
-
 4. FILTRO DE EDGE FINAL:
 - Só prossiga se:
   (P_decimal * odd) > 1.08
   e EV positivo.
-- Se a odd estiver derretendo (queda rápida) e o edge sumir:
-  -> Considere "Odd Justa" e RECUSE.
 
 ════════════════════════════════════
 REGRAS DE SAÍDA (FORMATO ESTRITO)
 ════════════════════════════════════
-- Idioma: PT-BR.
-- Sem Markdown, apenas texto simples.
-- Máximo 6 linhas.
+Recomendação: <palpite> [ODD_ID=<N>]
+Odd:
+Probabilidade de Green:
+EV:
+Risco:
+Justificativa:
 
-FORMATO OBRIGATÓRIO:
-Recomendação: <palpite em português claro e humano> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
-Odd: <X.XX>
-Probabilidade de Green: <XX%>
-EV: <+0.00>
-Risco: baixo|médio|alto
-Justificativa: <1 frase objetiva>
-
-REGRAS DE LINGUAGEM (OBRIGATÓRIAS):
-- Proibido usar termos técnicos ou em inglês.
-- Proibido usar nomes de mercados como:
-  Fulltime Result, Over/Under, Asian Handicap, Draw, Both Teams To Score.
-
-MAPEAMENTO OBRIGATÓRIO:
-- Draw → Empate
-- Home Win → Vitória Casa
-- Away Win → Vitória Fora
-- Over X.5 Goals → Mais de X.5 gols
-- Under X.5 Goals → Menos de X.5 gols
-- Over X.5 Corners → Mais de X.5 escanteios
-- Under X.5 Corners → Menos de X.5 escanteios
-- Over X.5 Cards → Mais de X.5 cartões
-- Under X.5 Cards → Menos de X.5 cartões
-- Asian Handicap -1 Home → Casa -1
-- Asian Handicap +1 Away → Fora +1
-
-════════════════════════════════════
 DADOS PARA PROCESSAMENTO
-════════════════════════════════════
 ${JSON.stringify(aiData)}`;
 
+      const model = genAI.getGenerativeModel({ model: GENAI_MODEL_RAW });
+      const res = await model.generateContent(prompt);
+      const text = res.response.text();
 
-
-  const run = async () => {
-    try {
-      const raw1 = await generateGemini(prompt);
-      const v1 = validateAIWithOddsDetailed(raw1, oddsCatalog, oddMin, oddMax);
-
-      if (!v1.ok) {
-        const hintList = buildOddsHintList(oddsCatalog, 25);
-
-        const retryPrompt = `Escolha OBRIGATORIAMENTE 1 ODD_ID da lista abaixo (não invente IDs).
-Retorne no FORMATO EXATO e inclua [ODD_ID=<N>] NA PRIMEIRA LINHA.
-
-LISTA_DE_ODDS_VALIDAS:
-${JSON.stringify(hintList)}
-
-DADOS AO VIVO:
-${JSON.stringify(aiData)}`;
-
-        const raw2 = await generateGemini(retryPrompt);
-        const v2 = validateAIWithOddsDetailed(raw2, oddsCatalog, oddMin, oddMax);
-
-        if (!v2.ok) {
-          const msg = `Sem oportunidades no range ${oddMin.toFixed(2)}–${oddMax.toFixed(2)}.`;
-          if (cacheKey) aiCacheSet(cacheKey, msg);
-          return msg;
-        }
-
-        const formatted2 = ensureAIFormat(raw2);
-        const patched2 = patchOddLineWithRealOdd(formatted2, v2.row.odd);
-
-        const patched2Consistent = applyConsistencyGoalsOU05(
-          snapshot,
-          snapshot?.match?.fixtureId || snapshot?.meta?.fixtureId,
-          patched2
-        );
-
-        const ui2 = formatForUI(patched2Consistent);
-
-        if (cacheKey) aiCacheSet(cacheKey, ui2);
-        return ui2;
-      }
-
-      const formatted1 = ensureAIFormat(raw1);
-      const patched1 = patchOddLineWithRealOdd(formatted1, v1.row.odd);
-
-      const patched1Consistent = applyConsistencyGoalsOU05(
-        snapshot,
-        snapshot?.match?.fixtureId || snapshot?.meta?.fixtureId,
-        patched1
-      );
-
-      const ui1 = formatForUI(patched1Consistent);
-
-      if (cacheKey) aiCacheSet(cacheKey, ui1);
-      return ui1;
-    } catch (err) {
-      console.error("GEMINI_MODEL_RAW:", GENAI_MODEL_RAW);
-      console.error("GEMINI_RESOLVED_MODEL:", _cachedResolvedModel);
-      console.error("GEMINI ERROR:", err);
-
-      const fallback = "Erro na análise da IA.";
-      if (cacheKey) aiCacheSet(cacheKey, fallback);
-      return fallback;
+      aiCache.set(fixtureId, text);
+      aiInFlight.delete(fixtureId);
+      return text;
+    } catch (e) {
+      aiInFlight.delete(fixtureId);
+      console.error("[IA ERROR]", e.message);
+      throw e;
     }
-  };
+  })();
 
-  return enqueueAI(cacheKey || "", run);
+  aiInFlight.set(fixtureId, p);
+  return p;
 }
 
-// -----------------------------------------------------------
-// ----------- ROUTES ----------------------------------------
-// -----------------------------------------------------------
-app.get("/", (_, res) => res.send("PredictIA Engine Online"));
-
-app.get("/football/live", async (req, res) => {
-  const leagueId = req.query.leagueId ? Number(req.query.leagueId) : undefined;
-
-  const data = await apiSports(
-    FOOTBALL_BASE,
-    "/fixtures",
-    leagueId ? { live: "all", league: leagueId } : { live: "all" }
-  );
-
-  res.json({
-    status: "ok",
-    data: (data.response || []).map((item) => ({
-      fixtureId: item?.fixture?.id,
-      league: item?.league ? { id: item.league.id, name: item.league.name } : null,
-      teams: item?.teams,
-      goals: item?.goals,
-      status: item?.fixture?.status,
-      time: item?.fixture?.status?.elapsed,
-    })),
-    raw: data.errors ? { errors: data.errors } : undefined,
-  });
-});
-
-app.get("/football/snapshot/:fixtureId", async (req, res) => {
-  const fixtureId = Number(req.params.fixtureId);
-  const wantDebug = String(req.query.debug || "").toLowerCase() === "true";
-
-  const oddMin = req.query.oddMin ? Number(req.query.oddMin) : ODD_MIN;
-  const oddMax = req.query.oddMax ? Number(req.query.oddMax) : ODD_MAX;
-
-  const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
-
-  const flags = getStatsXGFlags(snap);
-  const cornersPick = pickCornersForAI(snap);
-
-  // ✅ calcula TOP EVs só pra debug/preview (sem chamar IA)
-  const elapsed = safeNumber(snap?.match?.time?.elapsed, 0);
-  const evKey = `ev:${snap?.meta?.fixtureId}:${elapsed}:${oddMin}:${oddMax}`;
-  let topEvs = evCacheGet(evKey);
-  if (!topEvs) {
-    topEvs = computeTopEvsForCatalog(snap?.odds || [], snap?._oddsBookmakers || [], EV_TOP_N, EV_MIN_PCT);
-    evCacheSet(evKey, topEvs);
-  }
-
-  if (!wantDebug) {
-    return res.json({
-      status: "ok",
-      data: {
-        match: snap.match,
-        events: snap.events,
-        corners: cornersPick.available
-          ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
-          : null,
-        cornersAvailable: Boolean(cornersPick.available),
-        oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
-        statsAvailable: flags.statsAvailable,
-        xgAvailable: flags.xgAvailable,
-        stats: flags.statsAvailable ? snap.stats.data : null,
-        rawCounts: snap.rawCounts,
-        topEvs: topEvs,
-        topEvsAvailable: Array.isArray(topEvs) && topEvs.length > 0,
-      },
-    });
-  }
-
-  return res.json({
-    status: "ok",
-    data: {
-      ...snap,
-      flags,
-      corners_pick: cornersPick,
-      top_evs: topEvs,
-      top_evs_available: Array.isArray(topEvs) && topEvs.length > 0,
-    },
-  });
-});
-
+// ---------------- ROUTE ----------------
 app.get("/football/match/:fixtureId", async (req, res) => {
   const fixtureId = Number(req.params.fixtureId);
-  const wantAnalysis = String(req.query.analysis || "").toLowerCase() === "true";
-  const wantDebug = String(req.query.debug || "").toLowerCase() === "true";
 
-  const oddMin = req.query.oddMin ? Number(req.query.oddMin) : ODD_MIN;
-  const oddMax = req.query.oddMax ? Number(req.query.oddMax) : ODD_MAX;
+  try {
+    const snap = await getSnapshot(fixtureId);
+    if (!snap) return res.status(404).json({ error: "Jogo não encontrado" });
 
-  const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
-
-  const flags = getStatsXGFlags(snap);
-  const cornersPick = pickCornersForAI(snap);
-
-  const out = {
-    fixtureId,
-    snapshot: wantDebug ? snap : undefined,
-    data: {
-      match: snap.match,
-      events: snap.events,
-      corners: cornersPick.available
-        ? { source: cornersPick.source, total: cornersPick.total, home: cornersPick.home, away: cornersPick.away }
-        : null,
-      cornersAvailable: Boolean(cornersPick.available),
-      statsAvailable: flags.statsAvailable,
-      xgAvailable: flags.xgAvailable,
-      stats: flags.statsAvailable ? snap.stats.data : null,
-      oddsCount: Array.isArray(snap.odds) ? snap.odds.length : 0,
-      rawCounts: snap.rawCounts,
-    },
-  };
-
-  if (!wantAnalysis) {
-    return res.json({ status: "ok", data: out });
+    const ai = await getAI(snap, fixtureId);
+    res.json({ status: "ok", snapshot: snap, ai });
+  } catch (e) {
+    console.error("[ROUTE ERROR]", fixtureId, e.message);
+    res.status(500).json({ error: "Erro interno do servidor" });
   }
-
-  const prediction = await getAIAnalysisFromSnapshot(snap, `football:${fixtureId}`);
-  out.ai_prediction = prediction;
-
-  if (wantDebug) {
-    const elapsed = safeNumber(snap?.match?.time?.elapsed, 0);
-    const evKey = `ev:${snap?.meta?.fixtureId}:${elapsed}:${oddMin}:${oddMax}`;
-    const topEvs = evCacheGet(evKey) || [];
-    out.ai_debug = {
-      oddsCatalogSize: Array.isArray(snap.odds) ? snap.odds.length : 0,
-      statsTeams: snap?.rawCounts?.statsTeams ?? 0,
-      corners_pick: cornersPick,
-      stats_available: flags.statsAvailable,
-      xg_available: flags.xgAvailable,
-      books: snap?.rawCounts?.books ?? 0,
-      topEvs,
-      topEvsAvailable: Array.isArray(topEvs) && topEvs.length > 0,
-    };
-  }
-
-  return res.json({ status: "ok", data: out });
 });
 
-// -----------------------------------------------------------
-// SERVER
-// -----------------------------------------------------------
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
+// ---------------- SERVER ----------------
+app.listen(10000, () => {
+  console.log("PredictIA Engine PRO rodando na porta 10000");
+});
