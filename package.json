@@ -1,19 +1,20 @@
 {
   "name": "predictia-backend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
-  "engines": {
-    "node": "20.x"
-  },
+  "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
-    "axios": "^1.13.2",
+    "@google/generative-ai": "^0.24.1",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "lru-cache": "^11.2.5"
   }
 }
