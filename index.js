@@ -1,4 +1,5 @@
 // FILE: index.js (COMPLETO) — ✅ CACHE SNAPSHOT 60s + REQUEST COLLAPSING + EV TOP6 PRÉ-IA + CACHE IA 60s
+// ✅ FIX: aceita "SEM OPORTUNIDADE" (2 linhas) sem exigir ODD_ID + impede UI mostrar só "Odd: X"
 // (Sem alterar: computeTopEvsForCatalog, prompt interno, applyConsistencyGoalsOU05, formato UI 5/6 linhas)
 
 import "dotenv/config";
@@ -329,6 +330,23 @@ function pickCornersForAI(snapshot) {
 }
 
 // -----------------------------------------------------------
+// ✅ "SEM OPORTUNIDADE" HELPERS (NOVO)
+// -----------------------------------------------------------
+function isSemOportunidade(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  const lines = t.split("\n").map((x) => x.trim()).filter(Boolean);
+  return String(lines[0] || "").toUpperCase() === "SEM OPORTUNIDADE";
+}
+
+function normalizeSemOportunidade(text) {
+  const t = String(text || "").trim();
+  const lines = t.split("\n").map((x) => x.trim()).filter(Boolean);
+  const motivoLine = lines.find((ln) => /^Motivo\s*:/i.test(ln)) || "Motivo: Nenhum mercado passou nos filtros.";
+  return ["SEM OPORTUNIDADE", motivoLine].join("\n");
+}
+
+// -----------------------------------------------------------
 // ✅ FORMATADOR PARA UI (remove ODD_ID/EV/ALVO e deixa só 5 linhas)
 // -----------------------------------------------------------
 function toTitleCaseRisk(x) {
@@ -365,9 +383,13 @@ function simplifyRecommendationLine(line) {
   return s.trim();
 }
 
+// ✅ PATCH: impede UI mostrar só "Odd: X" quando IA veio incompleta
 function formatForUI(text) {
   const raw = String(text || "").trim();
   if (!raw) return "Erro na análise da IA.";
+
+  // ✅ se a IA devolveu SEM OPORTUNIDADE, mantém 2 linhas
+  if (isSemOportunidade(raw)) return normalizeSemOportunidade(raw);
 
   const lines = raw
     .split("\n")
@@ -395,6 +417,11 @@ function formatForUI(text) {
       risk = `Risco: ${toTitleCaseRisk(v)}`;
     }
     if (!just && /^Justificativa\s*:/i.test(ln)) just = ln.replace(/\s{2,}/g, " ").trim();
+  }
+
+  // ✅ se não tem Recomendação, converte pra SEM OPORTUNIDADE (evita "Odd: X" sozinho)
+  if (!rec) {
+    return "SEM OPORTUNIDADE\nMotivo: IA não retornou recomendação válida (saída incompleta).";
   }
 
   const out = [rec, odd, prob, risk, just]
@@ -1315,7 +1342,6 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
   const aiData = {
     match,
     live: {
-      // ✅ NÃO manda o catálogo inteiro para a IA (economia de tokens)
       // odds: oddsCatalog,  // REMOVIDO: agora só top_evs
       events,
 
@@ -1331,7 +1357,6 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
       statistics_available: statsAvailable,
       xg_available: xgAvailable,
 
-      // ✅ TOP 6 EVs (pré-calculados)
       top_evs: Array.isArray(topEvs) ? topEvs.slice(0, 6) : [],
       top_evs_available: Array.isArray(topEvs) && topEvs.length > 0,
       top_evs_rules: {
@@ -1484,26 +1509,46 @@ ${JSON.stringify(aiData)}`;
 
   const run = async () => {
     try {
-      // ✅ IMPORTANTE: validação usa o catálogo local (oddsCatalog) e ODD_ID deve existir nele
       const raw1 = await generateGemini(prompt);
+
+      // ✅ (NOVO) aceita SEM OPORTUNIDADE sem exigir ODD_ID
+      if (isSemOportunidade(raw1)) {
+        const uiNo = normalizeSemOportunidade(raw1);
+        if (cacheKey) aiCacheSet(cacheKey, uiNo);
+        return uiNo;
+      }
+
       const v1 = validateAIWithOddsDetailed(raw1, oddsCatalog, oddMin, oddMax);
 
       if (!v1.ok) {
-        // retry manda hintList baseado no catálogo (compatível)
         const hintList = buildOddsHintList(oddsCatalog, 25);
 
-        const retryPrompt = `Escolha OBRIGATORIAMENTE 1 ODD_ID da lista abaixo (não invente IDs). Retorne no FORMATO EXATO e inclua [ODD_ID=<N>] NA PRIMEIRA LINHA.
+        // ✅ (NOVO) retry permite SEM OPORTUNIDADE (não força pick)
+        const retryPrompt = `Você tem DUAS opções:
+1) Se existir pick válido, escolha OBRIGATORIAMENTE 1 ODD_ID da lista abaixo (não invente IDs) e retorne no FORMATO EXATO (6 linhas).
+2) Se NÃO existir pick válido após filtros, retorne EXATAMENTE 2 linhas:
+SEM OPORTUNIDADE
+Motivo: Nenhum mercado passou nos filtros de EV + momentum + segurança.
 
 LISTA_DE_ODDS_VALIDAS:
 ${JSON.stringify(hintList)}
 
 DADOS AO VIVO:
 ${JSON.stringify(aiData)}`;
+
         const raw2 = await generateGemini(retryPrompt);
+
+        // ✅ (NOVO) aceita SEM OPORTUNIDADE no retry
+        if (isSemOportunidade(raw2)) {
+          const uiNo2 = normalizeSemOportunidade(raw2);
+          if (cacheKey) aiCacheSet(cacheKey, uiNo2);
+          return uiNo2;
+        }
+
         const v2 = validateAIWithOddsDetailed(raw2, oddsCatalog, oddMin, oddMax);
 
         if (!v2.ok) {
-          const msg = `Sem oportunidades no range ${oddMin.toFixed(2)}–${oddMax.toFixed(2)}.`;
+          const msg = "SEM OPORTUNIDADE\nMotivo: Nenhuma odd válida/consistente no catálogo dentro do range.";
           if (cacheKey) aiCacheSet(cacheKey, msg);
           return msg;
         }
@@ -1518,7 +1563,6 @@ ${JSON.stringify(aiData)}`;
         );
 
         const ui2 = formatForUI(patched2Consistent);
-
         if (cacheKey) aiCacheSet(cacheKey, ui2);
         return ui2;
       }
@@ -1533,7 +1577,6 @@ ${JSON.stringify(aiData)}`;
       );
 
       const ui1 = formatForUI(patched1Consistent);
-
       if (cacheKey) aiCacheSet(cacheKey, ui1);
       return ui1;
     } catch (err) {
@@ -1585,13 +1628,11 @@ app.get("/football/snapshot/:fixtureId", async (req, res) => {
   const oddMin = req.query.oddMin ? Number(req.query.oddMin) : ODD_MIN;
   const oddMax = req.query.oddMax ? Number(req.query.oddMax) : ODD_MAX;
 
-  // ✅ agora usa cache 60s + request collapsing
   const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
 
   const flags = getStatsXGFlags(snap);
   const cornersPick = pickCornersForAI(snap);
 
-  // ✅ calcula TOP EVs só pra debug/preview (sem chamar IA)
   const elapsed = safeNumber(snap?.match?.time?.elapsed, 0);
   const evKey = `ev:${snap?.meta?.fixtureId}:${elapsed}:${oddMin}:${oddMax}`;
   let topEvs = evCacheGet(evKey);
@@ -1641,7 +1682,6 @@ app.get("/football/match/:fixtureId", async (req, res) => {
   const oddMin = req.query.oddMin ? Number(req.query.oddMin) : ODD_MIN;
   const oddMax = req.query.oddMax ? Number(req.query.oddMax) : ODD_MAX;
 
-  // ✅ agora usa cache 60s + request collapsing
   const snap = await buildFootballSnapshot(fixtureId, { oddMin, oddMax });
 
   const flags = getStatsXGFlags(snap);
@@ -1669,7 +1709,6 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     return res.json({ status: "ok", data: out });
   }
 
-  // ✅ cacheKey estável por fixture + range (evita colisões com oddMin/oddMax)
   const aiKey = `football:${fixtureId}:${oddMin.toFixed(2)}:${oddMax.toFixed(2)}`;
   const prediction = await getAIAnalysisFromSnapshot(snap, aiKey);
   out.ai_prediction = prediction;
