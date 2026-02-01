@@ -1,4 +1,4 @@
-// FILE: index.js (COMPLETO E FUNCIONAL) — COM LIVE + FALLBACK DA CHAVE
+// FILE: index.js (COMPLETO) — COMPAT APP (ADAPTERS) + ECONÔMICO + EV PRÉ-CALCULADO + TODAS STATS NO aiInput
 
 import "dotenv/config";
 import express from "express";
@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 // ---------------- ENV ----------------
-const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY; // ✅ fallback corrigido
+const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY; // ✅ fallback mantido
 const GENAI_KEY = process.env.GEMINI_API_KEY;
 const GENAI_MODEL_RAW = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
 
@@ -23,11 +23,11 @@ if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
 
 // ---------------- CACHES ----------------
-const snapshotCache = new LRUCache({ max: 500, ttl: 1000 * 60 });
-const aiCache = new LRUCache({ max: 500, ttl: 1000 * 60 });
+const snapshotCache = new LRUCache({ max: 700, ttl: 1000 * 45 }); // 45s
+const aiCache = new LRUCache({ max: 700, ttl: 1000 * 45 });       // 45s
 
-// Cache live list (curto, p/ não spammar live=all)
-const liveCache = new LRUCache({ max: 50, ttl: 1000 * 10 }); // 10s
+// Cache live list (curto p/ não spammar live=all)
+const liveCache = new LRUCache({ max: 80, ttl: 1000 * 10 }); // 10s
 const liveInFlight = new Map();
 
 // Anti race condition (dedup por fixtureId)
@@ -36,12 +36,31 @@ const aiInFlight = new Map();
 
 // ---------------- HELPERS ----------------
 const safeNumber = (v, d = 0) => {
-  const n = Number(v);
+  const n = Number(String(v ?? "").replace(",", "."));
   return Number.isFinite(n) ? n : d;
 };
 
 const isValidFixtureId = (n) =>
   Number.isFinite(n) && Number.isInteger(n) && n > 0;
+
+const lower = (s) => String(s ?? "").trim().toLowerCase();
+
+const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+
+// ---------------- ADAPTERS (COMPAT APP) ----------------
+const ADAPTERS = {
+  football: {
+    extractLiveScore: (item) => ({
+      fixtureId: item?.fixture?.id,
+      league: item?.league ? { id: item.league.id, name: item.league.name } : null,
+      teams: item?.teams,
+      goals: item?.goals,
+      score: item?.score,
+      status: item?.fixture?.status,
+      time: item?.fixture?.status?.elapsed,
+    }),
+  },
+};
 
 // ---------------- API CLIENT ----------------
 async function apiSports(path, params = {}) {
@@ -84,6 +103,437 @@ async function fetchLiveFixtures() {
   return p;
 }
 
+// ---------------- STATS NORMALIZATION ----------------
+// API-Football /fixtures/statistics geralmente:
+// response: [ { team:{...}, statistics:[{type,value},...] }, { team:{...}, statistics:[...]} ]
+function statsToMap(teamStats) {
+  const out = Object.create(null);
+  const arr = Array.isArray(teamStats?.statistics) ? teamStats.statistics : [];
+  for (const s of arr) {
+    const key = lower(s?.type);
+    out[key] = s?.value;
+  }
+  return out;
+}
+
+function percentToNumber(v) {
+  // "54%" -> 54
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const n = Number(s.replace("%", "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function maybeNumber(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const s = String(v).trim().replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getStat(map, keys) {
+  for (const k of keys) {
+    const v = map[lower(k)];
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+function normalizeStats(statsResponse) {
+  const resp = Array.isArray(statsResponse) ? statsResponse : [];
+  if (resp.length < 2) return null;
+
+  const homeObj = resp[0];
+  const awayObj = resp[1];
+
+  const homeMap = statsToMap(homeObj);
+  const awayMap = statsToMap(awayObj);
+
+  const norm = {
+    home: {
+      team: homeObj?.team ?? null,
+      raw: homeObj ?? null,
+      map: homeMap,
+    },
+    away: {
+      team: awayObj?.team ?? null,
+      raw: awayObj ?? null,
+      map: awayMap,
+    },
+    parsed: {
+      shotsOnGoal: {
+        home: maybeNumber(getStat(homeMap, ["shots on goal", "shots on target"])),
+        away: maybeNumber(getStat(awayMap, ["shots on goal", "shots on target"])),
+      },
+      totalShots: {
+        home: maybeNumber(getStat(homeMap, ["total shots"])),
+        away: maybeNumber(getStat(awayMap, ["total shots"])),
+      },
+      corners: {
+        home: maybeNumber(getStat(homeMap, ["corner kicks", "corners"])),
+        away: maybeNumber(getStat(awayMap, ["corner kicks", "corners"])),
+      },
+      possession: {
+        home: percentToNumber(getStat(homeMap, ["ball possession", "possession"])),
+        away: percentToNumber(getStat(awayMap, ["ball possession", "possession"])),
+      },
+      totalPasses: {
+        home: maybeNumber(getStat(homeMap, ["total passes"])),
+        away: maybeNumber(getStat(awayMap, ["total passes"])),
+      },
+      passesAccurate: {
+        home: maybeNumber(getStat(homeMap, ["passes accurate"])),
+        away: maybeNumber(getStat(awayMap, ["passes accurate"])),
+      },
+      fouls: {
+        home: maybeNumber(getStat(homeMap, ["fouls"])),
+        away: maybeNumber(getStat(awayMap, ["fouls"])),
+      },
+      yellow: {
+        home: maybeNumber(getStat(homeMap, ["yellow cards"])),
+        away: maybeNumber(getStat(awayMap, ["yellow cards"])),
+      },
+      red: {
+        home: maybeNumber(getStat(homeMap, ["red cards"])),
+        away: maybeNumber(getStat(awayMap, ["red cards"])),
+      },
+      attacksDangerous: {
+        home: maybeNumber(getStat(homeMap, ["dangerous attacks"])),
+        away: maybeNumber(getStat(awayMap, ["dangerous attacks"])),
+      },
+      attacks: {
+        home: maybeNumber(getStat(homeMap, ["attacks"])),
+        away: maybeNumber(getStat(awayMap, ["attacks"])),
+      },
+      expectedGoals: {
+        home: null,
+        away: null,
+        total: null,
+      },
+    },
+  };
+
+  // xG (Expected Goals)
+  const xgHome = maybeNumber(getStat(homeMap, ["expected goals", "xg"]));
+  const xgAway = maybeNumber(getStat(awayMap, ["expected goals", "xg"]));
+  norm.parsed.expectedGoals.home = xgHome;
+  norm.parsed.expectedGoals.away = xgAway;
+  if (Number.isFinite(xgHome) && Number.isFinite(xgAway)) {
+    norm.parsed.expectedGoals.total = +(xgHome + xgAway).toFixed(2);
+  }
+
+  return norm;
+}
+
+// ---------------- EVENTS COUNTS ----------------
+function countGoals(events) {
+  return (events || []).filter((e) => e?.type === "Goal").length;
+}
+function countReds(events) {
+  // Detail pode variar, então pega "Red Card", "Second Yellow Card", etc.
+  return (events || []).filter((e) => lower(e?.detail).includes("red")).length;
+}
+function countYellows(events) {
+  return (events || []).filter((e) => lower(e?.detail).includes("yellow")).length;
+}
+
+// ---------------- ODDS PARSER ----------------
+function extractOddsInRange(oddsResponse, oddMin, oddMax) {
+  const out = [];
+  for (const root of oddsResponse?.response || []) {
+    for (const bm of root?.bookmakers || []) {
+      for (const bet of bm?.bets || []) {
+        const market = String(bet?.name || "");
+        for (const v of bet?.values || []) {
+          const odd = safeNumber(v?.odd, NaN);
+          if (!Number.isFinite(odd)) continue;
+          if (odd < oddMin || odd > oddMax) continue;
+
+          out.push({
+            // ODD_ID do seu catálogo (por snapshot)
+            id: out.length + 1,
+            bookmaker: String(bm?.name || ""),
+            market,
+            selection: String(v?.value || ""),
+            odd,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------- PROBABILITY + EV ENGINE ----------------
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+function computeP_from_xgWinner(xgHome, xgAway, scoreH, scoreA, elapsed, side) {
+  // side: "home"|"away"|"draw"
+  const t = clamp(safeNumber(elapsed, 0), 0, 90);
+  const lead = (scoreH - scoreA);
+  const xgd = (safeNumber(xgHome, 0) - safeNumber(xgAway, 0));
+
+  // urgência/tempo: quanto mais tarde, mais o placar pesa
+  const timeWeight = clamp(t / 90, 0.05, 1.0);
+  const xgWeight = 1.0 - 0.35 * timeWeight;
+
+  // vantagem home/away
+  const strength = (xgd * xgWeight) + (lead * (0.9 * timeWeight));
+
+  // draw: prob maior quando jogo equilibrado e placar empatado
+  if (side === "draw") {
+    const balance = Math.abs(xgd) + Math.abs(lead);
+    const base = 0.26 + 0.10 * (1 - timeWeight); // mais cedo -> mais empate
+    const p = clamp(base * Math.exp(-0.85 * balance), 0.05, 0.55);
+    return p;
+  }
+
+  const dir = side === "home" ? 1 : -1;
+  const p = sigmoid(dir * strength * 1.4);
+  // limites conservadores
+  return clamp(p, 0.05, 0.92);
+}
+
+function computeP_over_under_goals(xgTotal, goalsTotal, elapsed, line, over) {
+  const t = clamp(safeNumber(elapsed, 0), 1, 90);
+  const g = safeNumber(goalsTotal, 0);
+  const xg = safeNumber(xgTotal, 0);
+
+  // expectativa final aproximada: combina xG + ritmo real (g/t)
+  const paceG = (g / t) * 90;
+  const expFinal = 0.65 * xg + 0.35 * paceG;
+
+  // delta para a linha
+  const delta = (expFinal - line);
+
+  // ajuste por tempo: quanto mais tarde, menos variância
+  const late = clamp(t / 90, 0, 1);
+  const k = 1.15 + 0.9 * late;
+
+  const pOver = sigmoid(delta * k);
+  const p = over ? pOver : (1 - pOver);
+
+  return clamp(p, 0.05, 0.95);
+}
+
+function computeP_over_under_corners(cornersTotal, elapsed, line, over) {
+  const t = clamp(safeNumber(elapsed, 0), 1, 90);
+  const c = safeNumber(cornersTotal, 0);
+
+  // projeção simples por ritmo
+  const pace = (c / t) * 90;
+  const delta = (pace - line);
+
+  const late = clamp(t / 90, 0, 1);
+  const k = 1.1 + 0.8 * late;
+
+  const pOver = sigmoid(delta * k);
+  const p = over ? pOver : (1 - pOver);
+
+  return clamp(p, 0.05, 0.95);
+}
+
+function computeP_over_under_cards(cardsTotal, elapsed, line, over) {
+  const t = clamp(safeNumber(elapsed, 0), 1, 90);
+  const c = safeNumber(cardsTotal, 0);
+
+  const pace = (c / t) * 90;
+  const delta = (pace - line);
+
+  const late = clamp(t / 90, 0, 1);
+  const k = 1.05 + 0.7 * late;
+
+  const pOver = sigmoid(delta * k);
+  const p = over ? pOver : (1 - pOver);
+
+  return clamp(p, 0.05, 0.95);
+}
+
+function computeP_btts(xgHome, xgAway, shotsOnGoalHome, shotsOnGoalAway, elapsed, goalsH, goalsA) {
+  const t = clamp(safeNumber(elapsed, 0), 1, 90);
+
+  // já saiu gol pros 2 => BTTS quase certo
+  if (safeNumber(goalsH, 0) > 0 && safeNumber(goalsA, 0) > 0) return 0.96;
+
+  const xgH = safeNumber(xgHome, 0);
+  const xgA = safeNumber(xgAway, 0);
+  const sotH = safeNumber(shotsOnGoalHome, 0);
+  const sotA = safeNumber(shotsOnGoalAway, 0);
+
+  // proxy de chance de marcar:
+  const rateH = 0.65 * xgH + 0.35 * ((sotH / t) * 90) * 0.12;
+  const rateA = 0.65 * xgA + 0.35 * ((sotA / t) * 90) * 0.12;
+
+  // converte pra prob de pelo menos 1 gol (Poisson-like aproximado)
+  const pH = clamp(1 - Math.exp(-rateH), 0.05, 0.98);
+  const pA = clamp(1 - Math.exp(-rateA), 0.05, 0.98);
+
+  const pBTTS = clamp(pH * pA, 0.05, 0.95);
+
+  // mais tarde e ainda 0 do time -> reduz
+  const late = clamp(t / 90, 0, 1);
+  if (late > 0.7) return clamp(pBTTS - 0.10, 0.05, 0.90);
+
+  return pBTTS;
+}
+
+function parseLineFromSelection(sel) {
+  // tenta extrair linha "2.5", "9.5", etc
+  const m = String(sel ?? "").match(/([0-9]+(?:\.[0-9]+)?)/);
+  return m ? safeNumber(m[1], NaN) : NaN;
+}
+
+function estimateProbabilityForOdd(oddItem, snap) {
+  const market = lower(oddItem?.market);
+  const selRaw = String(oddItem?.selection ?? "");
+  const sel = lower(selRaw);
+
+  const elapsed = safeNumber(snap?.match?.time?.elapsed, 0);
+  const goalsH = safeNumber(snap?.match?.score?.home, 0);
+  const goalsA = safeNumber(snap?.match?.score?.away, 0);
+  const goalsTotal = goalsH + goalsA;
+
+  const stats = snap?.stats?.norm?.parsed;
+  const xgHome = stats?.expectedGoals?.home;
+  const xgAway = stats?.expectedGoals?.away;
+  const xgTotal = stats?.expectedGoals?.total;
+
+  const cornersH = safeNumber(stats?.corners?.home, 0);
+  const cornersA = safeNumber(stats?.corners?.away, 0);
+  const cornersTotal = cornersH + cornersA;
+
+  const yH = safeNumber(stats?.yellow?.home, 0);
+  const yA = safeNumber(stats?.yellow?.away, 0);
+  const rH = safeNumber(stats?.red?.home, 0);
+  const rA = safeNumber(stats?.red?.away, 0);
+  const cardsTotal = yH + yA + rH + rA;
+
+  const sotH = safeNumber(stats?.shotsOnGoal?.home, 0);
+  const sotA = safeNumber(stats?.shotsOnGoal?.away, 0);
+
+  // anti-under cedo (igual sua regra)
+  const isUnderMarket = market.includes("under") || sel.includes("under") || sel.includes("menos");
+  if (elapsed < 25 && isUnderMarket) {
+    // bloqueia UNDER cedo (IA pode receber como "blocked")
+    return { p: null, reason: "UNDER_TOO_EARLY" };
+  }
+
+  // 1X2 / Match Winner
+  if (market.includes("match winner") || market.includes("match odds") || market === "1x2") {
+    if (sel.includes("home") || sel.includes("casa") || sel === "1") {
+      return { p: computeP_from_xgWinner(xgHome, xgAway, goalsH, goalsA, elapsed, "home"), reason: "MODEL_1X2" };
+    }
+    if (sel.includes("away") || sel.includes("fora") || sel === "2") {
+      return { p: computeP_from_xgWinner(xgHome, xgAway, goalsH, goalsA, elapsed, "away"), reason: "MODEL_1X2" };
+    }
+    if (sel.includes("draw") || sel.includes("empate") || sel === "x") {
+      return { p: computeP_from_xgWinner(xgHome, xgAway, goalsH, goalsA, elapsed, "draw"), reason: "MODEL_1X2" };
+    }
+  }
+
+  // BTTS
+  if (market.includes("both teams to score") || market.includes("btts") || market.includes("both teams score")) {
+    if (sel.includes("yes") || sel.includes("sim")) {
+      return { p: computeP_btts(xgHome, xgAway, sotH, sotA, elapsed, goalsH, goalsA), reason: "MODEL_BTTS" };
+    }
+    if (sel.includes("no") || sel.includes("não") || sel.includes("nao")) {
+      const pYes = computeP_btts(xgHome, xgAway, sotH, sotA, elapsed, goalsH, goalsA);
+      return { p: clamp(1 - pYes, 0.05, 0.95), reason: "MODEL_BTTS" };
+    }
+  }
+
+  // Over/Under Goals
+  if (market.includes("over/under") && (market.includes("goals") || market.includes("goal"))) {
+    const line = parseLineFromSelection(selRaw);
+    if (!Number.isFinite(line)) return { p: null, reason: "NO_LINE" };
+    if (sel.includes("over") || sel.includes("mais")) {
+      return { p: computeP_over_under_goals(xgTotal, goalsTotal, elapsed, line, true), reason: "MODEL_OU_GOALS" };
+    }
+    if (sel.includes("under") || sel.includes("menos")) {
+      return { p: computeP_over_under_goals(xgTotal, goalsTotal, elapsed, line, false), reason: "MODEL_OU_GOALS" };
+    }
+  }
+
+  // Over/Under Corners
+  if (market.includes("corners") || market.includes("corner")) {
+    const line = parseLineFromSelection(selRaw);
+    if (!Number.isFinite(line)) return { p: null, reason: "NO_LINE" };
+    if (sel.includes("over") || sel.includes("mais")) {
+      return { p: computeP_over_under_corners(cornersTotal, elapsed, line, true), reason: "MODEL_OU_CORNERS" };
+    }
+    if (sel.includes("under") || sel.includes("menos")) {
+      return { p: computeP_over_under_corners(cornersTotal, elapsed, line, false), reason: "MODEL_OU_CORNERS" };
+    }
+  }
+
+  // Cards (Over/Under)
+  if (market.includes("cards") || market.includes("card") || market.includes("yellow")) {
+    const line = parseLineFromSelection(selRaw);
+    if (!Number.isFinite(line)) return { p: null, reason: "NO_LINE" };
+    if (sel.includes("over") || sel.includes("mais")) {
+      return { p: computeP_over_under_cards(cardsTotal, elapsed, line, true), reason: "MODEL_OU_CARDS" };
+    }
+    if (sel.includes("under") || sel.includes("menos")) {
+      return { p: computeP_over_under_cards(cardsTotal, elapsed, line, false), reason: "MODEL_OU_CARDS" };
+    }
+  }
+
+  // fallback (não reconhecido)
+  return { p: null, reason: "UNSUPPORTED_MARKET" };
+}
+
+function computeTopEVs(snap) {
+  const out = [];
+  const elapsed = safeNumber(snap?.match?.time?.elapsed, 0);
+
+  // se muito cedo, ainda computa EV mas IA vai barrar pelo hard rule
+  for (const oddItem of snap?.odds || []) {
+    const odd = safeNumber(oddItem?.odd, NaN);
+    if (!Number.isFinite(odd)) continue;
+
+    const { p, reason } = estimateProbabilityForOdd(oddItem, snap);
+    if (!Number.isFinite(p)) {
+      out.push({
+        odd_id: oddItem?.id,
+        market: oddItem?.market,
+        selection: oddItem?.selection,
+        odd: oddItem?.odd,
+        p: null,
+        ev: null,
+        blocked_reason: reason || "NO_P",
+      });
+      continue;
+    }
+
+    // EV = P*odd - 1
+    const ev = +(p * odd - 1).toFixed(4);
+
+    out.push({
+      odd_id: oddItem?.id,
+      market: oddItem?.market,
+      selection: oddItem?.selection,
+      odd: +odd.toFixed(2),
+      p: +p.toFixed(4),
+      ev,
+      minute: elapsed,
+      model: reason || "MODEL",
+    });
+  }
+
+  // filtra só os com EV válido e > 0 (edge)
+  const valid = out
+    .filter((x) => Number.isFinite(x?.ev) && x.ev > 0)
+    .sort((a, b) => (b.ev - a.ev));
+
+  // mantém top 12 (economia no prompt)
+  const top = valid.slice(0, 12);
+
+  return { top, available: top.length > 0, debug_all: out };
+}
+
 // ---------------- SNAPSHOT ENGINE ----------------
 async function buildSnapshot(fixtureId) {
   console.log("[SNAPSHOT] building", fixtureId);
@@ -92,6 +542,8 @@ async function buildSnapshot(fixtureId) {
   const item = fx?.response?.[0];
   if (!item) return null;
 
+  const elapsed = safeNumber(item?.fixture?.status?.elapsed, 0);
+
   const snapshot = {
     match: {
       fixtureId,
@@ -99,53 +551,64 @@ async function buildSnapshot(fixtureId) {
         home: item?.teams?.home?.name ?? "Home",
         away: item?.teams?.away?.name ?? "Away",
       },
-      time: { elapsed: safeNumber(item?.fixture?.status?.elapsed) },
+      time: { elapsed },
       score: {
         home: safeNumber(item?.goals?.home),
         away: safeNumber(item?.goals?.away),
       },
+      status: item?.fixture?.status ?? null,
+      league: item?.league ?? null,
     },
-    events: { goals: 0, redcards: 0 },
+    events: {
+      goals: 0,
+      yellowcards: 0,
+      redcards: 0,
+      raw: [],
+    },
     odds: [],
-    stats: { available: false, data: null },
+    stats: {
+      available: false,
+      data: null,     // bruto da API
+      norm: null,     // normalizado e parseado
+    },
+    ev: {
+      top_evs: [],
+      top_evs_available: false,
+      debug_all: [],
+    },
   };
 
   // EVENTS
   const ev = await apiSports("/fixtures/events", { fixture: fixtureId });
   const events = ev?.response || [];
-  snapshot.events = {
-    goals: events.filter((e) => e?.type === "Goal").length,
-    redcards: events.filter((e) =>
-      String(e?.detail || "").toLowerCase().includes("red")
-    ).length,
-  };
+  snapshot.events.raw = events;
 
-  // ODDS (CATÁLOGO PARA ODD_ID)
+  snapshot.events.goals = countGoals(events);
+  snapshot.events.yellowcards = countYellows(events);
+  snapshot.events.redcards = countReds(events);
+
+  // ODDS (somente odds no range)
   const odds = await apiSports("/odds/live", { fixture: fixtureId });
-  for (const root of odds?.response || []) {
-    for (const bm of root?.bookmakers || []) {
-      for (const bet of bm?.bets || []) {
-        for (const v of bet?.values || []) {
-          const odd = safeNumber(v?.odd);
-          if (odd >= ODD_MIN && odd <= ODD_MAX) {
-            snapshot.odds.push({
-              id: snapshot.odds.length + 1, // ODD_ID do seu catálogo (por snapshot)
-              market: String(bet?.name || ""),
-              selection: String(v?.value || ""),
-              odd,
-            });
-          }
-        }
-      }
+  snapshot.odds = extractOddsInRange(odds, ODD_MIN, ODD_MAX);
+
+  // STATS (só se tiver odds válidas no range -> economia)
+  if (snapshot.odds.length > 0) {
+    const stats = await apiSports("/fixtures/statistics", { fixture: fixtureId });
+    const resp = stats?.response || [];
+
+    if (resp.length >= 2) {
+      snapshot.stats.available = true;
+      snapshot.stats.data = resp;
+      snapshot.stats.norm = normalizeStats(resp);
     }
   }
 
-  // STATS só se existir odd válida
-  if (snapshot.odds.length > 0) {
-    const stats = await apiSports("/fixtures/statistics", { fixture: fixtureId });
-    if ((stats?.response || []).length >= 2) {
-      snapshot.stats = { available: true, data: stats.response };
-    }
+  // EV (só calcula se tiver stats + odds)
+  if (snapshot.odds.length > 0 && snapshot.stats.available && snapshot.stats.norm) {
+    const { top, available, debug_all } = computeTopEVs(snapshot);
+    snapshot.ev.top_evs = top;
+    snapshot.ev.top_evs_available = available;
+    snapshot.ev.debug_all = debug_all;
   }
 
   return snapshot;
@@ -182,94 +645,57 @@ async function getAI(snapshot, fixtureId) {
 
   const p = (async () => {
     try {
-      const aiData = {
+      const aiInput = {
         match: snapshot.match,
         live: {
+          // odds selecionadas (range) com ODD_ID real
           odds: snapshot.odds,
-          events: snapshot.events,
-          statistics: snapshot.stats.data,
-          top_evs: [],
-          top_evs_available: false,
+
+          // eventos + cartões + gols
+          events: {
+            goals: snapshot.events.goals,
+            yellowcards: snapshot.events.yellowcards,
+            redcards: snapshot.events.redcards,
+          },
+
+          // TODAS as estatísticas (raw + normalizadas)
+          statistics_raw: snapshot.stats.data,
+          statistics_norm: snapshot.stats.norm,
+
+          // ✅ EV pré-calculado
+          top_evs: snapshot.ev.top_evs,
+          top_evs_available: snapshot.ev.top_evs_available,
         },
       };
 
       const prompt = `Você é o "PredictIA Engine v2.1 Elite", um sistema de inteligência quantitativa para futebol ao vivo.
 
 MISSÃO:
-Sua tarefa é realizar a convergência entre a ARBITRAGEM MATEMÁTICA e o MOMENTUM DO JOGO.
-Você deve escolher 1 (um) único palpite que represente o maior "Edge" (vantagem) real no momento.
+Escolher 1 (um) único palpite com maior "Edge" real AGORA.
 
-════════════════════════════════════
-PROTOCOLO DE DECISÃO (ORDEM DE PESO)
-════════════════════════════════════
+REGRAS DE SAÍDA (PT-BR, texto simples, sem markdown):
+Recomendação: <mercado + linha + período> (ALVO: JOGO|CASA|FORA) [ODD_ID=<N>]
+Odd: <X.XX>
+Probabilidade de Green: <XX%>
+EV: <+0.00>
+Risco: baixo|médio|alto
+Justificativa: <1 frase ligando EV + stats/xG + game state>
 
-1. FILTRO DE EV (EXPECTED VALUE):
+HARD RULES:
+- Se match.time.elapsed < 10 -> "INSUFFICIENT DATA — match too early for analysis."
+- Proibido inventar ODD_ID: use apenas os IDs de live.odds
+- Odd obrigatoriamente entre ${ODD_MIN.toFixed(2)} e ${ODD_MAX.toFixed(2)}
 - Se live.top_evs_available = true:
-  * O palpite DEVE ser extraído obrigatoriamente da lista live.top_evs (já ordenada por EV% desc).
-  * Analise o item #1. Se o cenário de jogo (momentum) for contrário, descarte como "VALUE TRAP" e avalie o item #2, sucessivamente.
-  * Se nenhum item da lista sobreviver ao filtro de momentum, RECUSE a análise.
+  * O palpite DEVE sair de live.top_evs (lista já ordenada por EV desc).
+  * Se o cenário (momentum/game state) contradizer, descarte como VALUE TRAP e avalie o próximo item.
+  * Se nenhum sobreviver, recuse sem palpite.
 
-- Se live.top_evs_available = false:
-  * Não há consenso multi-book. Seja EXTREMAMENTE conservador.
-  * Só recomende se houver distorção óbvia baseada em estatísticas fortes (ex: DAPM > 1.2).
+FILTRO ANTI-UNDER-CEDO:
+- Proibido recomendar "Menos de X gols" se match.time.elapsed < 25
+- Se bloqueado, responda: "SEM OPORTUNIDADE — Minuto cedo para Under; risco alto de mudança de ritmo."
 
-2. VALIDAÇÃO DE MOMENTUM (FILTRO DE CAMPO):
-- DAPM (Ataques Perigosos/Min):
-  * Se o palpite é a favor de um time (Vitória, Handicap, Over Gols dele),
-    o DAPM desse time nos últimos 10–15 min deve ser > 0.7.
-- CONVERSÃO:
-  * Use SOT (Chutes no Gol). Se volume alto e SOT baixo, reduza P.
-- GAME STATE:
-  * Favorito perdendo em casa = urgência alta.
-  * Time vencendo por 2+ = tendência de desaceleração.
-  * Nunca aplique urgência sem confirmar em DAPM/momentum.
-
-3. REGRAS DE SEGURANÇA (HARD RULES):
-- Se match.elapsed < 10:
-  -> Responda APENAS:
-  "INSUFFICIENT DATA — match too early for analysis."
-- EXPULSÕES:
-  * Se o time do palpite tiver vermelho:
-    - Reduza P em no mínimo 30 pontos percentuais ou recuse.
-    - Reavalie usando apenas dados pós-expulsão.
-- ODDS:
-  * Odd deve estar obrigatoriamente entre ${ODD_MIN.toFixed(2)} e ${ODD_MAX.toFixed(2)}.
-- CONSISTÊNCIA:
-  * Use ODD_ID real do catálogo live.odds. Proibido inventar IDs.
-
-════════════════════════════════════
-FILTRO ANTI-UNDER-CEDO (OBRIGATÓRIO)
-════════════════════════════════════
-- Proibido recomendar qualquer mercado de "Menos de X gols" se match.elapsed < 25.
-- Exceção (raríssima): só permitir UNDER antes de 25 se TODAS as condições abaixo forem verdade:
-  1) Placar 0-0
-  2) SOT_total <= 1
-  3) DAPM_total < 0.9
-  4) Probabilidade de Green >= 70%
-  5) EV >= +0.06
-  6) redcards = 0
-  7) Não é favorito perdendo em casa
-- Se o filtro bloquear:
-  -> Retorne SEM OPORTUNIDADE
-  -> Justificativa obrigatória: "Minuto cedo para Under; risco alto de mudança de ritmo."
-
-4. FILTRO DE EDGE FINAL:
-- Só prossiga se:
-  (P_decimal * odd) > 1.08
-  e EV positivo.
-
-════════════════════════════════════
-REGRAS DE SAÍDA (FORMATO ESTRITO)
-════════════════════════════════════
-Recomendação: <palpite> [ODD_ID=<N>]
-Odd:
-Probabilidade de Green:
-EV:
-Risco:
-Justificativa:
-
-DADOS PARA PROCESSAMENTO
-${JSON.stringify(aiData)}`;
+DADOS PARA PROCESSAMENTO (JSON):
+${JSON.stringify(aiInput)}`;
 
       const model = genAI.getGenerativeModel({ model: GENAI_MODEL_RAW });
       const res = await model.generateContent(prompt);
@@ -291,29 +717,15 @@ ${JSON.stringify(aiData)}`;
 
 // ---------------- ROUTES ----------------
 
-// ✅ LISTA DE JOGOS AO VIVO (para sua tela de seleção)
+// ✅ LISTA DE JOGOS AO VIVO (COMPAT APP: { status:"ok", data:[...] })
 app.get("/football/live", async (req, res) => {
   try {
     const liveList = await fetchLiveFixtures();
+    const data = (liveList || [])
+      .map(ADAPTERS.football.extractLiveScore)
+      .filter((g) => isValidFixtureId(Number(g?.fixtureId)));
 
-    // resposta enxuta (mantém info essencial)
-    const games = liveList.map((it) => ({
-      fixtureId: safeNumber(it?.fixture?.id),
-      league: it?.league?.name ?? "",
-      country: it?.league?.country ?? "",
-      teams: {
-        home: it?.teams?.home?.name ?? "",
-        away: it?.teams?.away?.name ?? "",
-      },
-      elapsed: safeNumber(it?.fixture?.status?.elapsed),
-      status: it?.fixture?.status?.short ?? "",
-      score: {
-        home: safeNumber(it?.goals?.home),
-        away: safeNumber(it?.goals?.away),
-      },
-    })).filter((g) => isValidFixtureId(g.fixtureId));
-
-    res.json({ status: "ok", games });
+    res.json({ status: "ok", data });
   } catch (e) {
     console.error("[LIVE ERROR]", e.message);
     res.status(500).json({ error: "Erro ao buscar jogos ao vivo" });
@@ -333,6 +745,8 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     if (!snap) return res.status(404).json({ error: "Jogo não encontrado" });
 
     const ai = await getAI(snap, fixtureId);
+
+    // snapshot inclui odds filtradas + stats + EV calculado (debug_all fica no snapshot.ev.debug_all)
     res.json({ status: "ok", snapshot: snap, ai });
   } catch (e) {
     console.error("[ROUTE ERROR]", fixtureId, e.message);
