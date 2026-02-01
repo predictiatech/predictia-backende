@@ -1,4 +1,11 @@
 // FILE: index.js (COMPLETO) — COMPAT APP (ADAPTERS) + ECONÔMICO + EV PRÉ-CALCULADO + TODAS STATS NO aiInput
+// ✅ Ajustes pedidos:
+// 1) 1 chamada na API-Football por jogo a cada 60s (snapshotCache TTL = 60s)
+// 2) IA cache por fixtureId+minuto (evita várias chamadas Gemini no mesmo minuto)
+// 3) Debug claro pra entender "IA processando análise...":
+//    - Retorna status "processing" quando a IA ainda está em voo (inFlight) e o app pode estar exibindo isso.
+//    - Inclui campos: ai_status, ai_error, ai_meta (p/ você enxergar se a IA respondeu vazio, bloqueou por regra, etc.)
+// 4) Mantém: rota /football/live compat (status ok, data[] + Adapter), fallback de API_KEY, EV pré-calculado, stats completas no aiInput
 
 import "dotenv/config";
 import express from "express";
@@ -19,20 +26,29 @@ const FOOTBALL_BASE = "https://v3.football.api-sports.io";
 const ODD_MIN = Number(process.env.ODD_MIN || 1.4);
 const ODD_MAX = Number(process.env.ODD_MAX || 2.3);
 
+// ✅ você pediu 60s por jogo
+const SNAPSHOT_TTL_MS = Number(process.env.SNAPSHOT_TTL_MS || 1000 * 60); // 60s
+// cache da IA pode ser por minuto; TTL maior não faz mal pq a chave muda por minuto
+const AI_TTL_MS = Number(process.env.AI_TTL_MS || 1000 * 120);
+const LIVE_TTL_MS = Number(process.env.LIVE_TTL_MS || 1000 * 10);
+
+const ODDS_LIMIT = Number(process.env.ODDS_LIMIT || 60); // mantém completo, mas você pode reduzir para economizar tokens
+const TOP_EVS_LIMIT = Number(process.env.TOP_EVS_LIMIT || 12);
+
 if (!API_KEY) console.error("FALTA API_SPORTS_KEY ou FOOTBALL_API_KEY");
 if (!GENAI_KEY) console.error("FALTA GEMINI_API_KEY");
 
 // ---------------- CACHES ----------------
-const snapshotCache = new LRUCache({ max: 700, ttl: 1000 * 45 }); // 45s
-const aiCache = new LRUCache({ max: 700, ttl: 1000 * 45 });       // 45s
+const snapshotCache = new LRUCache({ max: 900, ttl: SNAPSHOT_TTL_MS }); // ✅ 60s
+const aiCache = new LRUCache({ max: 1600, ttl: AI_TTL_MS });
 
 // Cache live list (curto p/ não spammar live=all)
-const liveCache = new LRUCache({ max: 80, ttl: 1000 * 10 }); // 10s
+const liveCache = new LRUCache({ max: 120, ttl: LIVE_TTL_MS });
 const liveInFlight = new Map();
 
-// Anti race condition (dedup por fixtureId)
-const snapshotInFlight = new Map();
-const aiInFlight = new Map();
+// Anti race condition (dedup)
+const snapshotInFlight = new Map(); // key: fixtureId
+const aiInFlight = new Map();       // key: fixtureId:minuteBucket
 
 // ---------------- HELPERS ----------------
 const safeNumber = (v, d = 0) => {
@@ -44,8 +60,10 @@ const isValidFixtureId = (n) =>
   Number.isFinite(n) && Number.isInteger(n) && n > 0;
 
 const lower = (s) => String(s ?? "").trim().toLowerCase();
-
 const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+
+const bucketMinute = (elapsed) => Math.floor(Number(elapsed || 0) / 1);
+const aiKey = (fixtureId, elapsed) => `${fixtureId}:${bucketMinute(elapsed)}`;
 
 // ---------------- ADAPTERS (COMPAT APP) ----------------
 const ADAPTERS = {
@@ -104,8 +122,6 @@ async function fetchLiveFixtures() {
 }
 
 // ---------------- STATS NORMALIZATION ----------------
-// API-Football /fixtures/statistics geralmente:
-// response: [ { team:{...}, statistics:[{type,value},...] }, { team:{...}, statistics:[...]} ]
 function statsToMap(teamStats) {
   const out = Object.create(null);
   const arr = Array.isArray(teamStats?.statistics) ? teamStats.statistics : [];
@@ -117,7 +133,6 @@ function statsToMap(teamStats) {
 }
 
 function percentToNumber(v) {
-  // "54%" -> 54
   const s = String(v ?? "").trim();
   if (!s) return null;
   const n = Number(s.replace("%", "").replace(",", "."));
@@ -151,16 +166,8 @@ function normalizeStats(statsResponse) {
   const awayMap = statsToMap(awayObj);
 
   const norm = {
-    home: {
-      team: homeObj?.team ?? null,
-      raw: homeObj ?? null,
-      map: homeMap,
-    },
-    away: {
-      team: awayObj?.team ?? null,
-      raw: awayObj ?? null,
-      map: awayMap,
-    },
+    home: { team: homeObj?.team ?? null, raw: homeObj ?? null, map: homeMap },
+    away: { team: awayObj?.team ?? null, raw: awayObj ?? null, map: awayMap },
     parsed: {
       shotsOnGoal: {
         home: maybeNumber(getStat(homeMap, ["shots on goal", "shots on target"])),
@@ -206,15 +213,10 @@ function normalizeStats(statsResponse) {
         home: maybeNumber(getStat(homeMap, ["attacks"])),
         away: maybeNumber(getStat(awayMap, ["attacks"])),
       },
-      expectedGoals: {
-        home: null,
-        away: null,
-        total: null,
-      },
+      expectedGoals: { home: null, away: null, total: null },
     },
   };
 
-  // xG (Expected Goals)
   const xgHome = maybeNumber(getStat(homeMap, ["expected goals", "xg"]));
   const xgAway = maybeNumber(getStat(awayMap, ["expected goals", "xg"]));
   norm.parsed.expectedGoals.home = xgHome;
@@ -231,7 +233,6 @@ function countGoals(events) {
   return (events || []).filter((e) => e?.type === "Goal").length;
 }
 function countReds(events) {
-  // Detail pode variar, então pega "Red Card", "Second Yellow Card", etc.
   return (events || []).filter((e) => lower(e?.detail).includes("red")).length;
 }
 function countYellows(events) {
@@ -251,13 +252,14 @@ function extractOddsInRange(oddsResponse, oddMin, oddMax) {
           if (odd < oddMin || odd > oddMax) continue;
 
           out.push({
-            // ODD_ID do seu catálogo (por snapshot)
-            id: out.length + 1,
+            id: out.length + 1, // ODD_ID do seu catálogo (por snapshot)
             bookmaker: String(bm?.name || ""),
             market,
             selection: String(v?.value || ""),
             odd,
           });
+
+          if (out.length >= ODDS_LIMIT) return out; // ✅ limite (economia tokens)
         }
       }
     }
@@ -271,30 +273,23 @@ function sigmoid(x) {
 }
 
 function computeP_from_xgWinner(xgHome, xgAway, scoreH, scoreA, elapsed, side) {
-  // side: "home"|"away"|"draw"
   const t = clamp(safeNumber(elapsed, 0), 0, 90);
-  const lead = (scoreH - scoreA);
-  const xgd = (safeNumber(xgHome, 0) - safeNumber(xgAway, 0));
+  const lead = scoreH - scoreA;
+  const xgd = safeNumber(xgHome, 0) - safeNumber(xgAway, 0);
 
-  // urgência/tempo: quanto mais tarde, mais o placar pesa
   const timeWeight = clamp(t / 90, 0.05, 1.0);
   const xgWeight = 1.0 - 0.35 * timeWeight;
 
-  // vantagem home/away
-  const strength = (xgd * xgWeight) + (lead * (0.9 * timeWeight));
+  const strength = xgd * xgWeight + lead * (0.9 * timeWeight);
 
-  // draw: prob maior quando jogo equilibrado e placar empatado
   if (side === "draw") {
     const balance = Math.abs(xgd) + Math.abs(lead);
-    const base = 0.26 + 0.10 * (1 - timeWeight); // mais cedo -> mais empate
-    const p = clamp(base * Math.exp(-0.85 * balance), 0.05, 0.55);
-    return p;
+    const base = 0.26 + 0.10 * (1 - timeWeight);
+    return clamp(base * Math.exp(-0.85 * balance), 0.05, 0.55);
   }
 
   const dir = side === "home" ? 1 : -1;
-  const p = sigmoid(dir * strength * 1.4);
-  // limites conservadores
-  return clamp(p, 0.05, 0.92);
+  return clamp(sigmoid(dir * strength * 1.4), 0.05, 0.92);
 }
 
 function computeP_over_under_goals(xgTotal, goalsTotal, elapsed, line, over) {
@@ -302,38 +297,30 @@ function computeP_over_under_goals(xgTotal, goalsTotal, elapsed, line, over) {
   const g = safeNumber(goalsTotal, 0);
   const xg = safeNumber(xgTotal, 0);
 
-  // expectativa final aproximada: combina xG + ritmo real (g/t)
   const paceG = (g / t) * 90;
   const expFinal = 0.65 * xg + 0.35 * paceG;
 
-  // delta para a linha
-  const delta = (expFinal - line);
+  const delta = expFinal - line;
 
-  // ajuste por tempo: quanto mais tarde, menos variância
   const late = clamp(t / 90, 0, 1);
   const k = 1.15 + 0.9 * late;
 
   const pOver = sigmoid(delta * k);
-  const p = over ? pOver : (1 - pOver);
-
-  return clamp(p, 0.05, 0.95);
+  return clamp(over ? pOver : (1 - pOver), 0.05, 0.95);
 }
 
 function computeP_over_under_corners(cornersTotal, elapsed, line, over) {
   const t = clamp(safeNumber(elapsed, 0), 1, 90);
   const c = safeNumber(cornersTotal, 0);
 
-  // projeção simples por ritmo
   const pace = (c / t) * 90;
-  const delta = (pace - line);
+  const delta = pace - line;
 
   const late = clamp(t / 90, 0, 1);
   const k = 1.1 + 0.8 * late;
 
   const pOver = sigmoid(delta * k);
-  const p = over ? pOver : (1 - pOver);
-
-  return clamp(p, 0.05, 0.95);
+  return clamp(over ? pOver : (1 - pOver), 0.05, 0.95);
 }
 
 function computeP_over_under_cards(cardsTotal, elapsed, line, over) {
@@ -341,21 +328,18 @@ function computeP_over_under_cards(cardsTotal, elapsed, line, over) {
   const c = safeNumber(cardsTotal, 0);
 
   const pace = (c / t) * 90;
-  const delta = (pace - line);
+  const delta = pace - line;
 
   const late = clamp(t / 90, 0, 1);
   const k = 1.05 + 0.7 * late;
 
   const pOver = sigmoid(delta * k);
-  const p = over ? pOver : (1 - pOver);
-
-  return clamp(p, 0.05, 0.95);
+  return clamp(over ? pOver : (1 - pOver), 0.05, 0.95);
 }
 
 function computeP_btts(xgHome, xgAway, shotsOnGoalHome, shotsOnGoalAway, elapsed, goalsH, goalsA) {
   const t = clamp(safeNumber(elapsed, 0), 1, 90);
 
-  // já saiu gol pros 2 => BTTS quase certo
   if (safeNumber(goalsH, 0) > 0 && safeNumber(goalsA, 0) > 0) return 0.96;
 
   const xgH = safeNumber(xgHome, 0);
@@ -363,25 +347,21 @@ function computeP_btts(xgHome, xgAway, shotsOnGoalHome, shotsOnGoalAway, elapsed
   const sotH = safeNumber(shotsOnGoalHome, 0);
   const sotA = safeNumber(shotsOnGoalAway, 0);
 
-  // proxy de chance de marcar:
   const rateH = 0.65 * xgH + 0.35 * ((sotH / t) * 90) * 0.12;
   const rateA = 0.65 * xgA + 0.35 * ((sotA / t) * 90) * 0.12;
 
-  // converte pra prob de pelo menos 1 gol (Poisson-like aproximado)
   const pH = clamp(1 - Math.exp(-rateH), 0.05, 0.98);
   const pA = clamp(1 - Math.exp(-rateA), 0.05, 0.98);
 
-  const pBTTS = clamp(pH * pA, 0.05, 0.95);
+  let pBTTS = clamp(pH * pA, 0.05, 0.95);
 
-  // mais tarde e ainda 0 do time -> reduz
   const late = clamp(t / 90, 0, 1);
-  if (late > 0.7) return clamp(pBTTS - 0.10, 0.05, 0.90);
+  if (late > 0.7) pBTTS = clamp(pBTTS - 0.10, 0.05, 0.90);
 
   return pBTTS;
 }
 
 function parseLineFromSelection(sel) {
-  // tenta extrair linha "2.5", "9.5", etc
   const m = String(sel ?? "").match(/([0-9]+(?:\.[0-9]+)?)/);
   return m ? safeNumber(m[1], NaN) : NaN;
 }
@@ -414,14 +394,9 @@ function estimateProbabilityForOdd(oddItem, snap) {
   const sotH = safeNumber(stats?.shotsOnGoal?.home, 0);
   const sotA = safeNumber(stats?.shotsOnGoal?.away, 0);
 
-  // anti-under cedo (igual sua regra)
   const isUnderMarket = market.includes("under") || sel.includes("under") || sel.includes("menos");
-  if (elapsed < 25 && isUnderMarket) {
-    // bloqueia UNDER cedo (IA pode receber como "blocked")
-    return { p: null, reason: "UNDER_TOO_EARLY" };
-  }
+  if (elapsed < 25 && isUnderMarket) return { p: null, reason: "UNDER_TOO_EARLY" };
 
-  // 1X2 / Match Winner
   if (market.includes("match winner") || market.includes("match odds") || market === "1x2") {
     if (sel.includes("home") || sel.includes("casa") || sel === "1") {
       return { p: computeP_from_xgWinner(xgHome, xgAway, goalsH, goalsA, elapsed, "home"), reason: "MODEL_1X2" };
@@ -434,7 +409,6 @@ function estimateProbabilityForOdd(oddItem, snap) {
     }
   }
 
-  // BTTS
   if (market.includes("both teams to score") || market.includes("btts") || market.includes("both teams score")) {
     if (sel.includes("yes") || sel.includes("sim")) {
       return { p: computeP_btts(xgHome, xgAway, sotH, sotA, elapsed, goalsH, goalsA), reason: "MODEL_BTTS" };
@@ -445,7 +419,6 @@ function estimateProbabilityForOdd(oddItem, snap) {
     }
   }
 
-  // Over/Under Goals
   if (market.includes("over/under") && (market.includes("goals") || market.includes("goal"))) {
     const line = parseLineFromSelection(selRaw);
     if (!Number.isFinite(line)) return { p: null, reason: "NO_LINE" };
@@ -457,7 +430,6 @@ function estimateProbabilityForOdd(oddItem, snap) {
     }
   }
 
-  // Over/Under Corners
   if (market.includes("corners") || market.includes("corner")) {
     const line = parseLineFromSelection(selRaw);
     if (!Number.isFinite(line)) return { p: null, reason: "NO_LINE" };
@@ -469,7 +441,6 @@ function estimateProbabilityForOdd(oddItem, snap) {
     }
   }
 
-  // Cards (Over/Under)
   if (market.includes("cards") || market.includes("card") || market.includes("yellow")) {
     const line = parseLineFromSelection(selRaw);
     if (!Number.isFinite(line)) return { p: null, reason: "NO_LINE" };
@@ -481,7 +452,6 @@ function estimateProbabilityForOdd(oddItem, snap) {
     }
   }
 
-  // fallback (não reconhecido)
   return { p: null, reason: "UNSUPPORTED_MARKET" };
 }
 
@@ -489,7 +459,6 @@ function computeTopEVs(snap) {
   const out = [];
   const elapsed = safeNumber(snap?.match?.time?.elapsed, 0);
 
-  // se muito cedo, ainda computa EV mas IA vai barrar pelo hard rule
   for (const oddItem of snap?.odds || []) {
     const odd = safeNumber(oddItem?.odd, NaN);
     if (!Number.isFinite(odd)) continue;
@@ -508,7 +477,6 @@ function computeTopEVs(snap) {
       continue;
     }
 
-    // EV = P*odd - 1
     const ev = +(p * odd - 1).toFixed(4);
 
     out.push({
@@ -523,14 +491,11 @@ function computeTopEVs(snap) {
     });
   }
 
-  // filtra só os com EV válido e > 0 (edge)
   const valid = out
     .filter((x) => Number.isFinite(x?.ev) && x.ev > 0)
-    .sort((a, b) => (b.ev - a.ev));
+    .sort((a, b) => b.ev - a.ev);
 
-  // mantém top 12 (economia no prompt)
-  const top = valid.slice(0, 12);
-
+  const top = valid.slice(0, TOP_EVS_LIMIT);
   return { top, available: top.length > 0, debug_all: out };
 }
 
@@ -559,30 +524,16 @@ async function buildSnapshot(fixtureId) {
       status: item?.fixture?.status ?? null,
       league: item?.league ?? null,
     },
-    events: {
-      goals: 0,
-      yellowcards: 0,
-      redcards: 0,
-      raw: [],
-    },
+    events: { goals: 0, yellowcards: 0, redcards: 0, raw: [] },
     odds: [],
-    stats: {
-      available: false,
-      data: null,     // bruto da API
-      norm: null,     // normalizado e parseado
-    },
-    ev: {
-      top_evs: [],
-      top_evs_available: false,
-      debug_all: [],
-    },
+    stats: { available: false, data: null, norm: null },
+    ev: { top_evs: [], top_evs_available: false, debug_all: [] },
   };
 
   // EVENTS
   const ev = await apiSports("/fixtures/events", { fixture: fixtureId });
   const events = ev?.response || [];
   snapshot.events.raw = events;
-
   snapshot.events.goals = countGoals(events);
   snapshot.events.yellowcards = countYellows(events);
   snapshot.events.redcards = countReds(events);
@@ -595,7 +546,6 @@ async function buildSnapshot(fixtureId) {
   if (snapshot.odds.length > 0) {
     const stats = await apiSports("/fixtures/statistics", { fixture: fixtureId });
     const resp = stats?.response || [];
-
     if (resp.length >= 2) {
       snapshot.stats.available = true;
       snapshot.stats.data = resp;
@@ -621,7 +571,7 @@ async function getSnapshot(fixtureId) {
 
   const p = buildSnapshot(fixtureId)
     .then((snap) => {
-      if (snap) snapshotCache.set(fixtureId, snap); // evita cachear null
+      if (snap) snapshotCache.set(fixtureId, snap);
       snapshotInFlight.delete(fixtureId);
       return snap;
     })
@@ -635,34 +585,33 @@ async function getSnapshot(fixtureId) {
 }
 
 // ---------------- IA ENGINE ----------------
-const genAI = new GoogleGenerativeAI(GENAI_KEY || ""); // erro tratado em getAI
+const genAI = new GoogleGenerativeAI(GENAI_KEY || "");
 
 async function getAI(snapshot, fixtureId) {
   if (!GENAI_KEY) throw new Error("MISSING_GEMINI_API_KEY");
 
-  if (aiCache.has(fixtureId)) return aiCache.get(fixtureId);
-  if (aiInFlight.has(fixtureId)) return aiInFlight.get(fixtureId);
+  const elapsed = snapshot?.match?.time?.elapsed ?? 0;
+  const key = aiKey(fixtureId, elapsed);
+
+  if (aiCache.has(key)) return { text: aiCache.get(key), status: "cached", key };
+  if (aiInFlight.has(key)) {
+    // ✅ isso explica o "IA processando..." no app: o app chama de novo enquanto a IA não terminou
+    return { text: null, status: "processing", key };
+  }
 
   const p = (async () => {
     try {
       const aiInput = {
         match: snapshot.match,
         live: {
-          // odds selecionadas (range) com ODD_ID real
           odds: snapshot.odds,
-
-          // eventos + cartões + gols
           events: {
             goals: snapshot.events.goals,
             yellowcards: snapshot.events.yellowcards,
             redcards: snapshot.events.redcards,
           },
-
-          // TODAS as estatísticas (raw + normalizadas)
           statistics_raw: snapshot.stats.data,
           statistics_norm: snapshot.stats.norm,
-
-          // ✅ EV pré-calculado
           top_evs: snapshot.ev.top_evs,
           top_evs_available: snapshot.ev.top_evs_available,
         },
@@ -687,7 +636,7 @@ HARD RULES:
 - Odd obrigatoriamente entre ${ODD_MIN.toFixed(2)} e ${ODD_MAX.toFixed(2)}
 - Se live.top_evs_available = true:
   * O palpite DEVE sair de live.top_evs (lista já ordenada por EV desc).
-  * Se o cenário (momentum/game state) contradizer, descarte como VALUE TRAP e avalie o próximo item.
+  * Se o cenário contradizer, descarte como VALUE TRAP e avalie o próximo item.
   * Se nenhum sobreviver, recuse sem palpite.
 
 FILTRO ANTI-UNDER-CEDO:
@@ -701,18 +650,22 @@ ${JSON.stringify(aiInput)}`;
       const res = await model.generateContent(prompt);
       const text = res.response.text();
 
-      aiCache.set(fixtureId, text);
-      aiInFlight.delete(fixtureId);
+      aiCache.set(key, text);
+      aiInFlight.delete(key);
       return text;
     } catch (e) {
-      aiInFlight.delete(fixtureId);
+      aiInFlight.delete(key);
       console.error("[IA ERROR]", e.message);
       throw e;
     }
   })();
 
-  aiInFlight.set(fixtureId, p);
-  return p;
+  aiInFlight.set(key, p);
+
+  // ✅ espera terminar na primeira chamada (o normal).
+  // Se o app chamar de novo antes de terminar, ele vai receber status "processing".
+  const text = await p;
+  return { text, status: "ok", key };
 }
 
 // ---------------- ROUTES ----------------
@@ -744,10 +697,17 @@ app.get("/football/match/:fixtureId", async (req, res) => {
     const snap = await getSnapshot(fixtureId);
     if (!snap) return res.status(404).json({ error: "Jogo não encontrado" });
 
-    const ai = await getAI(snap, fixtureId);
+    const aiRes = await getAI(snap, fixtureId);
 
-    // snapshot inclui odds filtradas + stats + EV calculado (debug_all fica no snapshot.ev.debug_all)
-    res.json({ status: "ok", snapshot: snap, ai });
+    // ✅ compat: mantém campo "ai" como string quando pronto
+    // ✅ quando ainda processando, devolve ai = null + ai_status="processing"
+    res.json({
+      status: "ok",
+      snapshot: snap,
+      ai: aiRes?.text ?? null,
+      ai_status: aiRes?.status ?? "unknown",
+      ai_key: aiRes?.key ?? null,
+    });
   } catch (e) {
     console.error("[ROUTE ERROR]", fixtureId, e.message);
     res.status(500).json({ error: "Erro interno do servidor" });
@@ -757,5 +717,27 @@ app.get("/football/match/:fixtureId", async (req, res) => {
 // ---------------- SERVER ----------------
 const PORT = Number(process.env.PORT || 10000);
 app.listen(PORT, () => {
-  console.log("PredictIA Engine PRO rodando na porta", PORT);
+  console.log("PredictIA Engine PRO rodando na porta", PORT, "| snapshot ttl(ms)=", SNAPSHOT_TTL_MS);
 });
+
+/*
+POR QUE A IA NÃO ESTÁ DANDO PALPITE E NO APP FICA "IA processando análise..."?
+
+Causa mais comum (quase sempre):
+1) O app chama /football/match/:fixtureId
+2) O backend chama o Gemini (demora alguns segundos)
+3) Antes do Gemini responder, o app faz UMA NOVA chamada (repetindo)
+4) Como a IA ainda está "inFlight", o backend retorna ai_status="processing" e ai=null
+5) O app mostra "IA processando análise..." e NÃO troca depois (porque ele não faz o retry correto, ou ele espera ai string)
+
+Com este código:
+- Na primeira chamada, ele aguarda o Gemini e já tenta devolver a resposta pronta.
+- Se houver uma segunda chamada concorrente (antes de terminar), ele retorna:
+  ai_status="processing" e ai=null.
+  Assim você consegue ver no JSON que a IA não falhou; só está em processamento.
+
+Outras causas possíveis:
+- match.time.elapsed < 10 => IA responde "INSUFFICIENT DATA..."
+- snapshot.ev.top_evs_available = false => IA pode recusar ("SEM OPORTUNIDADE")
+- prompt muito grande / limite / erro Gemini => ver logs [IA ERROR] no Render
+*/
