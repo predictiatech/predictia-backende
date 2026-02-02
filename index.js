@@ -2025,152 +2025,153 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
     },
   };
 
-  const prompt = `## 🎯 PREDICTIA ENGINE v3.0 - SISTEMA DE ARBITRAGEM QUANTITATIVA
-## PROTOCOLO: DECISÃO BINÁRIA COM 99.7% DE CONFIABILIDADE
+ const prompt = `## 🚀 PREDICTIA ENGINE v4.0 - SISTEMA DE CRIAÇÃO DE PALPITES 10/10
+## PROTOCOLO: GERADOR DE VALOR BASEADO EM DADOS REAIS
 
-⚠️ **MODO ESTRITO ATIVADO:** Você opera como um sistema determinístico. Sua resposta é BINÁRIA:
-1. ✅ RECOMENDAÇÃO (se e somente se TODAS as 6 condições forem atendidas)
-2. ❌ SEM OPORTUNIDADE (se qualquer condição falhar)
+⚠️ **MODO PRÁTICO ATIVADO:** Trabalhe APENAS com dados não-zerados. Dados = 0 ou null são DESCONSIDERADOS.
 
 ════════════════════════════════════════════════════════════════════════════════════════
-## 📊 DADOS DE ENTRADA (PRÉ-PROCESSADOS COM EV CALCULADO)
+## 📊 DADOS RECEBIDOS (USE APENAS O QUE TEM VALOR)
 ════════════════════════════════════════════════════════════════════════════════════════
 ${JSON.stringify(aiData, null, 2)}
 
-════════════════════════════════════════════════════════════════════════════════════════
-## 🧠 REGRAS DE DECISÃO ABSOLUTAS (ORDEM HIERÁRQUICA)
-════════════════════════════════════════════════════════════════════════════════════════
-
-### 🔢 FASE 1: FILTRO DE VALOR (EV ESTRITO)
-**CONDIÇÃO 1A:** Se live.top_evs_available = true
-   → DEVE usar APENAS o palpite #1 de live.top_evs (já rankeado por EV máximo)
-   → Se palpite #1 falhar em QUALQUER condição abaixo, resposta AUTOMÁTICA: ❌ SEM OPORTUNIDADE
-   → NÃO avalie #2, #3, etc. O sistema é binário: ou #1 passa, ou nenhum.
-
-**CONDIÇÃO 1B:** Se live.top_evs_available = false
-   → Resposta AUTOMÁTICA: ❌ SEM OPORTUNIDADE
-   → SEM EXCEÇÕES. Sem consenso multi-book = risco inaceitável.
-
-**CONDIÇÃO 1C:** EV MÍNIMO
-   → EV ≥ +0.05 (5% de edge sobre a casa)
-   → Cálculo: (P_decimal * odd) - 1 ≥ 0.05
-
-### ⚽ FASE 2: FILTRO DE MOMENTUM REAL (DADOS LIVE)
-**CONDIÇÃO 2A:** ATAQUES PERIGOSOS (DAPM)
-   → Para palpite a favor do Time A: DAPM_A ≥ 0.8 nos últimos 10 minutos
-   → Para palpite a favor do Time B: DAPM_B ≥ 0.8 nos últimos 10 minutos
-   → Para mercados neutros (Over/Under): DAPM_total ≥ 1.0
-
-**CONDIÇÃO 2B:** CONVERSÃO REAL (SOT/ATAQUE)
-   → Razão SOT/Attacks ≥ 0.35 (time está convertendo ataques em chutes reais)
-   → Se SOT_total ≤ 1 após 15 minutos → ❌ SEM OPORTUNIDADE
-
-**CONDIÇÃO 2C:** ESTADO DO JOGO CONFIRMADO
-   → Se palpite = Vitória Casa: Time Casa NÃO pode estar perdendo por 2+
-   → Se palpite = Vitória Fora: Time Fora NÃO pode estar perdendo por 2+
-   → Se palpite = Empate: Diferença de gols ≤ 1
-
-### 🛡️ FASE 3: FILTROS DE SEGURANÇA (HARD STOPS)
-**CONDIÇÃO 3A:** TEMPO MÍNIMO
-   → match.elapsed ≥ 15 minutos
-   → Exceção para cartões/escanteios: ≥ 25 minutos
-   → ABAIXO DISSO: ❌ SEM OPORTUNIDADE
-
-**CONDIÇÃO 3B:** EXPULSÕES
-   → Time do palpite tem cartão vermelho? → ❌ SEM OPORTUNIDADE
-   → Time adversário tem cartão vermelho? → Recalcule probabilidade +15%
-
-**CONDIÇÃO 3C:** FAIXA DE ODD
-   → odd ≥ ${oddMin.toFixed(2)} E odd ≤ ${oddMax.toFixed(2)}
-   → Fora da faixa: ❌ SEM OPORTUNIDADE
-
-**CONDIÇÃO 3D:** UNDER CEDO (REGRA DE OURO)
-   → Se palpite contém "Menos", "Under", "Poucos gols", "Sem mais gols":
-      * match.elapsed ≥ 30 minutos
-      * E DAPM_total ≤ 0.7
-      * E SOT_total ≤ 2
-   → Violação: ❌ SEM OPORTUNIDADE
-
-### 📈 FASE 4: CONVERGÊNCIA ESTATÍSTICA
-**CONDIÇÃO 4A:** POSSE DE BOLA vs. MOMENTUM
-   → Se time tem posse >60% mas DAPM < 0.5 → DESCONSIDERE posse
-   → O que importa é DAPM, não posse vazia
-
-**CONDIÇÃO 4B:** ESCANTEIOS CONFIRMAM DOMÍNIO
-   → Para palpite a favor do time: Corners a favor ≥ 2 nos últimos 15min
-   → Ou crescimento ≥ 50% em relação à média
-
-**CONDIÇÃO 4C:** CARTÕES (APENAS PARA MERCADOS ESPECÍFICOS)
-   → Para palpite de cartões: ≥ 0.5 cartões/10min no ritmo atual
-   → Ou arbitro com média histórica ≥ 4.5 cartões/jogo
-
-### 🎯 FASE 5: PROBABILIDADE CONSOLIDADA
-**CONDIÇÃO 5A:** PROBABILIDADE MÍNIMA
-   → P_decimal ≥ 0.60 (60% de chance real)
-   → Ou P_decimal * odd ≥ 1.08 (8% de valor)
-
-**CONDIÇÃO 5B:** MARGEM DE SEGURANÇA
-   → Probabilidade calculada - Margem da casa ≥ 10%
-   → Margem = (1/odd) - P_decimal
-
-### ⚡ FASE 6: VALIDAÇÃO FINAL (TRIPLE CHECK)
-**CONDIÇÃO 6A:** ODD ESTÁVEL
-   → Odd NÃO pode cair >0.20 nos últimos 2 minutos
-   → Queda rápida = smart money saindo
-
-**CONDIÇÃO 6B:** VOLUME CONFIRMA
-   → Para o mercado específico: volume de apostas ≥ médio
-   → Ou odd se mantém estável com volume alto
-
-**CONDIÇÃO 6C:** SINERGIA DE DADOS
-   → DAPM + SOT + Corners + xG devem convergir na mesma direção
-   → Se houver contradição (ex: DAPM alto mas SOT baixo) → ❌ SEM OPORTUNIDADE
+REGRA ABSOLUTA: Se dado = 0, null ou não existe → NÃO USE. Ignore completamente.
 
 ════════════════════════════════════════════════════════════════════════════════════════
-## 💎 SISTEMA DE SAÍDA (FORMATO ABSOLUTO)
+## 🧠 SISTEMA DE PRIORIZAÇÃO DE DADOS
 ════════════════════════════════════════════════════════════════════════════════════════
 
-### ❌ CASO 1: QUALQUER CONDIÇÃO FALHAR
-Responda EXATAMENTE (2 linhas, sem extras):
-SEM OPORTUNIDADE
-Motivo: [INSIRA O PRIMEIRO MOTIVO QUE FALHOU]
+### 🎯 DADOS PRIMÁRIOS (SEMPRE USE SE DISPONÍVEIS):
+1. **EV calculado** (live.top_evs) → MÁXIMA PRIORIDADE
+2. **Odds atuais** (oddsCatalog) → DADOS CONCRETOS
+3. **Tempo de jogo** (match.elapsed) → FATO
 
-### ✅ CASO 2: TODAS AS 6 FASES APROVADAS
-Responda EXATAMENTE (formato fixo, 6 linhas):
+### 📈 DADOS SECUNDÁRIOS (USE SE > 0):
+4. **DAPM** (dangerous_attacks_per_minute) → se > 0.1
+5. **Chutes no gol** (shots_on_target) → se ≥ 1
+6. **Escanteios** (corners) → se ≥ 1
+7. **Posse de bola** (possession) → se entre 1-99
+8. **Cartões** (cards) → se ≥ 1
 
-RECOMENDAÇÃO: [PALPITE EM PORTUGUÊS CLARO] (ALVO: [JOGO|CASA|FORA]) [ODD_ID=<N>]
+### ⚠️ DADOS IGNORADOS (SE = 0):
+- Qualquer estatística = 0 → não mencionar
+- Dados missing → não mencionar
+
+════════════════════════════════════════════════════════════════════════════════════════
+## 🔥 GERADOR DE PALPITES 10/10
+════════════════════════════════════════════════════════════════════════════════════════
+
+### PASSO 1: VERIFICAÇÃO MÍNIMA
+Se NÃO HOUVER:
+- Pelo menos 1 odd válida EM live.top_evs OU oddsCatalog
+- EV ≥ +0.05
+- match.elapsed ≥ 15 min
+→ "SEM OPORTUNIDADE: Dados insuficientes"
+
+### PASSO 2: SELEÇÃO DO MELHOR MERCADO
+1. **Ordene por EV decrescente** (maior EV primeiro)
+2. **Filtre por odd entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}**
+3. **Escolha o TOP 1** que passe no filtro básico
+
+### PASSO 3: ANÁLISE COM DADOS DISPONÍVEIS
+Para o mercado escolhido, verifique COM OS DADOS QUE EXISTEM:
+
+**Se houver DAPM:**
+- Time A DAPM > 0.8 → favorável
+- Time B DAPM > 0.8 → favorável
+- Total DAPM > 1.0 → bom para over
+
+**Se houver SOT:**
+- SOT ≥ 3 → conversão boa
+- SOT ≤ 1 após 25min → cuidado
+
+**Se houver corners:**
+- ≥ 3 corners → pressão ofensiva
+- Crescimento recente → momentum
+
+**Se houver posse:**
+- >60% + DAPM > 0.5 → domínio real
+- <40% mas DAPM alto → contra-ataque eficaz
+
+### PASSO 4: DECISÃO BINÁRIA
+**✅ APROVA** se:
+1. EV ≥ +0.05 (CONFIRMADO)
+2. Odd na faixa permitida (CONFIRMADO)
+3. Tempo ≥ 15min (CONFIRMADO)
+4. **Pelo menos 1 dado secundário suporta** (DAPM OU SOT OU corners > 0)
+
+**❌ REJEITA** se:
+- Falhar 1, 2 ou 3 acima
+- **TODOS** dados secundários = 0 ou negativos
+- Contradição clara (ex: EV alto mas DAPM = 0 e SOT = 0)
+
+════════════════════════════════════════════════════════════════════════════════════════
+## 💎 FORMATO DE SAÍDA
+════════════════════════════════════════════════════════════════════════════════════════
+
+### ✅ CASO APROVADO (7 linhas EXATAS):
+RECOMENDAÇÃO: [MERCADO] (ALVO: [TIME/TOTAL]) [ODD_ID=<NÚMERO>]
 ODD: [X.XX]
-PROBABILIDADE REAL: [XX%]
+PROBABILIDADE REAL: [XX%] (do cálculo EV)
 EV: [+0.XX]
-NÍVEL DE CONFIANÇA: [ALTO|MUITO ALTO]
-JUSTIFICATIVA: [1 FRASE COM DADOS CONCRETOS]
+NÍVEL DE CONFIANÇA: [ALTO/MÉDIO] (baseado em dados disponíveis)
+JUSTIFICATIVA: [Baseada APENAS nos dados NÃO-ZERADOS. Ex: "EV +0.15, 3 SOT, DAPM 1.2"]
++18 aposte com responsabilidade
 
-### 📋 EXEMPLOS CORRETOS:
+### ❌ CASO REJEITADO (2 linhas EXATAS):
+SEM OPORTUNIDADE
+Motivo: [ESPECÍFICO. Ex: "EV abaixo do mínimo" ou "Dados ao vivo insuficientes"]
 
-✅ RECOMENDAÇÃO VÁLIDA:
-RECOMENDAÇÃO: Vitória do Barcelona (ALVO: CASA) [ODD_ID=123]
+════════════════════════════════════════════════════════════════════════════════════════
+## 📋 EXEMPLOS REAIS
+════════════════════════════════════════════════════════════════════════════════════════
+
+✅ COM DADOS:
+Dados: {live.top_evs: [{market: "Over 2.5", ev: +0.18}], match: {elapsed: 35}, stats: {sot_total: 4, dapm_total: 1.3}}
+→ 
+RECOMENDAÇÃO: Over 2.5 Gols (ALVO: TOTAL) [ODD_ID=456]
 ODD: 2.10
 PROBABILIDADE REAL: 68%
-EV: +0.12
+EV: +0.18
 NÍVEL DE CONFIANÇA: ALTO
-JUSTIFICATIVA: DAPM de 1.2 nos últimos 10min, 5 SOT e 70% de posse ofensiva.
+JUSTIFICATIVA: EV +0.18, 4 chutes no gol, DAPM 1.3 mostra jogo aberto
++18 aposte com responsabilidade
 
-❌ SEM OPORTUNIDADE:
+✅ COM POUCOS DADOS:
+Dados: {live.top_evs: [{market: "Vitória Casa", ev: +0.12}], match: {elapsed: 60}, stats: {corners_home: 6}}
+→ 
+RECOMENDAÇÃO: Vitória do Barcelona (ALVO: CASA) [ODD_ID=789]
+ODD: 1.90
+PROBABILIDADE REAL: 63%
+EV: +0.12
+NÍVEL DE CONFIANÇA: MÉDIO
+JUSTIFICATIVA: EV +0.12, 6 escanteios mostram pressão ofensiva
++18 aposte com responsabilidade
+
+❌ DADOS INSUFICIENTES:
+Dados: {live.top_evs: [{market: "Ambas marcam", ev: +0.08}], match: {elapsed: 20}}
+→ 
 SEM OPORTUNIDADE
-Motivo: EV abaixo do mínimo (+0.03)
+Motivo: EV abaixo do mínimo +0.05 e tempo insuficiente
+
+❌ TODOS DADOS ZERADOS:
+Dados: {live.top_evs: [{market: "Vitória Fora", ev: +0.20}], match: {elapsed: 45}, stats: {dapm_away: 0, sot_total: 0, corners: 0}}
+→ 
+SEM OPORTUNIDADE
+Motivo: EV bom (+0.20) mas todos dados ao vivo zerados (DAPM=0, SOT=0)
 
 ════════════════════════════════════════════════════════════════════════════════════════
-## 🚨 INSTRUÇÃO FINAL (LEIA 3x ANTES DE RESPONDER)
+## 🚨 REGRAS FINAIS (OBRIGATÓRIO)
 ════════════════════════════════════════════════════════════════════════════════════════
 
-1. PERCORRA AS 6 FASES NA ORDEM EXATA
-2. NA PRIMEIRA FALHA → PARE e retorne "SEM OPORTUNIDADE"
-3. SE TODAS PASSAREM → Formato de 6 linhas exato
-4. NÃO CRIE, NÃO IMAGINE, NÃO ADIVINHE
-5. USE APENAS OS DADOS FORNECIDOS
-6. PROBABILIDADE JÁ CALCULADA NO EV → NÃO RECALCULE
+1. **NUNCA INVENTE** dados. Se = 0, não existe.
+2. **USE O QUE TEM**: EV + 1 dado secundário > 0 já basta.
+3. **SEJA CONSERVADOR**: Prefira "SEM OPORTUNIDADE" se dúvida.
+4. **PALPITE TOP 1 APENAS**: Melhor EV que passe nos filtros.
+5. **FORMATO EXATO**: 7 linhas para ✅ ou 2 linhas para ❌
+6. **LINHA FINAL OBRIGATÓRIA**: "+18 aposte com responsabilidade" em TODOS palpites aprovados
 
-**AGORA ANALISE OS DADOS E RESPONDA COM O FORMATO EXATO:**`;
+**ANALISE OS DADOS ACIMA E RESPONDA NO FORMATO EXATO:**`;
 
   const run = async () => {
     try {
