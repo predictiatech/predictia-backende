@@ -2071,7 +2071,13 @@ Se NÃO HOUVER:
 ### PASSO 2: SELEÇÃO DO MELHOR MERCADO
 1. **Ordene por EV decrescente** (maior EV primeiro)
 2. **Filtre por odd entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}**
-3. **Escolha o TOP 1** que passe no filtro básico
+3. **FILTRO DE MERCADOS HANDICAP: REJEITE** qualquer handicap que contenha:
+   - 0.25 (Asian Handicap +0.25, -0.25)
+   - 0.75 (Asian Handicap +0.75, -0.75)  
+   - 1.75 (Asian Handicap +1.75, -1.75)
+   - Qualquer valor que não seja exatamente ±0.5
+4. **PERMITA APENAS:** Handicap +0.5 ou -0.5 (meia bola)
+5. **Escolha o TOP 1** que passe no filtro básico
 
 ### PASSO 3: ANÁLISE COM DADOS DISPONÍVEIS
 Para o mercado escolhido, verifique COM OS DADOS QUE EXISTEM:
@@ -2098,12 +2104,14 @@ Para o mercado escolhido, verifique COM OS DADOS QUE EXISTEM:
 1. EV ≥ +0.05 (CONFIRMADO)
 2. Odd na faixa permitida (CONFIRMADO)
 3. Tempo ≥ 15min (CONFIRMADO)
-4. **Pelo menos 1 dado secundário suporta** (DAPM OU SOT OU corners > 0)
+4. **MERCADO NÃO É HANDICAP PROIBIDO** (não contém 0.25, 0.75, 1.75)
+5. **Pelo menos 1 dado secundário suporta** (DAPM OU SOT OU corners > 0)
 
 **❌ REJEITA** se:
-- Falhar 1, 2 ou 3 acima
+- Falhar 1, 2, 3 ou 4 acima
 - **TODOS** dados secundários = 0 ou negativos
 - Contradição clara (ex: EV alto mas DAPM = 0 e SOT = 0)
+- **MERCADO É HANDICAP PROIBIDO** (contém 0.25, 0.75, 1.75)
 
 ════════════════════════════════════════════════════════════════════════════════════════
 ## 💎 FORMATO DE SAÍDA
@@ -2120,16 +2128,16 @@ JUSTIFICATIVA: [Baseada APENAS nos dados NÃO-ZERADOS. Ex: "EV +0.15, 3 SOT, DAP
 
 ### ❌ CASO REJEITADO (2 linhas EXATAS):
 SEM OPORTUNIDADE
-Motivo: [ESPECÍFICO. Ex: "EV abaixo do mínimo" ou "Dados ao vivo insuficientes"]
+Motivo: [ESPECÍFICO. Ex: "EV abaixo do mínimo", "Dados ao vivo insuficientes", "Handicap 0.75 não permitido"]
 
 ════════════════════════════════════════════════════════════════════════════════════════
 ## 📋 EXEMPLOS REAIS
 ════════════════════════════════════════════════════════════════════════════════════════
 
-✅ COM DADOS:
-Dados: {live.top_evs: [{market: "Over 2.5", ev: +0.18}], match: {elapsed: 35}, stats: {sot_total: 4, dapm_total: 1.3}}
+✅ HANDICAP PERMITIDO (+0.5):
+Dados: {live.top_evs: [{market: "Handicap +0.5", ev: +0.18}], match: {elapsed: 35}, stats: {sot_total: 4, dapm_total: 1.3}}
 → 
-RECOMENDAÇÃO: Over 2.5 Gols (ALVO: TOTAL) [ODD_ID=456]
+RECOMENDAÇÃO: Handicap +0.5 (ALVO: TIME A) [ODD_ID=456]
 ODD: 2.10
 PROBABILIDADE REAL: 68%
 EV: +0.18
@@ -2137,10 +2145,16 @@ NÍVEL DE CONFIANÇA: ALTO
 JUSTIFICATIVA: EV +0.18, 4 chutes no gol, DAPM 1.3 mostra jogo aberto
 +18 aposte com responsabilidade
 
-✅ COM POUCOS DADOS:
-Dados: {live.top_evs: [{market: "Vitória Casa", ev: +0.12}], match: {elapsed: 60}, stats: {corners_home: 6}}
+❌ HANDICAP PROIBIDO (0.75):
+Dados: {live.top_evs: [{market: "Handicap -0.75", ev: +0.25}], match: {elapsed: 45}, stats: {corners_home: 6}}
 → 
-RECOMENDAÇÃO: Vitória do Barcelona (ALVO: CASA) [ODD_ID=789]
+SEM OPORTUNIDADE
+Motivo: Handicap 0.75 não permitido
+
+✅ HANDICAP PERMITIDO (-0.5):
+Dados: {live.top_evs: [{market: "Handicap -0.5", ev: +0.12}], match: {elapsed: 60}, stats: {corners_home: 6}}
+→ 
+RECOMENDAÇÃO: Handicap -0.5 (ALVO: TIME A) [ODD_ID=789]
 ODD: 1.90
 PROBABILIDADE REAL: 63%
 EV: +0.12
@@ -2168,8 +2182,9 @@ Motivo: EV bom (+0.20) mas todos dados ao vivo zerados (DAPM=0, SOT=0)
 2. **USE O QUE TEM**: EV + 1 dado secundário > 0 já basta.
 3. **SEJA CONSERVADOR**: Prefira "SEM OPORTUNIDADE" se dúvida.
 4. **PALPITE TOP 1 APENAS**: Melhor EV que passe nos filtros.
-5. **FORMATO EXATO**: 7 linhas para ✅ ou 2 linhas para ❌
-6. **LINHA FINAL OBRIGATÓRIA**: "+18 aposte com responsabilidade" em TODOS palpites aprovados
+5. **FILTRO HANDICAP ESTRITO**: Rejeite 0.25, 0.75, 1.75. Apenas ±0.5 permitido.
+6. **FORMATO EXATO**: 7 linhas para ✅ ou 2 linhas para ❌
+7. **LINHA FINAL OBRIGATÓRIA**: "+18 aposte com responsabilidade" em TODOS palpites aprovados
 
 **ANALISE OS DADOS ACIMA E RESPONDA NO FORMATO EXATO:**`;
 
