@@ -2025,122 +2025,156 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
     },
   };
 
- const prompt = `## 🚀 PREDICTIA ENGINE v5.1 - SISTEMA OTIMIZADO DE CRIAÇÃO DE PALPITES 10/10
-## PROTOCOLO: ANÁLISE DE VALOR COM IA AVANÇADA
-
-⚠️ **MODO PRÁTICO AVANÇADO:** Use apenas dados reais disponíveis. Evite fórmulas complexas - foque em correlações observáveis.
-
+ const prompt = `## 🚀 PREDICTIA ENGINE v4.0 - SISTEMA DE CRIAÇÃO DE PALPITES 10/10
+## PROTOCOLO: GERADOR DE VALOR BASEADO EM DADOS REAIS
+⚠️ **MODO PRÁTICO ATIVADO:** Trabalhe APENAS com dados não-zerados. Dados = 0 ou null são DESCONSIDERADOS.
 ════════════════════════════════════════════════════════════════════════════════════════
-## 📊 DADOS RECEBIDOS (ANALISE CRITICAMENTE)
+## 📊 DADOS RECEBIDOS (USE APENAS O QUE TEM VALOR)
 ════════════════════════════════════════════════════════════════════════════════════════
 ${JSON.stringify(aiData, null, 2)}
-
-REGRA ABSOLUTA: Dados zerados (0) ou nulos = inexistentes. Não extrapole além do disponível.
-
+REGRA ABSOLUTA: Se dado = 0, null ou não existe → NÃO USE. Ignore completamente.
 ════════════════════════════════════════════════════════════════════════════════════════
-## 🎯 SISTEMA DE ANÁLISE PRIORITÁRIA
+## 🧠 SISTEMA DE PRIORIZAÇÃO DE DADOS
 ════════════════════════════════════════════════════════════════════════════════════════
+### 🎯 DADOS PRIMÁRIOS (SEMPRE USE SE DISPONÍVEIS):
 
-### 🏆 DADOS CRÍTICOS (VERIFIQUE PRIMEIRO):
-1. **EV** (live.top_evs) → Valor principal. EV ≥ +0.05 é MÍNIMO.
-2. **Odds** (oddsCatalog) → Contexto real. Entre ${oddMin.toFixed(2)}-${oddMax.toFixed(2)}.
-3. **Tempo** (match.elapsed) → ≥15 minutos (≥30 ideal para análise).
+**EV calculado** (live.top_evs) → MÁXIMA PRIORIDADE
+**Odds atuais** (oddsCatalog) → DADOS CONCRETOS
+**Tempo de jogo** (match.elapsed) → FATO
 
-### 📊 DADOS DE SUPORTE (REQUERIDOS ≥2 PARA APROVAÇÃO):
-4. **DAPM** > 0.8 → Ataques perigosos consistentes
-5. **SOT** ≥ 2 → Chutes reais no gol
-6. **Corners** ≥ 3 → Pressão ofensiva
-7. **Posse** > 55% + DAPM > 0.5 → Domínio efetivo
-8. **Cartões** ≥ 2 (após 30min) → Intensidade
+### 📈 DADOS SECUNDÁRIOS (USE SE > 0):
 
-### ❌ FILTROS ABSOLUTOS:
-- **EV < +0.05** → REJEITA
-- **Tempo < 15min** → REJEITA  
-- **Handicap proibido**: 0.25, 0.75, 1.25, 1.75, 2.25 (qualquer handicap quebrado)
-- **Apenas permitidos**: ±0.5, ±1.0, ±1.5, ±2.0 (handicaps limpos)
+**DAPM** (dangerous_attacks_per_minute) → se > 0.1
+**Chutes no gol** (shots_on_target) → se ≥ 1
+**Escanteios** (corners) → se ≥ 1
+**Posse de bola** (possession) → se entre 1-99
+**Cartões** (cards) → se ≥ 1
 
-════════════════════════════════════════════════════════════════════════════════════════
-## 🔄 PROCESSO DECISÓRIO SIMPLIFICADO
+### ⚠️ DADOS IGNORADOS (SE = 0):
+
+Qualquer estatística = 0 → não mencionar
+Dados missing → não mencionar
 ════════════════════════════════════════════════════════════════════════════════════════
 
-### 1. **PRÉ-FILTRAGEM**
-- EV ≥ +0.05? ❌ → REJEITA
-- Tempo ≥ 15min? ❌ → REJEITA
-- Handicap permitido? ❌ → REJEITA
-- Odds na faixa? ❌ → REJEITA
-
-### 2. **CONTAGEM DE DADOS DE SUPORTE**
-Conte quantos dados de suporte estão disponíveis E positivos:
-- DAPM > 0.8: ✅
-- SOT ≥ 2: ✅  
-- Corners ≥ 3: ✅
-- Posse + DAPM OK: ✅
-- Cartões ≥ 2 (após 30min): ✅
-
-### 3. **DECISÃO FINAL**
-✅ **APROVA** se: EV OK + Tempo OK + Handicap OK + **≥2 dados de suporte positivos**
-
-❌ **REJEITA** se: Falha em qualquer critério OU <2 dados de suporte
-
+## 🔥 GERADOR DE PALPITES 10/10
 ════════════════════════════════════════════════════════════════════════════════════════
-## 📝 FORMATO DE SAÍDA (OBRIGATÓRIO)
+### PASSO 1: VERIFICAÇÃO MÍNIMA
+Se NÃO HOUVER:
+
+Pelo menos 1 odd válida EM live.top_evs OU oddsCatalog
+EV ≥ +0.05
+match.elapsed ≥ 15 min
+→ "SEM OPORTUNIDADE: Dados insuficientes"
+
+### PASSO 2: SELEÇÃO DO MELHOR MERCADO
+
+**Ordene por EV decrescente** (maior EV primeiro)
+**Filtre por odd entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}**
+**FILTRO DE MERCADOS HANDICAP: REJEITE** qualquer handicap que contenha:
+   - 0.25 (Asian Handicap +0.25, -0.25)
+   - 0.75 (Asian Handicap +0.75, -0.75)
+   - 1.75 (Asian Handicap +1.75, -1.75)
+   - Qualquer valor que não seja exatamente ±0.5
+**PERMITA APENAS:** Handicap +0.5 ou -0.5 (meia bola)
+**Escolha o TOP 1** que passe no filtro básico
+
+### PASSO 3: ANÁLISE COM DADOS DISPONÍVEIS
+Para o mercado escolhido, verifique COM OS DADOS QUE EXISTEM:
+**Se houver DAPM:**
+
+Time A DAPM > 0.8 → favorável
+Time B DAPM > 0.8 → favorável
+Total DAPM > 1.0 → bom para over
+**Se houver SOT:**
+SOT ≥ 3 → conversão boa
+SOT ≤ 1 após 25min → cuidado
+**Se houver corners:**
+≥ 3 corners → pressão ofensiva
+Crescimento recente → momentum
+**Se houver posse:**
+60% + DAPM > 0.5 → domínio real
+<40% mas DAPM alto → contra-ataque eficaz
+
+### PASSO 4: DECISÃO BINÁRIA
+**✅ APROVA** se:
+
+EV ≥ +0.05 (CONFIRMADO)
+Odd na faixa permitida (CONFIRMADO)
+Tempo ≥ 15min (CONFIRMADO)
+**MERCADO NÃO É HANDICAP PROIBIDO** (não contém 0.25, 0.75, 1.75)
+**Pelo menos 1 dado secundário suporta** (DAPM OU SOT OU corners > 0)
+**❌ REJEITA** se:
+
+
+Falhar 1, 2, 3 ou 4 acima
+**TODOS** dados secundários = 0 ou negativos
+Contradição clara (ex: EV alto mas DAPM = 0 e SOT = 0)
+**MERCADO É HANDICAP PROIBIDO** (contém 0.25, 0.75, 1.75)
 ════════════════════════════════════════════════════════════════════════════════════════
 
-### ✅ CASO APROVADO (9 linhas):
+## 💎 FORMATO DE SAÍDA
+════════════════════════════════════════════════════════════════════════════════════════
+### ✅ CASO APROVADO (7 linhas EXATAS):
 RECOMENDAÇÃO: [MERCADO] (ALVO: [TIME/TOTAL]) [ODD_ID=<NÚMERO>]
 ODD: [X.XX]
-PROBABILIDADE REAL: [XX%] (baseada em EV)
+PROBABILIDADE REAL: [XX%] (do cálculo EV)
 EV: [+0.XX]
-NÍVEL DE CONFIANÇA: [ALTO/MÉDIO/BAIXO] 
-// ALTO: ≥3 dados suporte | MÉDIO: 2 dados | BAIXO: 2 dados mas tempo <40min
-JUSTIFICATIVA: [Liste APENAS dados positivos. Ex: "EV +0.15, DAPM 1.2 (ataques perigosos), 3 SOT (chutes reais)"]
-ANÁLISE: [Tendência observável. Ex: "Corners aumentaram 50% nos últimos 10min → momentum ofensivo"]
+NÍVEL DE CONFIANÇA: [ALTO/MÉDIO] (baseado em dados disponíveis)
+JUSTIFICATIVA: [Baseada APENAS nos dados NÃO-ZERADOS. Ex: "EV +0.15, 3 SOT, DAPM 1.2"]
 +18 aposte com responsabilidade
-PIONEIRO NO MERCADO: Predictia - Palpites baseados em IA
-
-### ❌ CASO REJEITADO (3 linhas):
+### ❌ CASO REJEITADO (2 linhas EXATAS):
 SEM OPORTUNIDADE
-Motivo: [ESPECÍFICO. Ex: "Apenas 1 dado de suporte (SOT=1)" ou "Handicap 0.75 não permitido"]
-// Se EV OK mas dados insuficientes: "Monitorar: EV +0.10 positivo, aguardar mais dados ao vivo"
-
+Motivo: [ESPECÍFICO. Ex: "EV abaixo do mínimo", "Dados ao vivo insuficientes", "Handicap 0.75 não permitido"]
 ════════════════════════════════════════════════════════════════════════════════════════
-## 🎯 EXEMPLO PRÁTICO
+## 📋 EXEMPLOS REAIS
 ════════════════════════════════════════════════════════════════════════════════════════
-
-✅ APROVADO:
-Dados: {EV: +0.12, tempo: 40min, mercado: "Over 1.5", odd: 1.85, DAPM: 1.1, SOT: 3, corners: 2}
-
-→ 
-RECOMENDAÇÃO: Over 1.5 Gols (ALVO: TOTAL) [ODD_ID=123]
-ODD: 1.85
-PROBABILIDADE REAL: 64%
-EV: +0.12
+✅ HANDICAP PERMITIDO (+0.5):
+Dados: {live.top_evs: [{market: "Handicap +0.5", ev: +0.18}], match: {elapsed: 35}, stats: {sot_total: 4, dapm_total: 1.3}}
+→
+RECOMENDAÇÃO: Handicap +0.5 (ALVO: TIME A) [ODD_ID=456]
+ODD: 2.10
+PROBABILIDADE REAL: 68%
+EV: +0.18
 NÍVEL DE CONFIANÇA: ALTO
-JUSTIFICATIVA: EV +0.12, DAPM 1.1 (ataques intensos), 3 SOT (chutes eficazes)
-ANÁLISE: DAPM acima de 1.0 indica jogo aberto, SOT converte em gols
+JUSTIFICATIVA: EV +0.18, 4 chutes no gol, DAPM 1.3 mostra jogo aberto
 +18 aposte com responsabilidade
-PIONEIRO NO MERCADO: Predictia - Palpites baseados em IA
-
-❌ REJEITADO:
-Dados: {EV: +0.18, tempo: 25min, mercado: "Handicap -0.75", DAPM: 0.4}
-
-→ 
+❌ HANDICAP PROIBIDO (0.75):
+Dados: {live.top_evs: [{market: "Handicap -0.75", ev: +0.25}], match: {elapsed: 45}, stats: {corners_home: 6}}
+→
 SEM OPORTUNIDADE
-Motivo: Handicap 0.75 não permitido + DAPM baixo (0.4)
-Monitorar: EV positivo (+0.18), aguardar handicaps permitidos
-
+Motivo: Handicap 0.75 não permitido
+✅ HANDICAP PERMITIDO (-0.5):
+Dados: {live.top_evs: [{market: "Handicap -0.5", ev: +0.12}], match: {elapsed: 60}, stats: {corners_home: 6}}
+→
+RECOMENDAÇÃO: Handicap -0.5 (ALVO: TIME A) [ODD_ID=789]
+ODD: 1.90
+PROBABILIDADE REAL: 63%
+EV: +0.12
+NÍVEL DE CONFIANÇA: MÉDIO
+JUSTIFICATIVA: EV +0.12, 6 escanteios mostram pressão ofensiva
++18 aposte com responsabilidade
+❌ DADOS INSUFICIENTES:
+Dados: {live.top_evs: [{market: "Ambas marcam", ev: +0.08}], match: {elapsed: 20}}
+→
+SEM OPORTUNIDADE
+Motivo: EV abaixo do mínimo +0.05 e tempo insuficiente
+❌ TODOS DADOS ZERADOS:
+Dados: {live.top_evs: [{market: "Vitória Fora", ev: +0.20}], match: {elapsed: 45}, stats: {dapm_away: 0, sot_total: 0, corners: 0}}
+→
+SEM OPORTUNIDADE
+Motivo: EV bom (+0.20) mas todos dados ao vivo zerados (DAPM=0, SOT=0)
 ════════════════════════════════════════════════════════════════════════════════════════
-## 🚨 REGRAS FINAIS
+## 🚨 REGRAS FINAIS (OBRIGATÓRIO)
 ════════════════════════════════════════════════════════════════════════════════════════
 
-1. **SIMPLICIDADE PRIMEIRO**: Sem fórmulas complexas - análise observacional
-2. **TRANSPARÊNCIA**: Mostre claramente quais dados foram usados
-3. **CONSERVADORISMO**: Exija ≥2 dados de suporte para aprovar
-4. **HANDICAP LIMPO**: Apenas ±0.5, ±1.0, ±1.5, ±2.0
-5. **FORMATO FIXO**: 9 linhas (aprovado) ou 3 linhas (rejeitado)
-6. **BASE EMPÍRICA**: Nada de "simulação probabilística" sem dados históricos
-
-**ANALISE E RESPONDA NO FORMATO EXATO:**`;
+**NUNCA INVENTE** dados. Se = 0, não existe.
+**USE O QUE TEM**: EV + 1 dado secundário > 0 já basta.
+**SEJA CONSERVADOR**: Prefira "SEM OPORTUNIDADE" se dúvida.
+**PALPITE TOP 1 APENAS**: Melhor EV que passe nos filtros.
+**FILTRO HANDICAP ESTRITO**: Rejeite 0.25, 0.75, 1.75. Apenas ±0.5 permitido.
+**FORMATO EXATO**: 7 linhas para ✅ ou 2 linhas para ❌
+**LINHA FINAL OBRIGATÓRIA**: "+18 aposte com responsabilidade" em TODOS palpites aprovados
+**ANALISE OS DADOS ACIMA E RESPONDA NO FORMATO EXATO:**`;
   const run = async () => {
     try {
       const raw1 = await generateGemini(prompt);
