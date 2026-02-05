@@ -2025,167 +2025,132 @@ async function getAIAnalysisFromSnapshot(snapshot, cacheKey = "") {
     },
   };
 
- const prompt = `## 🚀 PREDICTIA ENGINE v4.1 - SISTEMA DE CRIAÇÃO DE PALPITES 10/10
-## PROTOCOLO: VALOR BASEADO EM DADOS REAIS E TEMPO DE JOGO
-⚠️ **MODO PRÁTICO ATIVADO:** Trabalhe APENAS com dados não-zerados. Dados = 0 ou null são DESCONSIDERADOS. ANALISE O TEMPO.
-════════════════════════════════════════════════════════════════════════════════════════
-## 📊 DADOS RECEBIDOS (USE APENAS O QUE TEM VALOR)
-════════════════════════════════════════════════════════════════════════════════════════
+ // ✅ Prompt reescrito (profissional + mais “seguro” + sem invenção + travas de realismo + handicap sem 0.25/0.75/1.75)
+// Mantém: gates por tempo, EV, odds range, 7 linhas ou 2 linhas, “SEM OPORTUNIDADE”, e trava de projeções absurdas.
+
+const prompt = `
+PREDICTIA ENGINE v4.2 — PROTOCOLO PROFISSIONAL DE PALPITES (DADOS REAIS • ALTA ACERTIVIDADE)
+
+OBJETIVO
+- Gerar no MÁXIMO 1 palpite por partida (TOP 1).
+- Somente com DADOS REAIS presentes no payload.
+- Proibido inventar estatísticas, odds, histórico, “médias de liga”, “memória” ou qualquer número não fornecido.
+- Se não houver base real suficiente: retornar "SEM OPORTUNIDADE".
+
+DADOS PARA ANÁLISE (ÚNICA FONTE DE VERDADE)
 ${JSON.stringify(aiData, null, 2)}
-REGRA ABSOLUTA: Se dado = 0, null ou não existe → NÃO USE. Ignore completamente.
-════════════════════════════════════════════════════════════════════════════════════════
-## 🧠 SISTEMA DE PRIORIZAÇÃO E ANÁLISE TEMPORAL
-════════════════════════════════════════════════════════════════════════════════════════
-### ⏱️ CONTEXTO TEMPORAL CRÍTICO (ELAPSED = ${aiData.match?.elapsed || 0} min)
-**FASE DO JOGO:** Determine a fase atual:
-- **INÍCIO (0-15 min):** Dados muito instáveis. SEJA HIPER-CONSERVADOR.
-- **FASE DE CONSTRUÇÃO (16-35 min):** Padrões começam a surgir. Permita apenas palpites com MÚLTIPLAS confirmações.
-- **FINAL DO 1º TEMPO (36-45+ min):** Momento de maior confiabilidade pré-intervalo.
-- **SEGUNDO TEMPO (46+ min):** Análise deve considerar aceleração/desaceleração típica.
 
-### 🎯 DADOS PRIMÁRIOS (SEMPRE USE SE DISPONÍVEIS):
-**EV calculado** (live.top_evs) → MÁXIMA PRIORIDADE (deve ser ≥ +0.10 para <40 min)
-**Odds atuais** (oddsCatalog) → DADOS CONCRETOS
-**Tempo de jogo** (match.elapsed) → FATO DECISIVO PARA QUALQUER PROJEÇÃO
+REGRAS DE DADOS (ANTI-INVENÇÃO)
+- Use EXCLUSIVAMENTE campos presentes e > 0 (e percentuais entre 1..99).
+- Se um campo não existe, é 0, null, vazio, ou inválido → IGNORAR COMPLETAMENTE.
+- É PROIBIDO “preencher lacunas” ou supor valores.
+- “Memória” aqui significa: padrões lógicos gerais, SEM números e SEM afirmar fatos externos. Se precisar de dado e ele não está no payload → SEM OPORTUNIDADE.
 
-### 📈 DADOS SECUNDÁRIOS (USE SE > 0 E COM PROJEÇÃO REALISTA):
-**DAPM** (dangerous_attacks_per_minute) → se > 0.1
-**Chutes no gol** (shots_on_target) → se ≥ 1
-**Escanteios** (corners) → se ≥ 1
-**Posse de bola** (possession) → se entre 1-99
-**Cartões** (cards) → se ≥ 1
+CONTEXTO DE TEMPO (FATO DECISIVO)
+- elapsed = ${aiData.match?.elapsed || 0} minutos
+- Nenhum palpite antes de 20min.
+- Mercados de TOTAL exigem tempo mínimo maior (ver gates).
+- Se elapsed estiver ausente/0 → SEM OPORTUNIDADE.
 
-### 🚫 FILTRO DE PROJEÇÃO IRREALISTA (OBRIGATÓRIO)
-**NUNCA PROJETE um palpite que exija um ritmo FUTURO anormal.**
-EXEMPLOS PROIBIDOS:
-- Aos 30min do 1º tempo: "Mais de 5 escanteios no 2º tempo" → Exigiria ritmo >0.33 esc/min, geralmente irreal.
-- Aos 20min: "Ambas marcam SIM" → Pode ser cedo demais.
-- Qualquer "Over X.X gols" que, para acontecer, precise de uma média de gols/minuto muito acima da atual.
+FONTES DE MERCADO (OBRIGATÓRIAS)
+Você só pode recomendar um mercado se existir:
+- Uma odd válida em live.top_evs OU em oddsCatalog (com ODD_ID, odd numérica)
+- EV válido associado (ou calculado e fornecido em live.top_evs)
+Se não houver odd/EV válidos → SEM OPORTUNIDADE.
 
-**CRITÉRIO DE REALISMO:** A projeção baseada no ritmo atual (estatística/tempo decorrido) NÃO PODE superar em mais de **50%** o ritmo histórico típico para a liga/campeonato. Na dúvida, REJEITE.
-════════════════════════════════════════════════════════════════════════════════════════
+GATE 0 — VIABILIDADE (BINÁRIO)
+REJEITE IMEDIATAMENTE (SEM OPORTUNIDADE) se QUALQUER item falhar:
+1) elapsed >= 20
+2) existe pelo menos 1 opção com odd válida + ODD_ID (em live.top_evs OU oddsCatalog)
+3) EV mínimo:
+   - elapsed < 40: EV >= +0.10
+   - elapsed >= 40: EV >= +0.07
+4) Para mercados de TOTAL (gols/escanteios): elapsed >= 25
+5) Para “Ambas Marcam” e “Over Gols”: elapsed >= 30
+6) Para “1X2 / Resultado Final”: elapsed >= 60
+   - EXCEÇÃO: se elapsed >= 40 e EV >= +0.20, pode liberar.
 
-## 🔥 GERADOR DE PALPITES 10/10 - PROCESSO 4 ETAPAS
-════════════════════════════════════════════════════════════════════════════════════════
-### ETAPA 1: VERIFICAÇÃO DE VIABILIDADE (GATE 0)
-Se NÃO HOUVER TODOS:
-1. Pelo menos 1 odd válida EM live.top_evs OU oddsCatalog
-2. EV ≥ +0.10 (se elapsed < 40 min) OU EV ≥ +0.07 (se elapsed ≥ 40 min)
-3. match.elapsed ≥ 20 min **PARA QUALQUER MERCADO**
-4. **Para mercados totais (escanteios, gols):** elapsed ≥ 25 min
-→ Pare imediatamente e retorne: "SEM OPORTUNIDADE: Dados ou tempo insuficientes"
+FILTRO DE ODDS (OBRIGATÓRIO)
+- Aceite somente odd entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}.
 
-### ETAPA 2: SELEÇÃO E FILTRAGEM DO MERCADO
+FILTRO HANDICAP (OBRIGATÓRIO E ESTRITO)
+- REJEITE qualquer handicap com:
+  - .25 (ex: +0.25, -0.25)
+  - .75 (ex: +0.75, -0.75)
+  - 1.75 (ex: +1.75, -1.75)
+  - qualquer valor que NÃO seja exatamente: ±0.5, ±1.0, ±1.5
+- PERMITIDOS: +0.5, -0.5, +1.0, -1.0, +1.5, -1.5
 
-**A) Ordene** por EV decrescente (maior EV primeiro).
-**B) Filtre** por odd entre ${oddMin.toFixed(2)} e ${oddMax.toFixed(2)}.
-**C) FILTRO DE MERCADOS HANDICAP (ESTRITO):** REJEITE qualquer handicap que contenha:
-   - 0.25 (Asian Handicap +0.25, -0.25)
-   - 0.75 (Asian Handicap +0.75, -0.75)
-   - 1.75 (Asian Handicap +1.75, -1.75)
-   - Qualquer valor que não seja exatamente ±0.5 ou ±1.0 ou ±1.5 (números inteiros ou meia bola).
-**PERMITA APENAS:** Handicap +0.5, -0.5, +1.0, -1.0, +1.5, -1.5.
-**D) FILTRO TEMPORAL POR MERCADO:**
-   - **Ambas Marcam / Over Gols:** elapsed ≥ 30 min.
-   - **Escanteios Totais (Over X.5):** elapsed ≥ 35 min e ritmo atual sustentável.
-   - **Resultado Final (1X2):** elapsed ≥ 60 min (ou EV > +0.20 se elapsed ≥ 40 min).
-**E) Escolha o TOP 1** mercado que passe em TODOS os filtros acima.
+TRAVA DE REALISMO (ANTI-PALPITE IRREAL)
+Você deve REJEITAR qualquer palpite que exija um “ritmo futuro” absurdo dado o que existe no payload.
+Use APENAS ritmo calculado com DADOS PRESENTES:
 
-### ETAPA 3: ANÁLISE DE SUPORTE E REALISMO
-Para o mercado escolhido, VERIFIQUE com os dados existentes:
+A) TOTAL DE GOLS (ex: Over 2.5)
+- Se gols_atual existe:
+  - ritmo_gols = gols_atual / elapsed
+  - proj_90 = ritmo_gols * 90
+  - REJEITE se proj_90 < linha_total_sugerida
+- Regra adicional de coerência:
+  - elapsed <= 30: PROIBIDO recomendar over alto (>= 4.5) mesmo com EV, a menos que gols_atual e ritmo sustentem (proj_90 >= linha) E existam 2+ indicadores (ver suporte).
+  - elapsed 40 com “Under 0.5 gols” é geralmente incoerente se já houver gol no payload (se gols_atual > 0 → REJEITE Under 0.5).
 
-**1. SUPORTE ESTATÍSTICO:** Precisa de pelo menos **DOIS** indicadores positivos (>0) entre:
-   - DAPM relevante (>0.7 para o time/lado do palpite)
-   - SOT (≥ 2 para o time/lado do palpite)
-   - Corners (≥ 3 e crescimento recente)
-   - Posse dominante (>60%) associada a DAPM/SOT
-   - Cartões (≥ 3) indicando jogo tenso (para Over mercados)
+B) TOTAL DE ESCANTEIOS (ex: Over 10.5)
+- Se corners_total existe:
+  - ritmo_corners = corners_total / elapsed
+  - proj_90 = ritmo_corners * 90
+  - REJEITE se proj_90 < linha_total_sugerida
 
-**2. TESTE DE REALISMO (CRUCIAL):**
-   - **Se mercado é TOTAL (ex: Over 2.5 gols):** O ritmo atual de gols/minuto * 90 deve ser >= ao total sugerido. Se não, REJEITE.
-   - **Se mercado é TOTAL DE ESCANTEIOS (ex: Over 8.5):** (corners atuais / elapsed) * 90 deve ser >= ao total sugerido. Se não, REJEITE.
-   - **Se mercado é AMBAS MARCAM:** Ambos os times devem ter pelo menos 1 SOT OU DAPM > 0.5. Se não, REJEITE.
+C) AMBAS MARCAM (BTTS)
+- Só aprova se:
+  - ambos os lados têm ao menos 1 SOT (se SOT por time existir) OU
+  - ambos têm DAPM > 0.5 (se DAPM por time existir)
+- Caso não existam dados por time → REJEITE (não inventar).
 
-### ETAPA 4: DECISÃO FINAL BINÁRIA
-**✅ APROVA** **SOMENTE** se:
-- Passou na ETAPA 1 (Gate 0).
-- Passou em TODOS os filtros da ETAPA 2.
-- Tem **SUPORTE ESTATÍSTICO** (pelo menos 2 indicadores positivos) da ETAPA 3.1.
-- **PASSOU** no Teste de Realismo da ETAPA 3.2.
-- **NÃO HÁ** contradição clara (ex: EV alto pra Over, mas DAPM=0 e SOT=0).
+D) TRAVAS EXPLÍCITAS PEDIDAS (COERÊNCIA TEMPORAL)
+- elapsed ~30:
+  - PROIBIDO recomendar “Over 5.0 gols” se gols_atual for baixo e não sustentar proj_90 >= 5.0.
+- elapsed ~40:
+  - PROIBIDO recomendar “Under 0.5 gols” se existir qualquer gol no payload.
+  - Se gols_atual = 0, só permita Under 0.5 se houver forte suporte defensivo/ofensivo fraco nos dados presentes (2+ indicadores coerentes), caso contrário REJEITE.
 
-**❌ REJEITA** se:
-- **FALHAR** em qualquer uma das etapas acima.
-- **TEMPO INSUFICIENTE** para o tipo de mercado.
-- **PROJEÇÃO IRREALISTA** (ritmo futuro anormal).
-- **DADOS CONTRADITÓRIOS**.
-- **MERCADO É HANDICAP PROIBIDO** (0.25, 0.75, 1.75).
-════════════════════════════════════════════════════════════════════════════════════════
+SUPORTE MÍNIMO (ANTI-ACHISMO) — PRECISA DE 2 CONFIRMAÇÕES
+Para aprovar o mercado escolhido, EXIJA pelo menos 2 indicadores positivos (presentes e > 0) dentre:
+- DAPM relevante (por time ou geral) compatível com o lado do palpite
+- SOT (por time) compatível com o lado do palpite
+- corners_total alto e crescendo (se houver info de corners e o ritmo sustentar)
+- posse dominante (>60) SOMENTE se houver também DAPM ou SOT (posse sozinha NÃO serve)
+- cartões >= 3 (apenas como reforço contextual; não pode ser o único suporte)
 
-## 💎 FORMATO DE SAÍDA (OBRIGATÓRIO)
-════════════════════════════════════════════════════════════════════════════════════════
-### ✅ CASO APROVADO (7 linhas EXATAS):
-RECOMENDAÇÃO: [MERCADO] (ALVO: [TIME/TOTAL]) [ODD_ID=<NÚMERO>]
-ODD: [X.XX]
-PROBABILIDADE REAL: [XX%] (do cálculo EV)
-EV: [+0.XX]
-NÍVEL DE CONFIANÇA: [ALTO/MÉDIO] (ALTO se elapsed > 60min e 3+ indicadores; MÉDIO caso contrário)
-JUSTIFICATIVA: [Baseada APENAS nos dados NÃO-ZERADOS e no TEMPO. Ex: "EV +0.18. Aos 40min: 3 SOT, DAPM 1.2, ritmo de 0.15 corners/min sustenta Over 9.5."]
+PROCESSO DE SELEÇÃO DO TOP 1 (DETERMINÍSTICO)
+1) Colete candidatos (live.top_evs e/ou oddsCatalog).
+2) Filtre por: odd range + EV mínimo + gates por tempo + handicap permitido.
+3) Ordene por EV desc.
+4) Avalie REALISMO (projeções) do candidato #1:
+   - Se falhar → vá para o próximo candidato.
+5) Avalie SUPORTE (2+ indicadores):
+   - Se falhar → vá para o próximo candidato.
+6) Se nenhum candidato passar → SEM OPORTUNIDADE.
+
+SAÍDA — FORMATO OBRIGATÓRIO (SEM MARKDOWN)
+✅ CASO APROVADO (7 linhas EXATAS):
+RECOMENDAÇÃO: <mercado + linha + período> (ALVO: JOGO|CASA|FORA|TOTAL) [ODD_ID=<N>]
+ODD: <X.XX>
+PROBABILIDADE REAL: <XX%>
+EV: <+0.XX>
+NÍVEL DE CONFIANÇA: ALTO|MÉDIO
+JUSTIFICATIVA: <1 frase citando APENAS dados presentes + tempo + teste de realismo>
 +18 aposte com responsabilidade
 
-### ❌ CASO REJEITADO (2 linhas EXATAS):
+❌ CASO REJEITADO (2 linhas EXATAS):
 SEM OPORTUNIDADE
-Motivo: [ESPECÍFICO. Ex: "Tempo insuficiente (25min) para mercado Over Escanteios", "Projeção irrealista: ritmo atual não sustenta Over 10.5", "Apenas 1 indicador positivo (DAPM), necessários 2", "Handicap +0.75 não permitido"]
-════════════════════════════════════════════════════════════════════════════════════════
-## 📋 EXEMPLOS REAIS (FOCADOS NO CONTROLE TEMPORAL)
-════════════════════════════════════════════════════════════════════════════════════════
-❌ EXEMPLO DO ERRO (30min, Over 5.5 escanteios no 2º tempo):
-Dados: {match: {elapsed: 30}, stats: {corners_total: 4}, live.top_evs: [{market: "Over 5.5 Escanteios - 2º Tempo", ev: +0.22}]}
-→
-SEM OPORTUNIDADE
-Motivo: Projeção irrealista: aos 30min, ritmo de 0.13 corners/min não sustenta >5.5 no 2º tempo.
+Motivo: <1 motivo objetivo (tempo insuficiente | sem odds/EV válidos | handicap proibido | suporte <2 | projeção irrealista | dados contraditórios)>
 
-✅ EXEMPLO CORRETO (65min, Handicap permitido):
-Dados: {match: {elapsed: 65}, stats: {sot_home: 5, dapm_home: 1.1, possession_home: 62}, live.top_evs: [{market: "Handicap -0.5", ev: +0.15}]}
-→
-RECOMENDAÇÃO: Handicap -0.5 (ALVO: HOME) [ODD_ID=123]
-ODD: 1.85
-PROBABILIDADE REAL: 65%
-EV: +0.15
-NÍVEL DE CONFIANÇA: ALTO
-JUSTIFICATIVA: EV +0.15. Aos 65min: domínio claro com 5 SOT, DAPM 1.1 e 62% de posse.
-+18 aposte com responsabilidade
+REGRA FINAL
+- Na dúvida, REJEITE.
+- Nunca invente.
+- Nunca saia do formato de 7 ou 2 linhas.
+`.trim();
 
-❌ EXEMPLO TEMPO INSUFICIENTE (22min, Ambas Marcam):
-Dados: {match: {elapsed: 22}, stats: {sot_home: 1, sot_away: 0}, live.top_evs: [{market: "Ambas Marcam Sim", ev: +0.19}]}
-→
-SEM OPORTUNIDADE
-Motivo: Tempo insuficiente (22min) para mercado Ambas Marcam.
-
-✅ EXEMPLO REALISTA (48min, Over Escanteios):
-Dados: {match: {elapsed: 48}, stats: {corners_total: 9}, live.top_evs: [{market: "Over 10.5 Escanteios", ev: +0.12}]}
-ANÁLISE: 9 corners / 48 min = 0.1875/min. Projeção: 0.1875 * 90 = ~16.8. Sustenta Over 10.5.
-→
-RECOMENDAÇÃO: Over 10.5 Escanteios (ALVO: TOTAL) [ODD_ID=456]
-ODD: 1.95
-PROBABILIDADE REAL: 61%
-EV: +0.12
-NÍVEL DE CONFIANÇA: MÉDIO
-JUSTIFICATIVA: EV +0.12. Aos 48min: ritmo alto de 0.19 corners/min (9 no total) sustenta projeção de ~17 escanteios.
-+18 aposte com responsabilidade
-════════════════════════════════════════════════════════════════════════════════════════
-## 🚨 REGRAS FINAIS ABSOLUTAS
-════════════════════════════════════════════════════════════════════════════════════════
-1.  **TEMPO É REI:** Nenhum palpite antes dos 20min. Mercados específicos exigem tempos mínimos maiores.
-2.  **PROJEÇÃO REALISTA:** Bloqueie qualquer palpite que exija um ritmo futuro anormal (+50% acima do atual ou da média típica).
-3.  **SUPORTE DUPLO:** Exija pelo menos 2 indicadores estatísticos positivos para aprovar.
-4.  **NUNCA INVENTE:** Use apenas dados fornecidos e não nulos.
-5.  **CONSERVADORISMO:** Na dúvida, "SEM OPORTUNIDADE".
-6.  **FORMATO EXATO:** 7 linhas (✅) ou 2 linhas (❌). Sem desvios.
-7.  **LINHA FINAL:** "+18 aposte com responsabilidade" em TODO palpite aprovado.
-
-**ANALISE OS DADOS ACIMA METICULOSAMENTE, COM FOCO NO TEMPO DECORRIDO (${aiData.match?.elapsed || 0} min), E RESPONDA NO FORMATO EXATO SOLICITADO:**
-`;
   const run = async () => {
     try {
       const raw1 = await generateGemini(prompt);
