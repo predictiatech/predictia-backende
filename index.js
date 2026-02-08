@@ -1,4 +1,5 @@
-// index.js (COMPLETO) — ✅ FIX fetch + ✅ FIX home/away stats mapping + ✅ FIX GOALS over/under by selectionType + ✅ GET /api/analyze-match (teste no navegador)
+// index.js (COMPLETO) — ✅ FIX fetch + ✅ FIX home/away stats mapping + ✅ FIX GOALS over/under by selectionType
+//                 + ✅ GET /api/analyze-match (teste no navegador) + ✅ FIX /api/debug/odds suporta bookmakers/odds/bets
 
 import "dotenv/config";
 import express from "express";
@@ -60,7 +61,11 @@ const MARKETS = {
       const cornersPerMin = cornersNow / Math.max(1, elapsed);
 
       const minutesRemaining =
-        marketType === "1T" ? Math.max(0, 45 - elapsed) : marketType === "2T" ? 45 : Math.max(0, 90 - elapsed);
+        marketType === "1T"
+          ? Math.max(0, 45 - elapsed)
+          : marketType === "2T"
+            ? 45
+            : Math.max(0, 90 - elapsed);
 
       let probability = 0.5;
 
@@ -110,7 +115,11 @@ const MARKETS = {
       const goalsPerMin = totalGoals / Math.max(1, elapsed);
 
       const minutesRemaining =
-        marketType === "1T" ? Math.max(0, 45 - elapsed) : marketType === "2T" ? 45 : Math.max(0, 90 - elapsed);
+        marketType === "1T"
+          ? Math.max(0, 45 - elapsed)
+          : marketType === "2T"
+            ? 45
+            : Math.max(0, 90 - elapsed);
 
       let probability = 0.5;
 
@@ -181,7 +190,11 @@ const MARKETS = {
       const foulsPerMin = foulsNow / Math.max(1, elapsed);
 
       const minutesRemaining =
-        marketType === "1T" ? Math.max(0, 45 - elapsed) : marketType === "2T" ? 45 : Math.max(0, 90 - elapsed);
+        marketType === "1T"
+          ? Math.max(0, 45 - elapsed)
+          : marketType === "2T"
+            ? 45
+            : Math.max(0, 90 - elapsed);
 
       let probability = 0.25;
 
@@ -306,7 +319,9 @@ const MARKETS = {
       const xGDiff = (xG.home || 0) - (xG.away || 0);
       probability += (isHomeSelection ? xGDiff : -xGDiff) * 0.25;
 
-      probability += isHomeSelection ? ((possession.home || 50) - 50) * 0.002 : ((possession.away || 50) - 50) * 0.002;
+      probability += isHomeSelection
+        ? ((possession.home || 50) - 50) * 0.002
+        : ((possession.away || 50) - 50) * 0.002;
 
       probability -= Math.abs(handicapValue) * 0.08;
 
@@ -351,8 +366,15 @@ function gamma(n) {
 
   const g = 7;
   const p = [
-    0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
-    12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+    0.99999999999980993,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
   ];
 
   if (n < 0.5) {
@@ -568,7 +590,6 @@ class MatchAnalyzer {
       if (v === null || v === undefined) return 0;
       if (typeof v === "number") return v;
 
-      // trata "55%" etc
       if (typeof v === "string") return parseFloat(v.replace("%", "")) || 0;
 
       return parseFloat(v) || 0;
@@ -849,7 +870,7 @@ class MarketAnalyzer {
 
       console.log(`[MARKET] Analisando mercado: ${market.name}`);
 
-      const marketOdds = matchData.odds.filter((odd) => this.isMarketMatch(odd.market, market.name, market.types));
+      const marketOdds = matchData.odds.filter((odd) => this.isMarketMatch(odd.market, market.name));
 
       console.log(`[MARKET] ${market.name}: ${marketOdds.length} odds encontradas`);
 
@@ -1209,6 +1230,7 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+// ✅ FIX: debug odds agora suporta group.bookmakers / group.odds / group.bets (não fica vazio)
 app.get("/api/debug/odds/:fixtureId", async (req, res) => {
   try {
     const fixtureId = parseInt(req.params.fixtureId);
@@ -1216,49 +1238,93 @@ app.get("/api/debug/odds/:fixtureId", async (req, res) => {
 
     const analysis = {
       fixtureId,
-      totalResponseGroups: oddsData.length,
+      totalResponseGroups: Array.isArray(oddsData) ? oddsData.length : 0,
       marketSummary: {},
       oddsInRange: [],
+      rawShape: [],
     };
 
-    oddsData.forEach((group) => {
-      if (group.bookmakers) {
-        group.bookmakers.forEach((bm) => {
-          bm.bets?.forEach((bet) => {
-            const marketName = bet.name || "Unknown";
+    const pushOdd = (marketName, bmName, value) => {
+      const oddValue = parseFloat(value?.odd) || 0;
+      const selection = value?.value ?? null;
+      const handicap = value?.handicap ?? null;
 
-            if (!analysis.marketSummary[marketName]) {
-              analysis.marketSummary[marketName] = { count: 0, minOdd: 999, maxOdd: 0 };
-            }
+      if (!marketName) return;
 
-            bet.values?.forEach((value) => {
-              const oddValue = parseFloat(value.odd) || 0;
-              analysis.marketSummary[marketName].count++;
-              analysis.marketSummary[marketName].minOdd = Math.min(analysis.marketSummary[marketName].minOdd, oddValue);
-              analysis.marketSummary[marketName].maxOdd = Math.max(analysis.marketSummary[marketName].maxOdd, oddValue);
+      if (!analysis.marketSummary[marketName]) {
+        analysis.marketSummary[marketName] = {
+          count: 0,
+          minOdd: 999,
+          maxOdd: 0,
+          values: [],
+        };
+      }
 
-              if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
-                analysis.oddsInRange.push({
-                  market: marketName,
-                  selection: value.value,
-                  odd: oddValue,
-                  handicap: value.handicap,
-                  bookmaker: bm.name,
-                });
-              }
-            });
-          });
+      analysis.marketSummary[marketName].count++;
+      analysis.marketSummary[marketName].minOdd = Math.min(analysis.marketSummary[marketName].minOdd, oddValue);
+      analysis.marketSummary[marketName].maxOdd = Math.max(analysis.marketSummary[marketName].maxOdd, oddValue);
+
+      analysis.marketSummary[marketName].values.push({
+        selection,
+        odd: oddValue,
+        handicap,
+        bookmaker: bmName || "unknown",
+      });
+
+      if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
+        analysis.oddsInRange.push({
+          market: marketName,
+          selection,
+          odd: oddValue,
+          handicap,
+          bookmaker: bmName || "unknown",
         });
+      }
+    };
+
+    const processBetsList = (bets, bmName) => {
+      if (!Array.isArray(bets)) return;
+      bets.forEach((bet) => {
+        const marketName = String(bet?.name || "").trim();
+        if (!marketName) return;
+        const values = bet?.values;
+        if (!Array.isArray(values)) return;
+        values.forEach((value) => pushOdd(marketName, bmName, value));
+      });
+    };
+
+    (Array.isArray(oddsData) ? oddsData : []).forEach((group, idx) => {
+      analysis.rawShape.push({
+        idx,
+        keys: group && typeof group === "object" ? Object.keys(group) : [],
+        hasBookmakers: !!group?.bookmakers,
+        hasOdds: !!group?.odds,
+        hasBets: !!group?.bets,
+      });
+
+      // Formato A: { bookmakers:[{name, bets:[{name, values:[] }]}] }
+      if (Array.isArray(group?.bookmakers)) {
+        group.bookmakers.forEach((bm) => processBetsList(bm?.bets, bm?.name || "unknown"));
+      }
+
+      // Formato B: { odds:[{name, values:[]}] }
+      if (Array.isArray(group?.odds)) {
+        processBetsList(group.odds, "live");
+      }
+
+      // Formato C: { bets:[{name, values:[]}] }
+      if (Array.isArray(group?.bets)) {
+        processBetsList(group.bets, "live");
       }
     });
 
     const topMarkets = Object.entries(analysis.marketSummary)
-      .sort((a, b) => b[1].count - a[1].count)
+      .sort((a, b) => (b?.[1]?.count || 0) - (a?.[1]?.count || 0))
       .slice(0, 10)
       .map(([name, data]) => ({
         market: name,
         count: data.count,
-        oddRange: `${data.minOdd.toFixed(2)} - ${data.maxOdd.toFixed(2)}`,
+        oddRange: `${(data.minOdd === 999 ? 0 : data.minOdd).toFixed(2)} - ${data.maxOdd.toFixed(2)}`,
         hasOddsInRange: data.minOdd <= config.oddRange.max && data.maxOdd >= config.oddRange.min,
       }));
 
@@ -1268,7 +1334,7 @@ app.get("/api/debug/odds/:fixtureId", async (req, res) => {
       config: {
         oddRange: config.oddRange,
         oddsInRangeCount: analysis.oddsInRange.length,
-        oddsInRangeSample: analysis.oddsInRange.slice(0, 5),
+        oddsInRangeSample: analysis.oddsInRange.slice(0, 10),
       },
     });
   } catch (error) {
@@ -1336,7 +1402,7 @@ app.listen(PORT, () => {
   console.log("ROTAS:");
   console.log("GET  /api/health");
   console.log("GET  /api/test-ev");
-  console.log("GET  /api/debug/market-calculation?market=corners&probability=0.62&odd=1.78");
+  console.log("GET  /api/debug/market-calculation?market=EVTEST&probability=0.62&odd=1.78");
   console.log("GET  /api/live-matches");
   console.log("GET  /api/live-matches?leagueId=39");
   console.log("GET  /api/match-stats/:fixtureId");
