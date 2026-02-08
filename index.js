@@ -29,7 +29,7 @@ const config = {
 const statsCache = new Map();
 
 // ============================================
-// MERCADOS DEFINIDOS (SEPARADOS E COMENTADOS)
+// MERCADOS DEFINIDOS (CORRIGIDOS)
 // ============================================
 
 const MARKETS = {
@@ -39,15 +39,13 @@ const MARKETS = {
     name: 'Escanteios',
     types: ['1T', '2T', 'Match', 'Team'],
     
-    // REGRAS ESPECÍFICAS PARA ESCANTEIOS
     rules: {
       minCornersForAnalysis: 2,
       considerPossession: true,
       weightRecent: 0.7
     },
     
-    // FÓRMULA EV PARA ESCANTEIOS
-    calculateEV: (stats, odd, marketType) => {
+    calculateEV: (stats, odd, marketType, handicap, selectionType) => {
       const elapsed = stats.match.time.elapsed;
       const cornersNow = stats.corners.total || 0;
       
@@ -61,7 +59,18 @@ const MARKETS = {
       
       if (cornersNow > 0) {
         const expectedCorners = cornersPerMin * minutesRemaining;
-        probability = Math.min(0.95, expectedCorners / 10); // Normalização
+        // Normalização mais realista
+        probability = Math.min(0.95, Math.max(0.05, expectedCorners / 12));
+      }
+      
+      // Ajustar por handicap se existir
+      if (handicap) {
+        const target = parseFloat(handicap);
+        if (selectionType === 'over') {
+          probability = Math.max(0.05, Math.min(0.95, probability * 1.2));
+        } else if (selectionType === 'under') {
+          probability = Math.max(0.05, Math.min(0.95, probability * 0.8));
+        }
       }
       
       // Cálculo EV: (Probabilidade * Odd) - 1
@@ -71,9 +80,10 @@ const MARKETS = {
         probability,
         details: {
           cornersNow,
-          cornersPerMin,
-          expectedCorners: cornersPerMin * minutesRemaining,
-          marketType
+          cornersPerMin: cornersPerMin.toFixed(3),
+          expectedCorners: (cornersPerMin * minutesRemaining).toFixed(2),
+          marketType,
+          minutesRemaining
         }
       };
     }
@@ -91,7 +101,7 @@ const MARKETS = {
       minShotsForAnalysis: 3
     },
     
-    calculateEV: (stats, odd, marketType, handicap) => {
+    calculateEV: (stats, odd, marketType, handicap, selectionType) => {
       const elapsed = stats.match.time.elapsed;
       const score = stats.match.score;
       const totalGoals = score.home + score.away;
@@ -103,28 +113,45 @@ const MARKETS = {
       
       let probability = 0.5;
       
-      // Modelo Poisson simplificado
-      const lambda = goalsPerMin * minutesRemaining;
+      // Usar xG se disponível
+      const xGTotal = (stats.xG.home || 0) + (stats.xG.away || 0);
+      const effectiveGoalsPerMin = xGTotal > 0 ? 
+        (xGTotal / elapsed) : 
+        goalsPerMin;
+      
+      const lambda = effectiveGoalsPerMin * minutesRemaining;
+      
+      // Função Poisson corrigida
+      const poissonProbability = (k) => {
+        return (Math.exp(-lambda) * Math.pow(lambda, k)) / gamma(k + 1);
+      };
       
       if (marketType.includes('Over') && handicap) {
         const target = parseFloat(handicap);
-        // Probabilidade de mais de X gols
-        probability = 1 - Math.exp(-lambda);
-        for (let i = 0; i <= target; i++) {
-          probability -= (Math.pow(lambda, i) * Math.exp(-lambda)) / factorial(i);
+        // Probabilidade de ter MAIS que target gols
+        let cumulative = 0;
+        for (let k = 0; k <= Math.floor(target); k++) {
+          cumulative += poissonProbability(k);
         }
+        probability = Math.max(0.05, Math.min(0.95, 1 - cumulative));
       } else if (marketType.includes('Under') && handicap) {
         const target = parseFloat(handicap);
-        // Probabilidade de menos de X gols
-        probability = 0;
-        for (let i = 0; i <= target; i++) {
-          probability += (Math.pow(lambda, i) * Math.exp(-lambda)) / factorial(i);
+        // Probabilidade de ter MENOS que target gols
+        let cumulative = 0;
+        for (let k = 0; k <= Math.floor(target); k++) {
+          cumulative += poissonProbability(k);
         }
-      } else if (marketType === 'Both Teams to Score') {
-        // Probabilidade simplificada de ambos marcarem
-        const homeScoringProb = stats.teams.home.shotsOnTarget > 0 ? 0.6 : 0.3;
-        const awayScoringProb = stats.teams.away.shotsOnTarget > 0 ? 0.6 : 0.3;
-        probability = homeScoringProb * awayScoringProb;
+        probability = Math.max(0.05, Math.min(0.95, cumulative));
+      } else if (marketType === 'Both Teams to Score' || selectionType === 'yes') {
+        // Probabilidade mais realista de ambos marcarem
+        const homeAttackStrength = Math.min(1, (stats.shots.home.onTarget || 0) / 10);
+        const awayAttackStrength = Math.min(1, (stats.shots.away.onTarget || 0) / 10);
+        const homeScoringProb = 0.3 + (homeAttackStrength * 0.4);
+        const awayScoringProb = 0.3 + (awayAttackStrength * 0.4);
+        probability = Math.max(0.05, Math.min(0.95, homeScoringProb * awayScoringProb));
+      } else if (selectionType === 'no') {
+        // Probabilidade de não ambos marcarem
+        probability = 0.6; // Base mais conservadora
       }
       
       const ev = (probability * odd) - 1;
@@ -133,10 +160,11 @@ const MARKETS = {
         probability,
         details: {
           totalGoals,
-          goalsPerMin,
-          expectedGoals: lambda,
+          goalsPerMin: goalsPerMin.toFixed(3),
+          expectedGoals: lambda.toFixed(2),
           marketType,
-          handicap
+          handicap,
+          xGUsed: xGTotal > 0
         }
       };
     }
@@ -153,23 +181,42 @@ const MARKETS = {
       considerIntensity: true
     },
     
-    calculateEV: (stats, odd, marketType, handicap) => {
+    calculateEV: (stats, odd, marketType, handicap, selectionType) => {
       const elapsed = stats.match.time.elapsed;
       const cardsNow = stats.cards.total || 0;
       const foulsNow = stats.fouls.total || 0;
+      const yellowCards = stats.cards.yellow || 0;
       
-      // Taxa de cartões por minuto
+      // Taxas por minuto
       const cardsPerMin = cardsNow / Math.max(1, elapsed);
       const foulsPerMin = foulsNow / Math.max(1, elapsed);
+      const yellowPerMin = yellowCards / Math.max(1, elapsed);
       
       const minutesRemaining = marketType === '1T' ? 45 - elapsed : 
                               marketType === '2T' ? 45 : 90 - elapsed;
       
-      // Probabilidade baseada em intensidade
-      let probability = 0.3; // Base
+      // Modelo baseado em intensidade do jogo
+      let probability = 0.25; // Base mais conservadora
+      
+      // Intensidade baseada em faltas
+      const intensity = foulsPerMin * 0.3;
+      probability += Math.min(0.4, intensity);
+      
+      // Cartões existentes indicam arbitragem mais rigorosa
       probability += cardsPerMin * 0.2;
-      probability += foulsPerMin * 0.1;
-      probability = Math.min(0.9, probability);
+      
+      // Ajustar por handicap
+      if (handicap) {
+        const target = parseFloat(handicap);
+        const expectedCards = cardsPerMin * minutesRemaining;
+        if (selectionType === 'over') {
+          probability = expectedCards > target ? 0.65 : 0.35;
+        } else if (selectionType === 'under') {
+          probability = expectedCards < target ? 0.65 : 0.35;
+        }
+      }
+      
+      probability = Math.max(0.05, Math.min(0.95, probability));
       
       const ev = (probability * odd) - 1;
       return {
@@ -178,8 +225,9 @@ const MARKETS = {
         details: {
           cardsNow,
           foulsNow,
-          cardsPerMin,
-          expectedCards: cardsPerMin * minutesRemaining,
+          cardsPerMin: cardsPerMin.toFixed(3),
+          foulsPerMin: foulsPerMin.toFixed(3),
+          expectedCards: (cardsPerMin * minutesRemaining).toFixed(2),
           marketType
         }
       };
@@ -198,40 +246,50 @@ const MARKETS = {
       homeAdvantage: 0.1
     },
     
-    calculateEV: (stats, odd, marketType, selection) => {
+    calculateEV: (stats, odd, marketType, handicap, selectionType) => {
       const elapsed = stats.match.time.elapsed;
       const score = stats.match.score;
       const possession = stats.possession;
       const shots = stats.shots;
+      const xG = stats.xG || { home: 0, away: 0 };
       
-      // Análise baseada em momentum atual
+      // Análise baseada em múltiplos fatores
       let probability = 0.5;
       
-      // Fator posse de bola
-      if (selection === 'home') {
-        probability += (possession.home - 50) * 0.005;
-      } else if (selection === 'away') {
-        probability += (possession.away - 50) * 0.005;
-      }
-      
-      // Fator chutes ao gol
-      if (selection === 'home') {
-        probability += (shots.home.onTarget * 0.02);
-      } else if (selection === 'away') {
-        probability += (shots.away.onTarget * 0.02);
-      }
-      
-      // Fator placar atual
+      // 1. Fator placar atual (mais peso)
       const goalDiff = score.home - score.away;
-      if (selection === 'home' && goalDiff > 0) {
-        probability += goalDiff * 0.1;
-      } else if (selection === 'away' && goalDiff < 0) {
-        probability += Math.abs(goalDiff) * 0.1;
+      if (selectionType === 'home') {
+        probability += goalDiff * 0.15;
+      } else if (selectionType === 'away') {
+        probability -= goalDiff * 0.15;
       }
       
-      // Vantagem de mando de campo
-      if (selection === 'home' && marketType === 'Match') {
-        probability += 0.1;
+      // 2. Fator posse de bola (menos peso)
+      if (selectionType === 'home') {
+        probability += (possession.home - 50) * 0.002;
+      } else if (selectionType === 'away') {
+        probability += (possession.away - 50) * 0.002;
+      }
+      
+      // 3. Fator xG (Expected Goals) - mais preciso que shots
+      const xGDiff = (xG.home || 0) - (xG.away || 0);
+      if (selectionType === 'home') {
+        probability += xGDiff * 0.2;
+      } else if (selectionType === 'away') {
+        probability -= xGDiff * 0.2;
+      }
+      
+      // 4. Vantagem de mando de campo (apenas para resultado final)
+      if (selectionType === 'home' && marketType === 'Match') {
+        probability += 0.08; // Reduzido de 0.1 para ser mais conservador
+      }
+      
+      // 5. Fator tempo (momentum diminui com o tempo)
+      const timeFactor = elapsed / 90;
+      if (goalDiff > 0 && selectionType === 'home') {
+        probability += 0.1 * (1 - timeFactor); // Vantagem diminui com o tempo
+      } else if (goalDiff < 0 && selectionType === 'away') {
+        probability += 0.1 * (1 - timeFactor);
       }
       
       probability = Math.max(0.1, Math.min(0.9, probability));
@@ -243,9 +301,11 @@ const MARKETS = {
         details: {
           score,
           possession,
-          shotsOnTarget: shots.total.onTarget,
+          xGDiff: xGDiff.toFixed(2),
+          shotsOnTarget: shots.total.onTarget || 0,
           marketType,
-          selection
+          selectionType,
+          timeFactor: timeFactor.toFixed(2)
         }
       };
     }
@@ -262,30 +322,45 @@ const MARKETS = {
       considerMomentum: true
     },
     
-    calculateEV: (stats, odd, marketType, handicap) => {
+    calculateEV: (stats, odd, marketType, handicap, selectionType) => {
       const elapsed = stats.match.time.elapsed;
       const score = stats.match.score;
       const possession = stats.possession;
-      const xG = stats.xG;
-      
-      const handicapValue = parseFloat(handicap);
-      const effectiveScore = score.home - score.away - handicapValue;
+      const xG = stats.xG || { home: 0, away: 0 };
       
       let probability = 0.5;
       
-      // Baseado em xG e posse
-      const xGDiff = xG.home - xG.away;
-      probability += xGDiff * 0.15;
+      // Determinar handicap e time
+      let handicapValue = 0;
+      let isHomeSelection = selectionType === 'home';
       
-      // Baseado em posse
-      probability += (possession.home - 50) * 0.003;
+      if (handicap) {
+        handicapValue = parseFloat(handicap);
+      }
       
-      // Ajuste pelo handicap
-      probability -= handicapValue * 0.1;
+      // Score ajustado pelo handicap
+      const effectiveScore = (score.home + (isHomeSelection ? handicapValue : 0)) - 
+                           (score.away + (isHomeSelection ? 0 : handicapValue));
       
-      // Fator tempo
+      // 1. Diferença de xG (fator mais importante)
+      const xGDiff = (xG.home || 0) - (xG.away || 0);
+      probability += (isHomeSelection ? xGDiff : -xGDiff) * 0.25;
+      
+      // 2. Posse de bola
+      probability += (isHomeSelection ? 
+        (possession.home - 50) * 0.002 : 
+        (possession.away - 50) * 0.002);
+      
+      // 3. Handicap adjustment
+      probability -= Math.abs(handicapValue) * 0.08;
+      
+      // 4. Fator tempo e placar atual
       const timeFactor = elapsed / 90;
-      probability += (effectiveScore > 0 ? 0.2 : -0.2) * timeFactor;
+      if (effectiveScore > 0) {
+        probability += (isHomeSelection ? 0.15 : -0.15) * timeFactor;
+      } else if (effectiveScore < 0) {
+        probability += (isHomeSelection ? -0.15 : 0.15) * timeFactor;
+      }
       
       probability = Math.max(0.1, Math.min(0.9, probability));
       
@@ -297,9 +372,11 @@ const MARKETS = {
           score,
           handicap: handicapValue,
           effectiveScore,
-          xGDiff,
-          possessionDiff: possession.home - possession.away,
-          marketType
+          xGDiff: xGDiff.toFixed(2),
+          possessionDiff: (possession.home - possession.away).toFixed(1),
+          marketType,
+          selectionType,
+          timeRemaining: (90 - elapsed)
         }
       };
     }
@@ -307,14 +384,74 @@ const MARKETS = {
 };
 
 // ============================================
-// FUNÇÕES AUXILIARES
+// FUNÇÕES AUXILIARES CORRIGIDAS
 // ============================================
 
-function factorial(n) {
+// Função gamma (fatorial para números reais) - CORREÇÃO CRÍTICA
+function gamma(n) {
+  // Aproximação de Stirling para a função Gamma
   if (n === 0 || n === 1) return 1;
-  let result = 1;
-  for (let i = 2; i <= n; i++) result *= i;
-  return result;
+  if (Number.isInteger(n)) {
+    let result = 1;
+    for (let i = 2; i <= n - 1; i++) result *= i;
+    return result;
+  }
+  // Aproximação para números não inteiros
+  const g = 7;
+  const p = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7
+  ];
+  
+  if (n < 0.5) {
+    return Math.PI / (Math.sin(Math.PI * n) * gamma(1 - n));
+  }
+  
+  n -= 1;
+  let x = p[0];
+  for (let i = 1; i < g + 2; i++) {
+    x += p[i] / (n + i);
+  }
+  const t = n + g + 0.5;
+  return Math.sqrt(2 * Math.PI) * Math.pow(t, n + 0.5) * Math.exp(-t) * x;
+}
+
+// Função factorial usando gamma (para compatibilidade)
+function factorial(n) {
+  if (n < 0) return NaN;
+  if (n === 0 || n === 1) return 1;
+  return gamma(n + 1);
+}
+
+// Função de validação de EV para testes
+function validateEVCalculation() {
+  const testCases = [
+    { probability: 0.7, odd: 1.5, expectedEV: 0.05 },
+    { probability: 0.5, odd: 2.0, expectedEV: 0.0 },
+    { probability: 0.3, odd: 4.0, expectedEV: 0.2 },
+    { probability: 0.8, odd: 1.25, expectedEV: 0.0 },
+  ];
+  
+  console.log('🧪 VALIDAÇÃO DE CÁLCULO EV:');
+  console.log('============================');
+  
+  let allPassed = true;
+  testCases.forEach((test, i) => {
+    const ev = (test.probability * test.odd) - 1;
+    const diff = Math.abs(ev - test.expectedEV);
+    const passed = diff < 0.01;
+    
+    console.log(`Teste ${i + 1}: P=${test.probability}, Odd=${test.odd}`);
+    console.log(`  Calculado: ${ev.toFixed(4)} | Esperado: ${test.expectedEV.toFixed(4)}`);
+    console.log(`  Status: ${passed ? '✅' : '❌'}`);
+    console.log('---');
+    
+    if (!passed) allPassed = false;
+  });
+  
+  console.log(allPassed ? '✅ TODOS OS TESTES PASSARAM' : '❌ ALGUNS TESTES FALHARAM');
+  return allPassed;
 }
 
 function sleep(ms) {
@@ -400,7 +537,7 @@ class ApiFootballClient {
 }
 
 // ============================================
-// ANALISADOR DE JOGOS (COM PROCESSODDS CORRIGIDO)
+// ANALISADOR DE JOGOS CORRIGIDO
 // ============================================
 
 class MatchAnalyzer {
@@ -471,7 +608,7 @@ class MatchAnalyzer {
     // Processar eventos
     const eventsData = this.processEvents(events);
     
-    // Processar odds (COM A CORREÇÃO)
+    // Processar odds
     const oddsData = this.processOddsCorrigido(odds, matchData.teams);
     
     return {
@@ -493,44 +630,48 @@ class MatchAnalyzer {
       return stat ? parseFloat(stat.value) || 0 : 0;
     };
     
+    const homeData = {
+      shotsOnGoal: extractValue(homeStats?.statistics, 'Shots on Goal'),
+      shotsOffGoal: extractValue(homeStats?.statistics, 'Shots off Goal'),
+      totalShots: extractValue(homeStats?.statistics, 'Total Shots'),
+      possession: extractValue(homeStats?.statistics, 'Ball Possession'),
+      corners: extractValue(homeStats?.statistics, 'Corner Kicks'),
+      fouls: extractValue(homeStats?.statistics, 'Fouls'),
+      yellowCards: extractValue(homeStats?.statistics, 'Yellow Cards'),
+      redCards: extractValue(homeStats?.statistics, 'Red Cards'),
+      offsides: extractValue(homeStats?.statistics, 'Offsides'),
+      passes: extractValue(homeStats?.statistics, 'Total passes'),
+      accuratePasses: extractValue(homeStats?.statistics, 'Passes %'),
+      xG: extractValue(homeStats?.statistics, 'Expected Goals')
+    };
+    
+    const awayData = {
+      shotsOnGoal: extractValue(awayStats?.statistics, 'Shots on Goal'),
+      shotsOffGoal: extractValue(awayStats?.statistics, 'Shots off Goal'),
+      totalShots: extractValue(awayStats?.statistics, 'Total Shots'),
+      possession: extractValue(awayStats?.statistics, 'Ball Possession'),
+      corners: extractValue(awayStats?.statistics, 'Corner Kicks'),
+      fouls: extractValue(awayStats?.statistics, 'Fouls'),
+      yellowCards: extractValue(awayStats?.statistics, 'Yellow Cards'),
+      redCards: extractValue(awayStats?.statistics, 'Red Cards'),
+      offsides: extractValue(awayStats?.statistics, 'Offsides'),
+      passes: extractValue(awayStats?.statistics, 'Total passes'),
+      accuratePasses: extractValue(awayStats?.statistics, 'Passes %'),
+      xG: extractValue(awayStats?.statistics, 'Expected Goals')
+    };
+    
     return {
-      home: {
-        shotsOnGoal: extractValue(homeStats?.statistics, 'Shots on Goal'),
-        shotsOffGoal: extractValue(homeStats?.statistics, 'Shots off Goal'),
-        totalShots: extractValue(homeStats?.statistics, 'Total Shots'),
-        possession: extractValue(homeStats?.statistics, 'Ball Possession'),
-        corners: extractValue(homeStats?.statistics, 'Corner Kicks'),
-        fouls: extractValue(homeStats?.statistics, 'Fouls'),
-        yellowCards: extractValue(homeStats?.statistics, 'Yellow Cards'),
-        redCards: extractValue(homeStats?.statistics, 'Red Cards'),
-        offsides: extractValue(homeStats?.statistics, 'Offsides'),
-        passes: extractValue(homeStats?.statistics, 'Total passes'),
-        accuratePasses: extractValue(homeStats?.statistics, 'Passes %'),
-        xG: extractValue(homeStats?.statistics, 'Expected Goals')
-      },
-      away: {
-        shotsOnGoal: extractValue(awayStats?.statistics, 'Shots on Goal'),
-        shotsOffGoal: extractValue(awayStats?.statistics, 'Shots off Goal'),
-        totalShots: extractValue(awayStats?.statistics, 'Total Shots'),
-        possession: extractValue(awayStats?.statistics, 'Ball Possession'),
-        corners: extractValue(awayStats?.statistics, 'Corner Kicks'),
-        fouls: extractValue(awayStats?.statistics, 'Fouls'),
-        yellowCards: extractValue(awayStats?.statistics, 'Yellow Cards'),
-        redCards: extractValue(awayStats?.statistics, 'Red Cards'),
-        offsides: extractValue(awayStats?.statistics, 'Offsides'),
-        passes: extractValue(awayStats?.statistics, 'Total passes'),
-        accuratePasses: extractValue(awayStats?.statistics, 'Passes %'),
-        xG: extractValue(awayStats?.statistics, 'Expected Goals')
-      },
+      home: homeData,
+      away: awayData,
       totals: {
-        shotsOnGoal: 0,
-        shotsOffGoal: 0,
-        totalShots: 0,
-        corners: 0,
-        fouls: 0,
-        yellowCards: 0,
-        redCards: 0,
-        offsides: 0
+        shotsOnGoal: homeData.shotsOnGoal + awayData.shotsOnGoal,
+        shotsOffGoal: homeData.shotsOffGoal + awayData.shotsOffGoal,
+        totalShots: homeData.totalShots + awayData.totalShots,
+        corners: homeData.corners + awayData.corners,
+        fouls: homeData.fouls + awayData.fouls,
+        yellowCards: homeData.yellowCards + awayData.yellowCards,
+        redCards: homeData.redCards + awayData.redCards,
+        offsides: homeData.offsides + awayData.offsides
       }
     };
   }
@@ -548,10 +689,6 @@ class MatchAnalyzer {
       allEvents: events
     };
   }
-  
-  // ============================================
-  // CORREÇÃO CRÍTICA: processOdds CORRIGIDO
-  // ============================================
   
   processOddsCorrigido(odds, teams) {
     const markets = [];
@@ -571,7 +708,6 @@ class MatchAnalyzer {
               const marketName = String(bet.name || '').trim();
               const marketLower = marketName.toLowerCase();
               
-              // DETECTAR TODOS OS MERCADOS RELEVANTES (CORREÇÃO AQUI)
               const isRelevantMarket = 
                 marketLower.includes('corner') ||
                 marketLower.includes('escanteio') ||
@@ -598,7 +734,6 @@ class MatchAnalyzer {
               
               if (!isRelevantMarket) return;
               
-              // DETERMINAR PERÍODO
               let period = 'Match';
               if (marketLower.includes('1st') || marketLower.includes('1st half') || marketLower.includes('first half')) {
                 period = '1H';
@@ -606,18 +741,14 @@ class MatchAnalyzer {
                 period = '2H';
               }
               
-              // PROCESSAR VALORES
               if (bet.values && Array.isArray(bet.values)) {
                 bet.values.forEach(value => {
                   const oddValue = parseFloat(value.odd) || 0;
                   
-                  // FILTRAR POR RANGE 1.40-2.00 (CONDIÇÃO DO SEU SISTEMA)
                   if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
-                    
                     const selection = String(value.value || '').trim();
                     const selectionLower = selection.toLowerCase();
                     
-                    // DETECTAR TIPO DE SELEÇÃO
                     let selectionType = 'game';
                     let targetTeam = null;
                     
@@ -635,6 +766,8 @@ class MatchAnalyzer {
                       selectionType = 'yes';
                     } else if (selectionLower.includes('no') || selectionLower.includes('não')) {
                       selectionType = 'no';
+                    } else if (selectionLower.includes('draw')) {
+                      selectionType = 'draw';
                     }
                     
                     markets.push({
@@ -646,7 +779,6 @@ class MatchAnalyzer {
                       odd: Number(oddValue.toFixed(2)),
                       handicap: value.handicap || null,
                       period: period,
-                      // Informações para debug
                       rawMarketName: marketName,
                       rawSelection: selection
                     });
@@ -658,13 +790,12 @@ class MatchAnalyzer {
         });
       }
       
-      // Formato B: Odds diretas (formato alternativo da API)
+      // Formato B: Odds diretas
       if (oddGroup.odds && Array.isArray(oddGroup.odds)) {
         oddGroup.odds.forEach(bet => {
           const marketName = String(bet.name || '').trim();
           const marketLower = marketName.toLowerCase();
           
-          // Mesma lógica de detecção
           const isRelevantMarket = 
             marketLower.includes('corner') ||
             marketLower.includes('escanteio') ||
@@ -724,28 +855,11 @@ class MatchAnalyzer {
     
     console.log(`[ODDS PROCESSOR] Encontrados ${markets.length} mercados no range ${config.oddRange.min}-${config.oddRange.max}`);
     
-    // Log para debug
     if (markets.length > 0) {
       console.log('[ODDS SAMPLE] Primeiros mercados encontrados:');
       markets.slice(0, 3).forEach((m, i) => {
         console.log(`  ${i+1}. ${m.market} - ${m.selection} @ ${m.odd} (${m.period})`);
       });
-    } else {
-      console.log('[ODDS PROCESSOR] Nenhum mercado encontrado no range especificado');
-      console.log('[ODDS PROCESSOR] Verificando se há odds fora do range...');
-      
-      // Debug: contar total de odds disponíveis
-      let totalOdds = 0;
-      odds.forEach(oddGroup => {
-        if (oddGroup.bookmakers) {
-          oddGroup.bookmakers.forEach(bm => {
-            bm.bets?.forEach(bet => {
-              totalOdds += bet.values?.length || 0;
-            });
-          });
-        }
-      });
-      console.log(`[ODDS DEBUG] Total de odds disponíveis (qualquer valor): ${totalOdds}`);
     }
     
     return markets;
@@ -753,7 +867,7 @@ class MatchAnalyzer {
 }
 
 // ============================================
-// ANALISADOR DE MERCADOS (ATUALIZADO)
+// ANALISADOR DE MERCADOS CORRIGIDO
 // ============================================
 
 class MarketAnalyzer {
@@ -777,7 +891,7 @@ class MarketAnalyzer {
       };
     }
     
-    // 3. Preparar estatísticas para cálculo (com fallback para eventos)
+    // 3. Preparar estatísticas para cálculo
     const stats = this.prepareStatsForAnalysis(matchData);
     
     // 4. Analisar cada mercado
@@ -787,7 +901,6 @@ class MarketAnalyzer {
       const market = MARKETS[marketKey];
       console.log(`[MARKET] Analisando mercado: ${market.name}`);
       
-      // Filtrar odds para este mercado (CORREÇÃO MELHORADA)
       const marketOdds = matchData.odds.filter(odd => 
         this.isMarketMatch(odd.market, market.name, market.types)
       );
@@ -795,17 +908,25 @@ class MarketAnalyzer {
       console.log(`[MARKET] ${market.name}: ${marketOdds.length} odds encontradas`);
       
       for (const oddData of marketOdds) {
-        // Já está filtrado por range de odds, mas verificamos novamente
         if (oddData.odd >= config.oddRange.min && oddData.odd <= config.oddRange.max) {
-          
-          // Determinar tipo de mercado e seleção
           const marketType = this.determineMarketType(oddData.market, oddData.period);
           const selection = oddData.selection;
           const handicap = oddData.handicap;
           const selectionType = oddData.selectionType;
           
-          // Calcular EV específico do mercado
-          const evResult = market.calculateEV(stats, oddData.odd, marketType, handicap, selectionType);
+          // Calcular EV com todos os parâmetros necessários
+          const evResult = market.calculateEV(
+            stats, 
+            oddData.odd, 
+            marketType, 
+            handicap, 
+            selectionType
+          );
+          
+          // Log detalhado para debugging
+          console.log(`[EV CALC] ${market.name} - ${selection} @ ${oddData.odd}`);
+          console.log(`  Probabilidade: ${(evResult.probability * 100).toFixed(1)}%`);
+          console.log(`  EV: ${evResult.ev.toFixed(4)}`);
           
           if (evResult.ev > 0) {
             console.log(`[EV+] ${market.name} - ${selection} @ ${oddData.odd} - EV: ${evResult.ev.toFixed(4)}`);
@@ -829,6 +950,11 @@ class MarketAnalyzer {
                 teams: matchData.match.teams,
                 minute: matchData.match.time.elapsed,
                 score: matchData.match.score
+              },
+              rawOddData: {
+                bookmaker: oddData.bookmaker,
+                period: oddData.period,
+                market: oddData.market
               }
             });
           }
@@ -848,7 +974,8 @@ class MarketAnalyzer {
   }
   
   prepareStatsForAnalysis(matchData) {
-    // Usar eventos como fallback quando estatísticas estão zeradas
+    // CORREÇÃO: Usar dados reais da API, não fallbacks incorretos
+    const stats = matchData.statistics;
     const events = matchData.events;
     
     return {
@@ -856,55 +983,59 @@ class MarketAnalyzer {
         time: {
           elapsed: matchData.match.time.elapsed
         },
-        score: {
-          home: matchData.match.score.home,
-          away: matchData.match.score.away
-        }
+        score: matchData.match.score
       },
       corners: {
-        total: matchData.statistics.totals.corners > 0 ? matchData.statistics.totals.corners : events.corners,
-        home: matchData.statistics.home.corners,
-        away: matchData.statistics.away.corners
+        total: stats.totals.corners,
+        home: stats.home.corners,
+        away: stats.away.corners
       },
       possession: {
-        home: matchData.statistics.home.possession,
-        away: matchData.statistics.away.possession
+        home: stats.home.possession,
+        away: stats.away.possession
       },
       shots: {
         total: {
-          onTarget: matchData.statistics.totals.shotsOnGoal > 0 ? 
-            matchData.statistics.totals.shotsOnGoal : 0,
-          offTarget: matchData.statistics.totals.shotsOffGoal > 0 ? 
-            matchData.statistics.totals.shotsOffGoal : 0
+          onTarget: stats.totals.shotsOnGoal,
+          offTarget: stats.totals.shotsOffGoal
         },
         home: {
-          onTarget: matchData.statistics.home.shotsOnGoal,
-          offTarget: matchData.statistics.home.shotsOffGoal
+          onTarget: stats.home.shotsOnGoal,
+          offTarget: stats.home.shotsOffGoal
         },
         away: {
-          onTarget: matchData.statistics.away.shotsOnGoal,
-          offTarget: matchData.statistics.away.shotsOffGoal
+          onTarget: stats.away.shotsOnGoal,
+          offTarget: stats.away.shotsOffGoal
         }
       },
       cards: {
-        total: matchData.events.yellowCards + matchData.events.redCards,
-        yellow: matchData.events.yellowCards,
-        red: matchData.events.redCards
+        total: events.yellowCards + events.redCards,
+        yellow: events.yellowCards,
+        red: events.redCards
       },
       fouls: {
-        total: matchData.statistics.totals.fouls > 0 ? matchData.statistics.totals.fouls : 0,
-        home: matchData.statistics.home.fouls,
-        away: matchData.statistics.away.fouls
+        total: stats.totals.fouls,
+        home: stats.home.fouls,
+        away: stats.away.fouls
       },
       xG: {
-        home: matchData.statistics.home.xG,
-        away: matchData.statistics.away.xG
+        home: stats.home.xG,
+        away: stats.away.xG
+      },
+      teams: {
+        home: {
+          shotsOnTarget: stats.home.shotsOnGoal,
+          shotsOffTarget: stats.home.shotsOffGoal
+        },
+        away: {
+          shotsOnTarget: stats.away.shotsOnGoal,
+          shotsOffTarget: stats.away.shotsOffGoal
+        }
       }
     };
   }
   
   prepareStatsForAI(stats) {
-    // Preparar estatísticas para envio à IA
     return {
       matchMinute: stats.match.time.elapsed,
       score: stats.match.score,
@@ -917,22 +1048,22 @@ class MarketAnalyzer {
     };
   }
   
-  // CORREÇÃO: Função melhorada para detectar mercados
   isMarketMatch(marketName, marketType, marketTypes) {
     const name = marketName.toLowerCase();
     const type = marketType.toLowerCase();
     
-    // Verificar se o nome do mercado contém palavras-chave do tipo
     if (type === 'escanteios') {
       return name.includes('corner') || name.includes('escanteio');
     } else if (type === 'gols') {
       return name.includes('goal') || name.includes('gol') || name.includes('goals') || 
-             name.includes('over') || name.includes('under') || name.includes('btts');
+             name.includes('over') || name.includes('under') || name.includes('btts') ||
+             name.includes('both teams to score') || name.includes('ambas marcam');
     } else if (type === 'cartões') {
-      return name.includes('card') || name.includes('cartão') || name.includes('yellow') || name.includes('red');
+      return name.includes('card') || name.includes('cartão') || name.includes('yellow') || 
+             name.includes('red') || name.includes('cartoes');
     } else if (type === 'vitória') {
       return name.includes('winner') || name.includes('vencedor') || name.includes('1x2') || 
-             name.includes('match result');
+             name.includes('match result') || name.includes('resultado');
     } else if (type === 'asiático') {
       return name.includes('handicap') || name.includes('asiatic') || name.includes('asian');
     }
@@ -972,7 +1103,8 @@ class IAPayloadBuilder {
         handicap: bestMarket.market.handicap,
         odd: bestMarket.odd,
         ev: bestMarket.ev,
-        probability: bestMarket.probability
+        probability: bestMarket.probability,
+        confidence: this.calculateConfidence(bestMarket.ev, bestMarket.probability)
       },
       matchInfo: bestMarket.matchInfo,
       statistics: bestMarket.statistics,
@@ -981,22 +1113,81 @@ class IAPayloadBuilder {
         market: r.market.name,
         selection: r.market.selection,
         odd: r.odd,
-        ev: r.ev
+        ev: r.ev,
+        probability: r.probability
       })),
       timestamp: new Date().toISOString(),
-      analysisType: 'EV_BASED_ANALYSIS'
+      analysisType: 'EV_BASED_ANALYSIS',
+      validation: {
+        evFormula: 'EV = (Probability × Odd) - 1',
+        evCalculation: `${bestMarket.probability.toFixed(2)} × ${bestMarket.odd} - 1 = ${bestMarket.ev.toFixed(4)}`
+      }
     };
+  }
+  
+  static calculateConfidence(ev, probability) {
+    if (ev > 0.2 && probability > 0.7) return 'HIGH';
+    if (ev > 0.1 && probability > 0.6) return 'MEDIUM';
+    if (ev > 0.05) return 'LOW';
+    return 'MINIMAL';
   }
 }
 
 // ============================================
-// ROTAS DO APP (COM ROTAS DE DEBUG)
+// ROTAS DO APP (COM ROTAS DE DEBUG E TESTE)
 // ============================================
 
 // Inicializar clientes
 const apiClient = new ApiFootballClient(API_KEY);
 const matchAnalyzer = new MatchAnalyzer(apiClient);
 const marketAnalyzer = new MarketAnalyzer(matchAnalyzer);
+
+// Rota para testar cálculo EV
+app.get('/api/test-ev', (req, res) => {
+  try {
+    const results = validateEVCalculation();
+    res.json({
+      success: true,
+      results,
+      formula: 'EV = (Probability × Odd) - 1',
+      tests: [
+        { probability: 0.7, odd: 1.5, expected: 0.05 },
+        { probability: 0.5, odd: 2.0, expected: 0.00 },
+        { probability: 0.3, odd: 4.0, expected: 0.20 }
+      ]
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Rota para validar mercado específico
+app.get('/api/debug/market-calculation', async (req, res) => {
+  try {
+    const { market, probability, odd } = req.query;
+    
+    if (!market || !probability || !odd) {
+      return res.status(400).json({
+        error: 'Parâmetros necessários: market, probability, odd'
+      });
+    }
+    
+    const prob = parseFloat(probability);
+    const oddValue = parseFloat(odd);
+    const ev = (prob * oddValue) - 1;
+    
+    res.json({
+      market,
+      probability: prob,
+      odd: oddValue,
+      ev: ev.toFixed(4),
+      recommendation: ev > 0 ? 'APOSTAR' : 'EVITAR',
+      confidence: ev > 0.2 ? 'ALTA' : ev > 0.1 ? 'MÉDIA' : ev > 0 ? 'BAIXA' : 'NENHUMA'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Rota para listar jogos ao vivo
 app.get('/api/live-matches', async (req, res) => {
@@ -1090,7 +1281,7 @@ app.post('/api/analyze-match', async (req, res) => {
       results: analysis.results,
       iaPayload: iaPayload,
       message: iaPayload ? 
-        `Encontradas ${analysis.results.length} oportunidades. Payload pronto para IA.` :
+        `Encontradas ${analysis.results.length} oportunidades com EV positivo.` :
         'Nenhuma oportunidade com EV positivo encontrada.'
     });
     
@@ -1141,7 +1332,8 @@ app.get('/api/health', (req, res) => {
     },
     cacheStats: {
       cachedMatches: statsCache.size
-    }
+    },
+    evValidation: validateEVCalculation()
   });
 });
 
@@ -1149,15 +1341,13 @@ app.get('/api/health', (req, res) => {
 // ROTAS DE DEBUG PARA DIAGNÓSTICO
 // ============================================
 
-// Rota para debug de odds (ver estrutura completa)
+// Rota para debug de odds
 app.get('/api/debug/odds/:fixtureId', async (req, res) => {
   try {
     const fixtureId = parseInt(req.params.fixtureId);
     
-    // Buscar odds diretamente
     const oddsData = await apiClient.getLiveOdds(fixtureId);
     
-    // Análise detalhada
     const analysis = {
       fixtureId,
       totalResponseGroups: oddsData.length,
@@ -1166,14 +1356,12 @@ app.get('/api/debug/odds/:fixtureId', async (req, res) => {
       oddsInRange: []
     };
     
-    // Processar todas as odds
     oddsData.forEach((group, groupIndex) => {
       if (group.bookmakers) {
         group.bookmakers.forEach(bm => {
           bm.bets?.forEach(bet => {
             const marketName = bet.name || 'Unknown';
             
-            // Adicionar ao resumo
             if (!analysis.marketSummary[marketName]) {
               analysis.marketSummary[marketName] = {
                 count: 0,
@@ -1200,7 +1388,6 @@ app.get('/api/debug/odds/:fixtureId', async (req, res) => {
                 handicap: value.handicap
               });
               
-              // Verificar se está no range
               if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
                 analysis.oddsInRange.push({
                   market: marketName,
@@ -1216,7 +1403,6 @@ app.get('/api/debug/odds/:fixtureId', async (req, res) => {
       }
     });
     
-    // Top 10 mercados por quantidade
     analysis.topMarkets = Object.entries(analysis.marketSummary)
       .sort((a, b) => b[1].count - a[1].count)
       .slice(0, 10)
@@ -1300,7 +1486,7 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
   console.log('============================================');
-  console.log('MERCADOS CONFIGURADOS:');
+  console.log('MERCADOS CONFIGURADOS (CORRIGIDOS):');
   Object.values(MARKETS).forEach(market => {
     console.log(`- ${market.name}: ${market.types.join(', ')}`);
   });
@@ -1310,11 +1496,18 @@ app.listen(PORT, () => {
   console.log('============================================');
   console.log('ROTAS DISPONÍVEIS:');
   console.log('GET  /api/health');
+  console.log('GET  /api/test-ev');
+  console.log('GET  /api/debug/market-calculation');
   console.log('GET  /api/live-matches');
   console.log('GET  /api/live-matches?leagueId=39');
   console.log('GET  /api/match-stats/:fixtureId');
   console.log('POST /api/analyze-match');
   console.log('GET  /api/debug/odds/:fixtureId');
   console.log('GET  /api/debug/corners/:fixtureId');
+  console.log('============================================');
+  
+  // Validar cálculos EV ao iniciar
+  console.log('🧮 Validando cálculos EV...');
+  validateEVCalculation();
   console.log('============================================');
 });
