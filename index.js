@@ -1,4 +1,4 @@
-// index.js (COMPLETO) — ✅ FIX fetch + ✅ FIX home/away stats mapping + ✅ FIX GOALS over/under by selectionType
+
 //                 + ✅ GET /api/analyze-match (teste no navegador) + ✅ FIX /api/debug/odds suporta bookmakers/odds/bets
 
 import "dotenv/config";
@@ -966,34 +966,50 @@ class MarketAnalyzer {
   }
 
   isMarketMatch(marketName, marketType) {
-    const name = String(marketName || "").toLowerCase();
-    const type = String(marketType || "").toLowerCase();
+  const name = String(marketName || "").toLowerCase();
+  const type = String(marketType || "").toLowerCase();
 
-    if (type === "escanteios") return name.includes("corner") || name.includes("escanteio");
-    if (type === "gols")
-      return (
-        name.includes("goal") ||
-        name.includes("gol") ||
-        name.includes("goals") ||
-        name.includes("over") ||
-        name.includes("under") ||
-        name.includes("btts") ||
-        name.includes("both teams to score") ||
-        name.includes("ambas marcam")
-      );
-    if (type === "cartões") return name.includes("card") || name.includes("cartão") || name.includes("yellow") || name.includes("red") || name.includes("cartoes");
-    if (type === "vitória") return name.includes("winner") || name.includes("vencedor") || name.includes("1x2") || name.includes("match result") || name.includes("resultado");
-    if (type === "asiático") return name.includes("handicap") || name.includes("asiatic") || name.includes("asian");
+  const hasAny = (...keys) => keys.some(k => name.includes(k));
 
-    return false;
+  // ❌ mercados que NÃO podem cair em GOLS
+  const isShotsMarket =
+    hasAny("shot", "shots", "shots on goal", "total shots", "player shots", "shots on target", "sot");
+
+  const isScorerMarket =
+    hasAny("goal scorer", "scorer", "anytime", "first goalscorer", "last goalscorer");
+
+  if (type === "escanteios") {
+    return hasAny("corner", "escanteio");
   }
 
-  determineMarketType(_marketName, period) {
-    if (period === "1H") return "1T";
-    if (period === "2H") return "2T";
-    return "Match";
+  if (type === "gols") {
+    if (isShotsMarket) return false;
+    if (isScorerMarket) return false;
+
+    // ✅ somente termos realmente de gols
+    return (
+      hasAny("goal", "goals", "match goals", "total goals", "team goals", "goals over/under") ||
+      hasAny("btts", "both teams to score", "ambas marcam")
+    );
   }
+
+  if (type === "cartões") {
+    return hasAny("card", "cartão", "yellow", "red", "cartoes");
+  }
+
+  if (type === "vitória") {
+    return hasAny("winner", "vencedor", "1x2", "match result", "resultado");
+  }
+
+  if (type === "asiático") {
+    // ✅ handicap do resultado (não corners handicap)
+    if (hasAny("corner")) return false;
+    return hasAny("handicap", "asiatic", "asian");
+  }
+
+  return false;
 }
+
 
 // ============================================
 // PAYLOAD BUILDER
