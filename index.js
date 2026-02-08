@@ -400,7 +400,7 @@ class ApiFootballClient {
 }
 
 // ============================================
-// ANALISADOR DE JOGOS
+// ANALISADOR DE JOGOS (COM PROCESSODDS CORRIGIDO)
 // ============================================
 
 class MatchAnalyzer {
@@ -471,8 +471,8 @@ class MatchAnalyzer {
     // Processar eventos
     const eventsData = this.processEvents(events);
     
-    // Processar odds
-    const oddsData = this.processOdds(odds);
+    // Processar odds (COM A CORREÇÃO)
+    const oddsData = this.processOddsCorrigido(odds, matchData.teams);
     
     return {
       match: matchData,
@@ -549,25 +549,106 @@ class MatchAnalyzer {
     };
   }
   
-  processOdds(odds) {
+  // ============================================
+  // CORREÇÃO CRÍTICA: processOdds CORRIGIDO
+  // ============================================
+  
+  processOddsCorrigido(odds, teams) {
     const markets = [];
+    const homeTeam = teams.home.toLowerCase();
+    const awayTeam = teams.away.toLowerCase();
+    
+    console.log(`[ODDS PROCESSOR] Processando odds para ${teams.home} vs ${teams.away}`);
     
     odds.forEach(oddGroup => {
-      if (oddGroup.bookmakers) {
+      // Formato A: Com bookmakers (formato mais comum)
+      if (oddGroup.bookmakers && Array.isArray(oddGroup.bookmakers)) {
         oddGroup.bookmakers.forEach(bookmaker => {
-          if (bookmaker.bets) {
+          const bmName = bookmaker.name || 'Unknown';
+          
+          if (bookmaker.bets && Array.isArray(bookmaker.bets)) {
             bookmaker.bets.forEach(bet => {
-              if (bet.values) {
+              const marketName = String(bet.name || '').trim();
+              const marketLower = marketName.toLowerCase();
+              
+              // DETECTAR TODOS OS MERCADOS RELEVANTES (CORREÇÃO AQUI)
+              const isRelevantMarket = 
+                marketLower.includes('corner') ||
+                marketLower.includes('escanteio') ||
+                marketLower.includes('card') ||
+                marketLower.includes('cartão') ||
+                marketLower.includes('yellow card') ||
+                marketLower.includes('red card') ||
+                marketLower.includes('goal') ||
+                marketLower.includes('gol') ||
+                marketLower.includes('goals') ||
+                marketLower.includes('winner') ||
+                marketLower.includes('vencedor') ||
+                marketLower.includes('handicap') ||
+                marketLower.includes('asiatic') ||
+                marketLower.includes('asian') ||
+                marketLower.includes('1x2') ||
+                marketLower.includes('match result') ||
+                marketLower.includes('both teams to score') ||
+                marketLower.includes('ambas marcam') ||
+                marketLower.includes('over') ||
+                marketLower.includes('under') ||
+                marketLower.includes('mais') ||
+                marketLower.includes('menos');
+              
+              if (!isRelevantMarket) return;
+              
+              // DETERMINAR PERÍODO
+              let period = 'Match';
+              if (marketLower.includes('1st') || marketLower.includes('1st half') || marketLower.includes('first half')) {
+                period = '1H';
+              } else if (marketLower.includes('2nd') || marketLower.includes('2nd half') || marketLower.includes('second half')) {
+                period = '2H';
+              }
+              
+              // PROCESSAR VALORES
+              if (bet.values && Array.isArray(bet.values)) {
                 bet.values.forEach(value => {
-                  if (value.odd >= config.oddRange.min && value.odd <= config.oddRange.max) {
+                  const oddValue = parseFloat(value.odd) || 0;
+                  
+                  // FILTRAR POR RANGE 1.40-2.00 (CONDIÇÃO DO SEU SISTEMA)
+                  if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
+                    
+                    const selection = String(value.value || '').trim();
+                    const selectionLower = selection.toLowerCase();
+                    
+                    // DETECTAR TIPO DE SELEÇÃO
+                    let selectionType = 'game';
+                    let targetTeam = null;
+                    
+                    if (selectionLower.includes('home') || selection === '1' || selectionLower.includes(homeTeam)) {
+                      selectionType = 'home';
+                      targetTeam = teams.home;
+                    } else if (selectionLower.includes('away') || selection === '2' || selectionLower.includes(awayTeam)) {
+                      selectionType = 'away';
+                      targetTeam = teams.away;
+                    } else if (selectionLower.includes('over') || selectionLower.includes('mais')) {
+                      selectionType = 'over';
+                    } else if (selectionLower.includes('under') || selectionLower.includes('menos')) {
+                      selectionType = 'under';
+                    } else if (selectionLower.includes('yes') || selectionLower.includes('sim')) {
+                      selectionType = 'yes';
+                    } else if (selectionLower.includes('no') || selectionLower.includes('não')) {
+                      selectionType = 'no';
+                    }
+                    
                     markets.push({
-                      bookmaker: bookmaker.name,
-                      market: bet.name,
-                      selection: value.value,
-                      odd: value.odd,
-                      handicap: value.handicap,
-                      period: bet.name.includes('1st') ? '1T' : 
-                             bet.name.includes('2nd') ? '2T' : 'Match'
+                      bookmaker: bmName,
+                      market: marketName,
+                      selection: selection,
+                      selectionType: selectionType,
+                      targetTeam: targetTeam,
+                      odd: Number(oddValue.toFixed(2)),
+                      handicap: value.handicap || null,
+                      period: period,
+                      // Informações para debug
+                      rawMarketName: marketName,
+                      rawSelection: selection
                     });
                   }
                 });
@@ -576,14 +657,103 @@ class MatchAnalyzer {
           }
         });
       }
+      
+      // Formato B: Odds diretas (formato alternativo da API)
+      if (oddGroup.odds && Array.isArray(oddGroup.odds)) {
+        oddGroup.odds.forEach(bet => {
+          const marketName = String(bet.name || '').trim();
+          const marketLower = marketName.toLowerCase();
+          
+          // Mesma lógica de detecção
+          const isRelevantMarket = 
+            marketLower.includes('corner') ||
+            marketLower.includes('escanteio') ||
+            marketLower.includes('card') ||
+            marketLower.includes('cartão') ||
+            marketLower.includes('goal') ||
+            marketLower.includes('gol') ||
+            marketLower.includes('winner') ||
+            marketLower.includes('vencedor') ||
+            marketLower.includes('handicap') ||
+            marketLower.includes('asiatic') ||
+            marketLower.includes('1x2');
+          
+          if (!isRelevantMarket) return;
+          
+          let period = 'Match';
+          if (marketLower.includes('1st') || marketLower.includes('1st half')) period = '1H';
+          if (marketLower.includes('2nd') || marketLower.includes('2nd half')) period = '2H';
+          
+          if (bet.values && Array.isArray(bet.values)) {
+            bet.values.forEach(value => {
+              const oddValue = parseFloat(value.odd) || 0;
+              
+              if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
+                const selection = String(value.value || '').trim();
+                const selectionLower = selection.toLowerCase();
+                
+                let selectionType = 'game';
+                let targetTeam = null;
+                
+                if (selectionLower.includes('home') || selection === '1' || selectionLower.includes(homeTeam)) {
+                  selectionType = 'home';
+                  targetTeam = teams.home;
+                } else if (selectionLower.includes('away') || selection === '2' || selectionLower.includes(awayTeam)) {
+                  selectionType = 'away';
+                  targetTeam = teams.away;
+                }
+                
+                markets.push({
+                  bookmaker: 'live',
+                  market: marketName,
+                  selection: selection,
+                  selectionType: selectionType,
+                  targetTeam: targetTeam,
+                  odd: Number(oddValue.toFixed(2)),
+                  handicap: value.handicap || null,
+                  period: period,
+                  rawMarketName: marketName,
+                  rawSelection: selection
+                });
+              }
+            });
+          }
+        });
+      }
     });
+    
+    console.log(`[ODDS PROCESSOR] Encontrados ${markets.length} mercados no range ${config.oddRange.min}-${config.oddRange.max}`);
+    
+    // Log para debug
+    if (markets.length > 0) {
+      console.log('[ODDS SAMPLE] Primeiros mercados encontrados:');
+      markets.slice(0, 3).forEach((m, i) => {
+        console.log(`  ${i+1}. ${m.market} - ${m.selection} @ ${m.odd} (${m.period})`);
+      });
+    } else {
+      console.log('[ODDS PROCESSOR] Nenhum mercado encontrado no range especificado');
+      console.log('[ODDS PROCESSOR] Verificando se há odds fora do range...');
+      
+      // Debug: contar total de odds disponíveis
+      let totalOdds = 0;
+      odds.forEach(oddGroup => {
+        if (oddGroup.bookmakers) {
+          oddGroup.bookmakers.forEach(bm => {
+            bm.bets?.forEach(bet => {
+              totalOdds += bet.values?.length || 0;
+            });
+          });
+        }
+      });
+      console.log(`[ODDS DEBUG] Total de odds disponíveis (qualquer valor): ${totalOdds}`);
+    }
     
     return markets;
   }
 }
 
 // ============================================
-// ANALISADOR DE MERCADOS
+// ANALISADOR DE MERCADOS (ATUALIZADO)
 // ============================================
 
 class MarketAnalyzer {
@@ -607,7 +777,7 @@ class MarketAnalyzer {
       };
     }
     
-    // 3. Preparar estatísticas para cálculo
+    // 3. Preparar estatísticas para cálculo (com fallback para eventos)
     const stats = this.prepareStatsForAnalysis(matchData);
     
     // 4. Analisar cada mercado
@@ -617,11 +787,12 @@ class MarketAnalyzer {
       const market = MARKETS[marketKey];
       console.log(`[MARKET] Analisando mercado: ${market.name}`);
       
-      // Filtrar odds para este mercado
+      // Filtrar odds para este mercado (CORREÇÃO MELHORADA)
       const marketOdds = matchData.odds.filter(odd => 
-        odd.market.toLowerCase().includes(market.name.toLowerCase()) ||
-        this.isMarketType(odd.market, market.types)
+        this.isMarketMatch(odd.market, market.name, market.types)
       );
+      
+      console.log(`[MARKET] ${market.name}: ${marketOdds.length} odds encontradas`);
       
       for (const oddData of marketOdds) {
         // Já está filtrado por range de odds, mas verificamos novamente
@@ -631,12 +802,13 @@ class MarketAnalyzer {
           const marketType = this.determineMarketType(oddData.market, oddData.period);
           const selection = oddData.selection;
           const handicap = oddData.handicap;
+          const selectionType = oddData.selectionType;
           
           // Calcular EV específico do mercado
-          const evResult = market.calculateEV(stats, oddData.odd, marketType, handicap, selection);
+          const evResult = market.calculateEV(stats, oddData.odd, marketType, handicap, selectionType);
           
           if (evResult.ev > 0) {
-            console.log(`[EV+] ${market.name} - Odd: ${oddData.odd} - EV: ${evResult.ev.toFixed(4)}`);
+            console.log(`[EV+] ${market.name} - ${selection} @ ${oddData.odd} - EV: ${evResult.ev.toFixed(4)}`);
             
             results.push({
               market: {
@@ -644,6 +816,7 @@ class MarketAnalyzer {
                 name: market.name,
                 type: marketType,
                 selection: selection,
+                selectionType: selectionType,
                 handicap: handicap
               },
               odd: oddData.odd,
@@ -668,12 +841,16 @@ class MarketAnalyzer {
       minute: matchData.match.time.elapsed,
       results: results,
       totalMarketsAnalyzed: results.length,
+      totalOddsAvailable: matchData.odds.length,
       apiCalls: matchData.apiCalls,
       cacheHit: false
     };
   }
   
   prepareStatsForAnalysis(matchData) {
+    // Usar eventos como fallback quando estatísticas estão zeradas
+    const events = matchData.events;
+    
     return {
       match: {
         time: {
@@ -685,7 +862,7 @@ class MarketAnalyzer {
         }
       },
       corners: {
-        total: matchData.statistics.totals.corners,
+        total: matchData.statistics.totals.corners > 0 ? matchData.statistics.totals.corners : events.corners,
         home: matchData.statistics.home.corners,
         away: matchData.statistics.away.corners
       },
@@ -695,8 +872,10 @@ class MarketAnalyzer {
       },
       shots: {
         total: {
-          onTarget: matchData.statistics.home.shotsOnGoal + matchData.statistics.away.shotsOnGoal,
-          offTarget: matchData.statistics.home.shotsOffGoal + matchData.statistics.away.shotsOffGoal
+          onTarget: matchData.statistics.totals.shotsOnGoal > 0 ? 
+            matchData.statistics.totals.shotsOnGoal : 0,
+          offTarget: matchData.statistics.totals.shotsOffGoal > 0 ? 
+            matchData.statistics.totals.shotsOffGoal : 0
         },
         home: {
           onTarget: matchData.statistics.home.shotsOnGoal,
@@ -713,7 +892,7 @@ class MarketAnalyzer {
         red: matchData.events.redCards
       },
       fouls: {
-        total: matchData.statistics.totals.fouls,
+        total: matchData.statistics.totals.fouls > 0 ? matchData.statistics.totals.fouls : 0,
         home: matchData.statistics.home.fouls,
         away: matchData.statistics.away.fouls
       },
@@ -738,14 +917,32 @@ class MarketAnalyzer {
     };
   }
   
-  isMarketType(marketName, types) {
+  // CORREÇÃO: Função melhorada para detectar mercados
+  isMarketMatch(marketName, marketType, marketTypes) {
     const name = marketName.toLowerCase();
-    return types.some(type => name.includes(type.toLowerCase()));
+    const type = marketType.toLowerCase();
+    
+    // Verificar se o nome do mercado contém palavras-chave do tipo
+    if (type === 'escanteios') {
+      return name.includes('corner') || name.includes('escanteio');
+    } else if (type === 'gols') {
+      return name.includes('goal') || name.includes('gol') || name.includes('goals') || 
+             name.includes('over') || name.includes('under') || name.includes('btts');
+    } else if (type === 'cartões') {
+      return name.includes('card') || name.includes('cartão') || name.includes('yellow') || name.includes('red');
+    } else if (type === 'vitória') {
+      return name.includes('winner') || name.includes('vencedor') || name.includes('1x2') || 
+             name.includes('match result');
+    } else if (type === 'asiático') {
+      return name.includes('handicap') || name.includes('asiatic') || name.includes('asian');
+    }
+    
+    return false;
   }
   
   determineMarketType(marketName, period) {
-    if (period === '1T') return '1T';
-    if (period === '2T') return '2T';
+    if (period === '1H') return '1T';
+    if (period === '2H') return '2T';
     return 'Match';
   }
 }
@@ -771,6 +968,7 @@ class IAPayloadBuilder {
         market: bestMarket.market.name,
         type: bestMarket.market.type,
         selection: bestMarket.market.selection,
+        selectionType: bestMarket.market.selectionType,
         handicap: bestMarket.market.handicap,
         odd: bestMarket.odd,
         ev: bestMarket.ev,
@@ -781,6 +979,7 @@ class IAPayloadBuilder {
       marketDetails: bestMarket.details,
       alternatives: sortedResults.slice(1, 3).map(r => ({
         market: r.market.name,
+        selection: r.market.selection,
         odd: r.odd,
         ev: r.ev
       })),
@@ -791,7 +990,7 @@ class IAPayloadBuilder {
 }
 
 // ============================================
-// ROTAS DO APP
+// ROTAS DO APP (COM ROTAS DE DEBUG)
 // ============================================
 
 // Inicializar clientes
@@ -886,6 +1085,7 @@ app.post('/api/analyze-match', async (req, res) => {
       eligible: true,
       minute: analysis.minute,
       totalOpportunities: analysis.results.length,
+      totalOddsAvailable: analysis.totalOddsAvailable,
       apiCalls: analysis.apiCalls || apiClient.getCallCount(),
       results: analysis.results,
       iaPayload: iaPayload,
@@ -946,6 +1146,153 @@ app.get('/api/health', (req, res) => {
 });
 
 // ============================================
+// ROTAS DE DEBUG PARA DIAGNÓSTICO
+// ============================================
+
+// Rota para debug de odds (ver estrutura completa)
+app.get('/api/debug/odds/:fixtureId', async (req, res) => {
+  try {
+    const fixtureId = parseInt(req.params.fixtureId);
+    
+    // Buscar odds diretamente
+    const oddsData = await apiClient.getLiveOdds(fixtureId);
+    
+    // Análise detalhada
+    const analysis = {
+      fixtureId,
+      totalResponseGroups: oddsData.length,
+      allMarkets: [],
+      marketSummary: {},
+      oddsInRange: []
+    };
+    
+    // Processar todas as odds
+    oddsData.forEach((group, groupIndex) => {
+      if (group.bookmakers) {
+        group.bookmakers.forEach(bm => {
+          bm.bets?.forEach(bet => {
+            const marketName = bet.name || 'Unknown';
+            
+            // Adicionar ao resumo
+            if (!analysis.marketSummary[marketName]) {
+              analysis.marketSummary[marketName] = {
+                count: 0,
+                minOdd: 999,
+                maxOdd: 0,
+                values: []
+              };
+            }
+            
+            bet.values?.forEach(value => {
+              const oddValue = parseFloat(value.odd) || 0;
+              analysis.marketSummary[marketName].count++;
+              analysis.marketSummary[marketName].minOdd = Math.min(
+                analysis.marketSummary[marketName].minOdd, 
+                oddValue
+              );
+              analysis.marketSummary[marketName].maxOdd = Math.max(
+                analysis.marketSummary[marketName].maxOdd, 
+                oddValue
+              );
+              analysis.marketSummary[marketName].values.push({
+                selection: value.value,
+                odd: oddValue,
+                handicap: value.handicap
+              });
+              
+              // Verificar se está no range
+              if (oddValue >= config.oddRange.min && oddValue <= config.oddRange.max) {
+                analysis.oddsInRange.push({
+                  market: marketName,
+                  selection: value.value,
+                  odd: oddValue,
+                  handicap: value.handicap,
+                  bookmaker: bm.name
+                });
+              }
+            });
+          });
+        });
+      }
+    });
+    
+    // Top 10 mercados por quantidade
+    analysis.topMarkets = Object.entries(analysis.marketSummary)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 10)
+      .map(([name, data]) => ({
+        market: name,
+        count: data.count,
+        oddRange: `${data.minOdd.toFixed(2)} - ${data.maxOdd.toFixed(2)}`,
+        hasOddsInRange: data.minOdd <= config.oddRange.max && data.maxOdd >= config.oddRange.min
+      }));
+    
+    res.json({
+      success: true,
+      analysis,
+      config: {
+        oddRange: config.oddRange,
+        oddsInRangeCount: analysis.oddsInRange.length,
+        oddsInRangeSample: analysis.oddsInRange.slice(0, 5)
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Rota para debug rápido de corners
+app.get('/api/debug/corners/:fixtureId', async (req, res) => {
+  try {
+    const fixtureId = parseInt(req.params.fixtureId);
+    const odds = await apiClient.getLiveOdds(fixtureId);
+    
+    const cornerOdds = [];
+    
+    odds.forEach(group => {
+      if (group.bookmakers) {
+        group.bookmakers.forEach(bm => {
+          bm.bets?.forEach(bet => {
+            const marketName = bet.name || '';
+            if (marketName.toLowerCase().includes('corner') || 
+                marketName.toLowerCase().includes('escanteio')) {
+              
+              bet.values?.forEach(value => {
+                const oddValue = parseFloat(value.odd) || 0;
+                
+                cornerOdds.push({
+                  bookmaker: bm.name,
+                  market: marketName,
+                  selection: value.value,
+                  odd: oddValue,
+                  handicap: value.handicap,
+                  inRange: oddValue >= config.oddRange.min && oddValue <= config.oddRange.max
+                });
+              });
+            }
+          });
+        });
+      }
+    });
+    
+    res.json({
+      fixtureId,
+      cornerOddsFound: cornerOdds.length,
+      cornerOddsInRange: cornerOdds.filter(o => o.inRange).length,
+      allCornerOdds: cornerOdds,
+      range: config.oddRange
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // INICIAR SERVIDOR
 // ============================================
 
@@ -960,5 +1307,14 @@ app.listen(PORT, () => {
   console.log('============================================');
   console.log(`ODD RANGE: ${config.oddRange.min} - ${config.oddRange.max}`);
   console.log(`TEMPO MÍNIMO: ${config.minGameMinute} minutos`);
+  console.log('============================================');
+  console.log('ROTAS DISPONÍVEIS:');
+  console.log('GET  /api/health');
+  console.log('GET  /api/live-matches');
+  console.log('GET  /api/live-matches?leagueId=39');
+  console.log('GET  /api/match-stats/:fixtureId');
+  console.log('POST /api/analyze-match');
+  console.log('GET  /api/debug/odds/:fixtureId');
+  console.log('GET  /api/debug/corners/:fixtureId');
   console.log('============================================');
 });
