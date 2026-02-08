@@ -1,5 +1,7 @@
-//                 + ✅ GET /api/analyze-match (teste no navegador) + ✅ FIX /api/debug/odds suporta bookmakers/odds/bets
+// FILE: index.js (COMPLETO) — ✅ GET /api/analyze-match (teste no navegador)
+// ✅ FIX /api/debug/odds suporta bookmakers/odds/bets
 // ✅ FIX RENDER: MarketAnalyzer agora tem determineMarketType() + FECHAMENTO DA CLASSE (}).
+// ✅ FIX ANTI-PEGADINHA: GOALS Over/Under agora considera gols já marcados (live) — usa gols restantes possíveis
 
 import "dotenv/config";
 import express from "express";
@@ -130,17 +132,30 @@ const MARKETS = {
 
       const poissonProbability = (k) => (Math.exp(-lambda) * Math.pow(lambda, k)) / gamma(k + 1);
 
-      // ✅ FIX: não depender de marketType.includes('Over'/'Under') (marketType aqui é período)
-      if (selectionType === "over" && handicap) {
+      // ✅ FIX ANTI-PEGADINHA (LIVE): Over/Under agora considera os gols já marcados
+      // Ex.: Under 2.5 com 1 gol no placar => só pode sair no máximo 1 gol no restante
+      if ((selectionType === "over" || selectionType === "under") && handicap) {
         const target = parseFloat(handicap);
-        let cumulative = 0;
-        for (let k = 0; k <= Math.floor(target); k++) cumulative += poissonProbability(k);
-        probability = Math.max(0.05, Math.min(0.95, 1 - cumulative));
-      } else if (selectionType === "under" && handicap) {
-        const target = parseFloat(handicap);
-        let cumulative = 0;
-        for (let k = 0; k <= Math.floor(target); k++) cumulative += poissonProbability(k);
-        probability = Math.max(0.05, Math.min(0.95, cumulative));
+        const maxFinalGoals = Math.floor(target); // 2.5 -> 2
+        const goalsNow = totalGoals;
+
+        const remainingAllowed = maxFinalGoals - goalsNow;
+
+        // mercado impossível (já estourou o limite do under)
+        if (remainingAllowed < 0) {
+          probability = 0.0;
+        } else if (selectionType === "under") {
+          // P( gols_restantes <= remainingAllowed )
+          let cumulative = 0;
+          for (let k = 0; k <= remainingAllowed; k++) cumulative += poissonProbability(k);
+          probability = Math.max(0.05, Math.min(0.95, cumulative));
+        } else if (selectionType === "over") {
+          // precisa de pelo menos (remainingAllowed + 1) gols restantes para passar do limite final
+          const needed = remainingAllowed + 1;
+          let cumulative = 0;
+          for (let k = 0; k < needed; k++) cumulative += poissonProbability(k);
+          probability = Math.max(0.05, Math.min(0.95, 1 - cumulative));
+        }
       } else if (selectionType === "yes") {
         const homeAttackStrength = Math.min(1, (stats.shots.home.onTarget || 0) / 10);
         const awayAttackStrength = Math.min(1, (stats.shots.away.onTarget || 0) / 10);
@@ -659,6 +674,7 @@ class MatchAnalyzer {
     console.log(`[ODDS PROCESSOR] Processando odds para ${teams.home} vs ${teams.away}`);
 
     odds.forEach((oddGroup) => {
+      // Formato A: Com bookmakers
       if (oddGroup.bookmakers && Array.isArray(oddGroup.bookmakers)) {
         oddGroup.bookmakers.forEach((bookmaker) => {
           const bmName = bookmaker.name || "Unknown";
@@ -697,11 +713,7 @@ class MatchAnalyzer {
               let period = "Match";
               if (marketLower.includes("1st") || marketLower.includes("1st half") || marketLower.includes("first half")) {
                 period = "1H";
-              } else if (
-                marketLower.includes("2nd") ||
-                marketLower.includes("2nd half") ||
-                marketLower.includes("second half")
-              ) {
+              } else if (marketLower.includes("2nd") || marketLower.includes("2nd half") || marketLower.includes("second half")) {
                 period = "2H";
               }
 
@@ -719,11 +731,7 @@ class MatchAnalyzer {
                     if (selectionLower.includes("home") || selection === "1" || (homeTeam && selectionLower.includes(homeTeam))) {
                       selectionType = "home";
                       targetTeam = teams.home;
-                    } else if (
-                      selectionLower.includes("away") ||
-                      selection === "2" ||
-                      (awayTeam && selectionLower.includes(awayTeam))
-                    ) {
+                    } else if (selectionLower.includes("away") || selection === "2" || (awayTeam && selectionLower.includes(awayTeam))) {
                       selectionType = "away";
                       targetTeam = teams.away;
                     } else if (selectionLower.includes("over") || selectionLower.includes("mais")) {
@@ -758,6 +766,7 @@ class MatchAnalyzer {
         });
       }
 
+      // Formato B: Odds diretas
       if (oddGroup.odds && Array.isArray(oddGroup.odds)) {
         oddGroup.odds.forEach((bet) => {
           const marketName = String(bet.name || "").trim();
@@ -796,11 +805,7 @@ class MatchAnalyzer {
                 if (selectionLower.includes("home") || selection === "1" || (homeTeam && selectionLower.includes(homeTeam))) {
                   selectionType = "home";
                   targetTeam = teams.home;
-                } else if (
-                  selectionLower.includes("away") ||
-                  selection === "2" ||
-                  (awayTeam && selectionLower.includes(awayTeam))
-                ) {
+                } else if (selectionLower.includes("away") || selection === "2" || (awayTeam && selectionLower.includes(awayTeam))) {
                   selectionType = "away";
                   targetTeam = teams.away;
                 } else if (selectionLower.includes("over") || selectionLower.includes("mais")) {
@@ -832,15 +837,11 @@ class MatchAnalyzer {
       }
     });
 
-    console.log(
-      `[ODDS PROCESSOR] Encontrados ${markets.length} mercados no range ${config.oddRange.min}-${config.oddRange.max}`
-    );
+    console.log(`[ODDS PROCESSOR] Encontrados ${markets.length} mercados no range ${config.oddRange.min}-${config.oddRange.max}`);
 
     if (markets.length > 0) {
       console.log("[ODDS SAMPLE] Primeiros mercados encontrados:");
-      markets
-        .slice(0, 3)
-        .forEach((m, i) => console.log(`  ${i + 1}. ${m.market} - ${m.selection} @ ${m.odd} (${m.period})`));
+      markets.slice(0, 3).forEach((m, i) => console.log(`  ${i + 1}. ${m.market} - ${m.selection} @ ${m.odd} (${m.period})`));
     }
 
     return markets;
@@ -981,27 +982,11 @@ class MarketAnalyzer {
 
     const hasAny = (...keys) => keys.some((k) => name.includes(k));
 
-    const isShotsMarket = hasAny(
-      "shot",
-      "shots",
-      "shots on goal",
-      "total shots",
-      "player shots",
-      "shots on target",
-      "sot"
-    );
+    // ❌ mercados que NÃO podem cair em GOLS
+    const isShotsMarket = hasAny("shot", "shots", "shots on goal", "total shots", "player shots", "shots on target", "sot");
+    const isScorerMarket = hasAny("goal scorer", "scorer", "anytime", "first goalscorer", "last goalscorer");
 
-    const isScorerMarket = hasAny(
-      "goal scorer",
-      "scorer",
-      "anytime",
-      "first goalscorer",
-      "last goalscorer"
-    );
-
-    if (type === "escanteios") {
-      return hasAny("corner", "escanteio");
-    }
+    if (type === "escanteios") return hasAny("corner", "escanteio");
 
     if (type === "gols") {
       if (isShotsMarket) return false;
@@ -1013,13 +998,9 @@ class MarketAnalyzer {
       );
     }
 
-    if (type === "cartões") {
-      return hasAny("card", "cartão", "yellow", "red", "cartoes");
-    }
+    if (type === "cartões") return hasAny("card", "cartão", "yellow", "red", "cartoes");
 
-    if (type === "vitória") {
-      return hasAny("winner", "vencedor", "1x2", "match result", "resultado");
-    }
+    if (type === "vitória") return hasAny("winner", "vencedor", "1x2", "match result", "resultado");
 
     if (type === "asiático") {
       if (hasAny("corner")) return false;
@@ -1035,7 +1016,7 @@ class MarketAnalyzer {
     if (period === "2H") return "2T";
     return "Match";
   }
-} // ✅ FECHA A CLASSE MarketAnalyzer (ESSA CHAVE ESTAVA FALTANDO)
+} // ✅ FECHA A CLASSE MarketAnalyzer
 
 // ============================================
 // PAYLOAD BUILDER
@@ -1217,9 +1198,7 @@ app.post("/api/analyze-match", async (req, res) => {
 app.get("/api/analyze-match", async (req, res) => {
   try {
     const fixtureId = Number(req.query.fixtureId);
-    const markets = req.query.markets
-      ? String(req.query.markets).split(",").map((s) => s.trim())
-      : Object.keys(MARKETS);
+    const markets = req.query.markets ? String(req.query.markets).split(",").map((s) => s.trim()) : Object.keys(MARKETS);
 
     if (!fixtureId) return res.status(400).json({ success: false, error: "fixtureId is required" });
 
@@ -1355,14 +1334,17 @@ app.get("/api/debug/odds/:fixtureId", async (req, res) => {
         hasBets: !!group?.bets,
       });
 
+      // Formato A: { bookmakers:[{name, bets:[{name, values:[] }]}] }
       if (Array.isArray(group?.bookmakers)) {
         group.bookmakers.forEach((bm) => processBetsList(bm?.bets, bm?.name || "unknown"));
       }
 
+      // Formato B: { odds:[{name, values:[]}] }
       if (Array.isArray(group?.odds)) {
         processBetsList(group.odds, "live");
       }
 
+      // Formato C: { bets:[{name, values:[]}] }
       if (Array.isArray(group?.bets)) {
         processBetsList(group.bets, "live");
       }
